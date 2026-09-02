@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local model weights and large generated assets must never be committed.
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+models/
+output/
+temp/
+
+# Local IDE and operating-system files.
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.log
