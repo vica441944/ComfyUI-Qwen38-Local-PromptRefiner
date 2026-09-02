@@ -4,6 +4,13 @@ This custom node runs a local Qwen-VL GGUF directly through `llama-cpp-python`. 
 
 > Model weights and vision-projector files are intentionally not included. Download a compatible Qwen3.8-VL GGUF and matching `mmproj` separately, then place them in `ComfyUI/models/LLM`.
 
+## Model downloads
+
+- **Exact prompt-refiner package for Ollama:** [starnodes/qwen3.8-vl-27b-promptrefiner-abliterated](https://ollama.com/starnodes/qwen3.8-vl-27b-promptrefiner-abliterated)
+- **Direct GGUF download for this node:** [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-GGUF](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-GGUF)
+
+The Hugging Face download is the compatible Abliterated base GGUF, rather than the Starnodes prompt-refiner package. This node includes the prompt-refiner routing profile separately. Download a main model and a matching vision projector from the same Hugging Face repository, for example `Qwen3.8-27B-ABLITERATED-Q5_K_M.gguf` plus `mmproj-Qwen3.8-27B-ABLITERATED-F16.gguf`. Configure the desired context length in the node itself (for example, `32768`); it is not determined by the filename.
+
 ## Install
 
 1. Copy this folder into `ComfyUI\custom_nodes\ComfyUI-Qwen38-Local-PromptRefiner`.
