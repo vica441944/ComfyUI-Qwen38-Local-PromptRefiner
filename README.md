@@ -1,10 +1,21 @@
 # Qwen3.8 Local Prompt Refiner for ComfyUI
 
+
 This custom node runs a local Qwen-VL GGUF directly through `llama-cpp-python`. It never starts or calls Ollama. The node accepts a prompt brief and up to nine `IMAGE` references, then returns an engine-native prompt string ready to connect to a ComfyUI text input.
+
 
 > Model weights and vision-projector files are intentionally not included. Download a compatible Qwen3.8-VL GGUF and matching `mmproj` separately, then place them in `ComfyUI/models/LLM`.
 
+## Model downloads
+
+- **Exact prompt-refiner package for Ollama:** [starnodes/qwen3.8-vl-27b-promptrefiner-abliterated](https://ollama.com/starnodes/qwen3.8-vl-27b-promptrefiner-abliterated)
+- **Direct GGUF download for this node:** [Blackfrost-AI/Qwen3.8-27B-ABLITERATED-GGUF](https://huggingface.co/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-GGUF)
+
+The Hugging Face download is the compatible Abliterated base GGUF, rather than the Starnodes prompt-refiner package. This node includes the prompt-refiner routing profile separately. Download a main model and a matching vision projector from the same Hugging Face repository, for example `Qwen3.8-27B-ABLITERATED-Q5_K_M.gguf` plus `mmproj-Qwen3.8-27B-ABLITERATED-F16.gguf`. Configure the desired context length in the node itself (for example, `32768`); it is not determined by the filename.
+
+
 ## Install
+
 
 1. Copy this folder into `ComfyUI\custom_nodes\ComfyUI-Qwen38-Local-PromptRefiner`.
 2. Put the Qwen GGUF and its *matching* vision projector GGUF in `ComfyUI\models\LLM`.
@@ -12,11 +23,15 @@ This custom node runs a local Qwen-VL GGUF directly through `llama-cpp-python`. 
    - Projector example: `mmproj-model-bf16.gguf`
 3. In the ComfyUI Python environment, install a GPU-enabled `llama-cpp-python` build appropriate for the installed CUDA/driver version. Then restart ComfyUI.
 
+
 The generic package in `requirements.txt` is a CPU fallback. For NVIDIA CUDA on Windows, install the matching CUDA wheel instead; the `llama-cpp-python` project documents the available CUDA wheel indexes.
+
 
 ## Node usage
 
+
 Add **LLM / Prompt Refiner → Qwen3.8 Local Prompt Refiner (GGUF)**.
+
 
 - Select the model GGUF and matching `mmproj` GGUF from `models/LLM`.
 - Set **GPU layers** to `-1` to offload all compatible layers to the GPU.
@@ -28,11 +43,14 @@ Add **LLM / Prompt Refiner → Qwen3.8 Local Prompt Refiner (GGUF)**.
 - The `brief` text area has **@ autocomplete**: after connecting assets, type `@` and choose a displayed image, video, or audio slot with the mouse, arrow keys + Enter, or Tab. Only connected ports are shown.
 - Leave **keep model loaded** disabled to release VRAM after each queue execution; enable it only when repeatedly prompting with the same model.
 
+
 ## LoRA trigger presets
+
 
 The node can preserve LoRA trigger words without adding a seventh field to MiniMax H3 full-reference output.  Edit
 `lora_trigger_presets.json` beside `nodes.py`, then restart ComfyUI (or reload custom nodes) so the preset names appear
 in the three **lora preset** dropdowns:
+
 
 ```json
 {
@@ -43,17 +61,13 @@ in the three **lora preset** dropdowns:
 }
 ```
 
+
 Use up to three saved presets at once.  For a one-off LoRA, paste comma- or newline-separated values into
 **manual lora trigger words**.  Trigger text is treated as literal data: the node asks the model to preserve each term
 verbatim, and for MiniMax H3 full-reference output it inserts any missing terms inside `detailed_description` only.
 
+
 ## Compatibility notes
 
+
 The node requires a current `llama-cpp-python` build with the generic `MTMDChatHandler` or the `Qwen25VLChatHandler` and a matching projector. Start with **auto (MTMD)**. If the selected build does not expose that handler, update `llama-cpp-python`; the node reports a clear error instead of silently falling back to text-only inference.
-
-`mmproj` files are model-specific. Do not combine a projector from a different Qwen-VL conversion with the Qwen GGUF.
-
-## Outputs
-
-- `prompt`: local model's final prompt with common `<think>` / `<thinking>` blocks removed.
-- `debug`: local execution summary, including model, projector, reference count, and cache setting.
