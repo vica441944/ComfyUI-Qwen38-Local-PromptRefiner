@@ -56,7 +56,8 @@ MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
 MIN_REFERENCE_MEDIA_SECONDS = 2.0
 MAX_REFERENCE_MEDIA_SECONDS = 15.0
-MAX_REFERENCE_MEDIA_TOTAL_SECONDS = 15.0
+MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS = 120.0
+REFERENCE_DURATION_TOLERANCE_SECONDS = 0.05
 VIDEO_FRAME_MAX_SIDE = 1024
 
 FALLBACK_ROUTE_SYSTEM = """You are a local multi-engine generative-media prompt refiner. Return only the final
@@ -280,11 +281,24 @@ class _AudioReference:
     silence_ratio: float
 
 
-def _validate_reference_duration(kind: str, slot: int, duration: float) -> None:
-    if not MIN_REFERENCE_MEDIA_SECONDS <= duration <= MAX_REFERENCE_MEDIA_SECONDS:
+@dataclass(frozen=True)
+class _EmbeddedVideoAudioReference:
+    """Metadata for an AUDIO input paired to one connected VIDEO input."""
+
+    video_slot: int
+    audio: _AudioReference
+
+
+def _validate_reference_duration(kind: str, slot: int, duration: float, max_duration: float) -> None:
+    if not (
+        MIN_REFERENCE_MEDIA_SECONDS - REFERENCE_DURATION_TOLERANCE_SECONDS
+        <= duration
+        <= max_duration + REFERENCE_DURATION_TOLERANCE_SECONDS
+    ):
         raise PromptRefinerError(
             f"reference_{kind}_{slot} is {duration:.2f}s. MiniMax H3 full reference accepts "
-            f"{MIN_REFERENCE_MEDIA_SECONDS:.0f}–{MAX_REFERENCE_MEDIA_SECONDS:.0f}s per {kind}."
+            f"{MIN_REFERENCE_MEDIA_SECONDS:.0f}–{max_duration:.2f}s per {kind} "
+            f"(±{REFERENCE_DURATION_TOLERANCE_SECONDS:.2f}s media-timestamp tolerance)."
         )
 
 
@@ -318,7 +332,9 @@ def _video_source_path(video: Any, slot: int) -> tuple[str, bool]:
         raise
 
 
-def _analyze_video(video: Any, slot: int, sample_count: int) -> _VideoReference:
+def _analyze_video(
+    video: Any, slot: int, sample_count: int, max_duration: float
+) -> _VideoReference:
     """Read H3 reference-video metadata and uniformly sampled visual frames for Qwen-VL."""
 
     try:
@@ -340,7 +356,7 @@ def _analyze_video(video: Any, slot: int, sample_count: int) -> _VideoReference:
             raise PromptRefinerError(f"reference_video_{slot} has invalid FPS, frame count, or dimensions.")
 
         duration = frame_count / fps
-        _validate_reference_duration("video", slot, duration)
+        _validate_reference_duration("video", slot, duration, max_duration)
         positions = np.linspace(0, frame_count - 1, min(sample_count, frame_count), dtype=int)
         frame_uris: list[str] = []
         for position in dict.fromkeys(int(value) for value in positions):
@@ -362,7 +378,7 @@ def _analyze_video(video: Any, slot: int, sample_count: int) -> _VideoReference:
                 pass
 
 
-def _analyze_audio(audio: Any, slot: int) -> _AudioReference:
+def _analyze_audio(audio: Any, slot: int, max_duration: float) -> _AudioReference:
     """Read H3 reference-audio metadata. Qwen-VL does not receive raw audio bytes."""
 
     if not isinstance(audio, dict):
@@ -394,7 +410,7 @@ def _analyze_audio(audio: Any, slot: int) -> _AudioReference:
     else:
         array = array.astype(np.float32, copy=False)
     duration = array.shape[1] / float(sample_rate)
-    _validate_reference_duration("audio", slot, duration)
+    _validate_reference_duration("audio", slot, duration, max_duration)
     return _AudioReference(
         slot=slot,
         duration=duration,
@@ -405,20 +421,43 @@ def _analyze_audio(audio: Any, slot: int) -> _AudioReference:
     )
 
 
-def _get_video_inputs(values: dict[str, Any], sample_count: int) -> list[_VideoReference]:
+def _get_video_inputs(
+    values: dict[str, Any], sample_count: int, max_duration: float
+) -> list[_VideoReference]:
     return [
-        _analyze_video(values[f"reference_video_{slot}"], slot, sample_count)
+        _analyze_video(values[f"reference_video_{slot}"], slot, sample_count, max_duration)
         for slot in range(1, MAX_REFERENCE_VIDEOS + 1)
         if values.get(f"reference_video_{slot}") is not None
     ]
 
 
-def _get_audio_inputs(values: dict[str, Any]) -> list[_AudioReference]:
+def _get_audio_inputs(values: dict[str, Any], max_duration: float) -> list[_AudioReference]:
     return [
-        _analyze_audio(values[f"reference_audio_{slot}"], slot)
+        _analyze_audio(values[f"reference_audio_{slot}"], slot, max_duration)
         for slot in range(1, MAX_REFERENCE_AUDIOS + 1)
         if values.get(f"reference_audio_{slot}") is not None
     ]
+
+
+def _get_video_audio_inputs(
+    values: dict[str, Any], max_duration: float
+) -> list[_EmbeddedVideoAudioReference]:
+    """Read optional AUDIO inputs that are explicitly paired with VIDEO slots."""
+
+    metadata: list[_EmbeddedVideoAudioReference] = []
+    for slot in range(1, MAX_REFERENCE_VIDEOS + 1):
+        audio = values.get(f"reference_video_audio_{slot}")
+        if audio is None:
+            continue
+        try:
+            audio_metadata = _analyze_audio(audio, slot, max_duration)
+        except PromptRefinerError as error:
+            message = str(error).replace(
+                f"reference_audio_{slot}", f"reference_video_audio_{slot}"
+            )
+            raise PromptRefinerError(message) from error
+        metadata.append(_EmbeddedVideoAudioReference(slot, audio_metadata))
+    return metadata
 
 
 def _normalize_asset_links(
@@ -426,8 +465,9 @@ def _normalize_asset_links(
     image_references: Iterable[tuple[int, str]],
     video_references: Iterable[_VideoReference],
     audio_references: Iterable[_AudioReference],
+    embedded_video_audio_references: Iterable[_EmbeddedVideoAudioReference] = (),
 ) -> str:
-    """Resolve @reference_image_N/video_N/audio_N against actual connected slots."""
+    """Resolve @reference_* aliases against actual connected inputs and tracks."""
 
     available = {
         "image": {slot for slot, _ in image_references},
@@ -435,6 +475,18 @@ def _normalize_asset_links(
         "audio": {item.slot for item in audio_references},
     }
     labels = {"image": "Picture", "video": "Video", "audio": "Audio"}
+    embedded_audio_slots = {item.video_slot for item in embedded_video_audio_references}
+    embedded_pattern = re.compile(r"@reference_video_audio_([1-3])\b", re.IGNORECASE)
+
+    def replace_embedded_audio(match: re.Match[str]) -> str:
+        slot = int(match.group(1))
+        if slot not in embedded_audio_slots:
+            raise PromptRefinerError(
+                f"{match.group(0)} was used in brief, but reference_video_audio_{slot} is not connected."
+            )
+        return f"<Video {slot}> paired audio track"
+
+    brief = embedded_pattern.sub(replace_embedded_audio, brief)
     pattern = re.compile(r"@reference_(image|video|audio)_([1-9])\b", re.IGNORECASE)
 
     def replace(match: re.Match[str]) -> str:
@@ -581,11 +633,13 @@ def _build_request(
     image_references: Iterable[tuple[int, str]],
     video_references: Iterable[_VideoReference],
     audio_references: Iterable[_AudioReference],
+    embedded_video_audio_references: Iterable[_EmbeddedVideoAudioReference],
     lora_triggers: Iterable[str],
 ) -> list[dict[str, Any]]:
     images = list(image_references)
     videos = list(video_references)
     audios = list(audio_references)
+    embedded_video_audios = list(embedded_video_audio_references)
     reference_lines = "\n".join(
         [f"<Picture {index}>: supplied through reference_image_{index}." for index, _ in images]
         + [
@@ -600,6 +654,13 @@ def _build_request(
             f"RMS={item.rms:.4f}, silence={item.silence_ratio:.1%}. "
             "Raw audio is not available to this Qwen-VL model; use Additional reference notes for dialogue, voice, or music details."
             for item in audios
+        ]
+        + [
+            f"<Video {item.video_slot}> paired audio track: supplied through reference_video_audio_{item.video_slot}; "
+            f"{item.audio.duration:.2f}s, {item.audio.sample_rate}Hz, {item.audio.channels} channel(s). "
+            "It belongs to the matching MiniMax H3 ref_video_audio port. Raw audio is not available to Qwen-VL; use Additional reference "
+            "notes for exact dialogue, voice, or music details."
+            for item in embedded_video_audios
         ]
     )
     extra = f"\nAdditional reference notes:\n{reference_text.strip()}" if reference_text.strip() else ""
@@ -627,8 +688,9 @@ Use <Picture N>, <Video N>, <Audio N>, <Voice N>, and <Subject N> labels exactly
 subject_definitions, define each referenced subject and preservation requirement. In retention_analysis, account for
 every supplied visual reference. In detailed_description, write the observable H3 shot/action/camera/dialogue plan.
 Use <d>[Language] exact dialogue</d> for spoken dialogue. Video samples are visual evidence for their matching
-<Video N> labels. Audio metadata is not a transcription: preserve <Audio N> labels and use only supplied notes for
-dialogue, voice, or music details. Include every field even when its value is N/A."""
+<Video N> labels. A paired video audio track belongs to its matching <Video N>, not a separate <Audio N> input.
+Audio metadata is not a transcription: preserve supplied audio labels and use only supplied notes for dialogue,
+voice, or music details. Include every field even when its value is N/A."""
     prompt = f"{ENGINE_TAGS[engine]}\n{brief.strip()}"
     if reference_lines:
         prompt += f"\n\nReference inventory:\n{reference_lines}"
@@ -687,7 +749,7 @@ class Qwen38LocalPromptRefiner:
                         "multiline": True,
                         "default": "",
                         "dynamicPrompts": False,
-                        "tooltip": "Use @reference_image_1, @reference_video_1, or @reference_audio_1 to link exact connected assets.",
+                        "tooltip": "Use @reference_image_1, @reference_video_1, @reference_video_audio_1, or @reference_audio_1 to link exact connected assets.",
                     },
                 ),
                 "engine": (list(ENGINE_TAGS.keys()), {"default": "Auto (standard image)"}),
@@ -714,6 +776,14 @@ class Qwen38LocalPromptRefiner:
                         "tooltip": "Uniform visual samples per reference video for Qwen-VL analysis.",
                     },
                 ),
+                "max_reference_media_seconds": (
+                    "STRING",
+                    {
+                        "default": f"{MAX_REFERENCE_MEDIA_SECONDS:.0f}",
+                        "multiline": False,
+                        "tooltip": "Maximum duration in seconds for each reference video or audio and the total per media type. Leave blank for 15. Enter a value from 2 to 120; for example 16 or 20.5.",
+                    },
+                ),
             },
             "optional": {
                 "reference_text": (
@@ -727,6 +797,15 @@ class Qwen38LocalPromptRefiner:
                 "manual_lora_trigger_words": ("STRING", {"multiline": True, "default": ""}),
                 **optional_images,
                 **optional_videos,
+                **{
+                    f"reference_video_audio_{index}": (
+                        "AUDIO",
+                        {
+                            "tooltip": f"Audio paired with reference_video_{index}. Connect the matching audio output from your video loader; leave empty for a visual-only video reference.",
+                        },
+                    )
+                    for index in range(1, MAX_REFERENCE_VIDEOS + 1)
+                },
                 **optional_audios,
             },
         }
@@ -754,12 +833,28 @@ class Qwen38LocalPromptRefiner:
         lora_preset_2: str = LORA_PRESET_NONE,
         lora_preset_3: str = LORA_PRESET_NONE,
         video_frame_samples: int = 5,
+        max_reference_media_seconds: float | str = MAX_REFERENCE_MEDIA_SECONDS,
         reference_text: str = "",
         manual_lora_trigger_words: str = "",
         **assets: Any,
-    ) -> tuple[str, str]:
+    ) -> tuple[Any, ...]:
         if not brief.strip():
             raise PromptRefinerError("Write a prompt brief before running the node.")
+
+        try:
+            raw_max_media_seconds = str(max_reference_media_seconds).strip()
+            max_media_seconds = (
+                float(raw_max_media_seconds) if raw_max_media_seconds else MAX_REFERENCE_MEDIA_SECONDS
+            )
+        except (TypeError, ValueError) as error:
+            raise PromptRefinerError(
+                "max_reference_media_seconds must be a number from 2 to 120, for example 16 or 20.5."
+            ) from error
+        if not MIN_REFERENCE_MEDIA_SECONDS <= max_media_seconds <= MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS:
+            raise PromptRefinerError(
+                f"max_reference_media_seconds must be between {MIN_REFERENCE_MEDIA_SECONDS:.0f} and "
+                f"{MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS:.0f}."
+            )
 
         model_path = _resolve_model_file(model_name)
         mmproj_path = _resolve_model_file(mmproj_name, allow_none=True)
@@ -770,33 +865,53 @@ class Qwen38LocalPromptRefiner:
         has_audio_inputs = any(
             assets.get(f"reference_audio_{slot}") is not None
             for slot in range(1, MAX_REFERENCE_AUDIOS + 1)
+        ) or any(
+            assets.get(f"reference_video_audio_{slot}") is not None
+            for slot in range(1, MAX_REFERENCE_VIDEOS + 1)
         )
         if (has_video_inputs or has_audio_inputs) and engine != FULL_REFERENCE_ENGINE:
             raise PromptRefinerError("reference_video and reference_audio inputs are available only in MiniMax H3 full reference mode.")
 
         image_references = _get_image_inputs(assets)
         sample_count = min(8, max(2, int(video_frame_samples)))
-        video_references = _get_video_inputs(assets, sample_count)
-        audio_references = _get_audio_inputs(assets)
+        video_references = _get_video_inputs(assets, sample_count, max_media_seconds)
+        audio_references = _get_audio_inputs(assets, max_media_seconds)
+        embedded_video_audio_references = _get_video_audio_inputs(assets, max_media_seconds)
         lora_triggers = _selected_lora_triggers(
             (lora_preset_1, lora_preset_2, lora_preset_3), manual_lora_trigger_words
         )
         if audio_references and not (image_references or video_references):
             raise PromptRefinerError("MiniMax H3 full reference requires at least one image or video when audio is supplied.")
+        videos_by_slot = {item.slot: item for item in video_references}
+        for item in embedded_video_audio_references:
+            video = videos_by_slot.get(item.video_slot)
+            if video is None:
+                raise PromptRefinerError(
+                    f"reference_video_audio_{item.video_slot} is connected, but reference_video_{item.video_slot} is not."
+                )
+            if abs(item.audio.duration - video.duration) > 0.5:
+                raise PromptRefinerError(
+                    f"reference_video_audio_{item.video_slot} is {item.audio.duration:.2f}s, but "
+                    f"reference_video_{item.video_slot} is {video.duration:.2f}s. Paired video and audio must describe the same clip."
+                )
         video_duration = sum(item.duration for item in video_references)
         audio_duration = sum(item.duration for item in audio_references)
-        if video_duration > MAX_REFERENCE_MEDIA_TOTAL_SECONDS + 0.05:
+        if video_duration > max_media_seconds + REFERENCE_DURATION_TOLERANCE_SECONDS:
             raise PromptRefinerError(
-                f"Reference videos total {video_duration:.2f}s; MiniMax H3 full reference accepts at most "
-                f"{MAX_REFERENCE_MEDIA_TOTAL_SECONDS:.0f}s."
+                f"Reference videos total {video_duration:.2f}s; the configured total limit is "
+                f"{max_media_seconds:.2f}s."
             )
-        if audio_duration > MAX_REFERENCE_MEDIA_TOTAL_SECONDS + 0.05:
+        if audio_duration > max_media_seconds + REFERENCE_DURATION_TOLERANCE_SECONDS:
             raise PromptRefinerError(
-                f"Reference audios total {audio_duration:.2f}s; MiniMax H3 full reference accepts at most "
-                f"{MAX_REFERENCE_MEDIA_TOTAL_SECONDS:.0f}s."
+                f"Reference audios total {audio_duration:.2f}s; the configured total limit is "
+                f"{max_media_seconds:.2f}s."
             )
         normalized_brief = _normalize_asset_links(
-            brief, image_references, video_references, audio_references
+            brief,
+            image_references,
+            video_references,
+            audio_references,
+            embedded_video_audio_references,
         )
         if (image_references or video_references) and not mmproj_path:
             raise PromptRefinerError("Reference images or video samples require a matching mmproj GGUF selected from models/LLM.")
@@ -816,6 +931,7 @@ class Qwen38LocalPromptRefiner:
             image_references,
             video_references,
             audio_references,
+            embedded_video_audio_references,
             lora_triggers,
         )
 
@@ -835,7 +951,9 @@ class Qwen38LocalPromptRefiner:
                 f"local llama.cpp | model={Path(model_path).name} | "
                 f"mmproj={Path(mmproj_path).name if mmproj_path else 'none'} | "
                 f"images={len(image_references)} | videos={len(video_references)} ({video_duration:.2f}s) | "
-                f"audios={len(audio_references)} ({audio_duration:.2f}s) | lora_triggers={len(lora_triggers)} | "
+                f"audios={len(audio_references)} ({audio_duration:.2f}s) | "
+                f"paired_video_audios={len(embedded_video_audio_references)} | media_limit={max_media_seconds:.2f}s | "
+                f"lora_triggers={len(lora_triggers)} | "
                 f"cached={keep_model_loaded}"
             )
             return (prompt, debug)
