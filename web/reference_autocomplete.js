@@ -1,10 +1,13 @@
 import { app } from "../../scripts/app.js";
 
-const NODE_NAME = "Qwen38LocalPromptRefiner";
+const NODE_NAMES = new Set(["Qwen38LocalPromptRefiner", "Qwen38LongVideoDirectorPlanner"]);
 const WIDGET_NAME = "brief";
+const EXTERNAL_BRIEF_INPUT = "external_brief";
 const ASSET_TYPES = [
   { prefix: "reference_image_", icon: "🖼", label: "Picture" },
   { prefix: "reference_video_", icon: "🎞", label: "Video" },
+  { prefix: "reference_video_frames_", tokenPrefix: "reference_video_", icon: "🎞", label: "Director video" },
+  { prefix: "reference_video_audio_", icon: "🔉", label: "Video audio" },
   { prefix: "reference_audio_", icon: "🔊", label: "Audio" },
 ];
 
@@ -20,7 +23,7 @@ function availableAssets(node) {
       const name = `${type.prefix}${slot}`;
       if (inputIsLinked(node, name)) {
         assets.push({
-          token: `@${name}`,
+          token: `@${type.tokenPrefix ?? type.prefix}${slot}`,
           title: `${type.icon} ${type.label} ${slot}`,
           detail: name,
         });
@@ -60,10 +63,16 @@ function createMenu() {
   return menu;
 }
 
-function attachAutocomplete(node, widget) {
-  const textarea = widget?.inputEl ?? widget?.element;
-  if (!(textarea instanceof HTMLTextAreaElement) || textarea.dataset.qwen38AutocompleteAttached) return;
-  textarea.dataset.qwen38AutocompleteAttached = "true";
+function editableTextElement(widget) {
+  const element = widget?.inputEl ?? widget?.element;
+  return element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement ? element : null;
+}
+
+function attachAutocomplete(assetNode, editableNode, widget) {
+  const textarea = editableTextElement(widget);
+  const bindingKey = `qwen38AutocompleteAttached${assetNode.id}`;
+  if (!textarea || textarea.dataset[bindingKey]) return;
+  textarea.dataset[bindingKey] = "true";
 
   const menu = createMenu();
   let choices = [];
@@ -82,7 +91,8 @@ function attachAutocomplete(node, widget) {
     const value = `${textarea.value.slice(0, range.start)}${choice.token}${textarea.value.slice(range.end)}`;
     const cursor = range.start + choice.token.length;
     const sync = () => {
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      const elementPrototype = textarea instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeSetter = Object.getOwnPropertyDescriptor(elementPrototype, "value")?.set;
       if (nativeSetter) nativeSetter.call(textarea, value);
       else textarea.value = value;
       textarea.selectionStart = cursor;
@@ -90,7 +100,7 @@ function attachAutocomplete(node, widget) {
       widget.value = value;
       if (widget.inputEl && widget.inputEl !== textarea) widget.inputEl.value = value;
       if (widget.element && widget.element !== textarea) widget.element.value = value;
-      node.setDirtyCanvas?.(true, true);
+      editableNode.setDirtyCanvas?.(true, true);
     };
     sync();
     widget.callback?.(value);
@@ -139,7 +149,7 @@ function attachAutocomplete(node, widget) {
       return;
     }
     const query = replacement.query;
-    choices = availableAssets(node).filter((choice) => choice.token.slice(1).toLowerCase().includes(query));
+    choices = availableAssets(assetNode).filter((choice) => choice.token.slice(1).toLowerCase().includes(query));
     if (!choices.length) {
       hide();
       return;
@@ -174,17 +184,156 @@ function attachAutocomplete(node, widget) {
     }
   });
 
-  const originalOnRemoved = node.onRemoved;
-  node.onRemoved = function (...args) {
+  const originalOnRemoved = assetNode.onRemoved;
+  assetNode.onRemoved = function (...args) {
     menu.remove();
     return originalOnRemoved?.apply(this, args);
   };
 }
 
+function linkedTextSource(node) {
+  const input = node.inputs?.find((item) => item?.name === EXTERNAL_BRIEF_INPUT);
+  const linkId = input?.link ?? input?.links?.[0];
+  if (linkId == null) return null;
+  const link = node.graph?.links?.[linkId] ?? app.graph?.links?.[linkId];
+  if (!link) return null;
+  return node.graph?.getNodeById?.(link.origin_id) ?? app.graph?.getNodeById?.(link.origin_id) ?? null;
+}
+
+function externalTextWidget(sourceNode) {
+  const widgets = sourceNode?.widgets ?? [];
+  const preferredNames = /^(brief|text|string|value|prompt)$/i;
+  return (
+    widgets.find((widget) => preferredNames.test(widget?.name ?? "") && editableTextElement(widget))
+    ?? widgets.find((widget) => editableTextElement(widget))
+    ?? null
+  );
+}
+
+function attachExternalBriefAutocomplete(assetNode) {
+    const sourceNode = linkedTextSource(assetNode);
+    const widget = externalTextWidget(sourceNode);
+    if (sourceNode && widget) attachAutocomplete(assetNode, sourceNode, widget);
+}
+
+function normalizeDirectorGroupSpecs(value) {
+  let specs = value;
+  // ComfyUI merges one UI result as [[{...}, {...}]].
+  while (Array.isArray(specs) && specs.length === 1 && Array.isArray(specs[0])) specs = specs[0];
+  return Array.isArray(specs) ? specs.filter((item) => item && typeof item === "object") : [];
+}
+
+function isLongDirectorPlanner(node) {
+  return (node?.comfyClass ?? node?.type) === "Qwen38LongVideoDirectorPlanner";
+}
+
+function savedWidgetNames(workflowNode) {
+  const names = [];
+  for (const input of workflowNode?.inputs ?? []) {
+    const name = input?.widget?.name;
+    if (!name) continue;
+    names.push(name);
+    // Comfy serializes the seed's after-generate control as one extra widget
+    // value, even though it has no separate input socket in workflow JSON.
+    if (name === "seed") names.push("control_after_generate");
+  }
+  return names;
+}
+
+const LEGACY_WIDGET_ORDERS = {
+  Qwen38LocalPromptRefiner: [
+    "brief", "engine", "model_name", "mmproj_name", "vision_handler", "context_length", "gpu_layers",
+    "temperature", "top_p", "max_tokens", "seed", "control_after_generate", "keep_model_loaded",
+    "lora_preset_1", "lora_preset_2", "lora_preset_3", "video_frame_samples", "max_reference_media_seconds",
+    "reference_text", "manual_lora_trigger_words",
+  ],
+  Qwen38LongVideoDirectorPlanner: [
+    "brief", "director_mode", "total_duration_seconds", "segment_duration_seconds", "example_preset",
+    "model_name", "mmproj_name", "vision_handler", "context_length", "gpu_layers", "temperature", "top_p",
+    "max_tokens", "seed", "control_after_generate", "keep_model_loaded", "lora_preset_1", "lora_preset_2",
+    "lora_preset_3", "video_frame_samples", "reference_text", "manual_lora_trigger_words",
+  ],
+};
+
+function hasLegacyWidgetValueShift(nodeName, values) {
+  if (nodeName === "Qwen38LocalPromptRefiner") {
+    // Before example_preset was added, index 2 was model_name. A GGUF at that
+    // position proves a positional shift even if an autosave has newer inputs.
+    return typeof values?.[2] === "string" && /\.(gguf|ggml)(?:$|[\\/])/i.test(values[2]);
+  }
+  // Before planning_quality was added, index 2 was total_duration_seconds.
+  const shiftedTotal = values?.[2];
+  return typeof shiftedTotal === "number"
+    || (typeof shiftedTotal === "string" && /^\d+(?:\.\d+)?$/.test(shiftedTotal));
+}
+
+function setWidgetValue(widget, value) {
+  if (!widget) return;
+  widget.value = value;
+  const element = widget.inputEl ?? widget.element;
+  if (element && "value" in element) element.value = value;
+  widget.callback?.(value);
+}
+
+function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
+  const oldValues = workflowNode?.widgets_values;
+  if (!Array.isArray(oldValues) || !Array.isArray(workflowNode?.inputs)) return false;
+
+  const savedNames = savedWidgetNames(workflowNode);
+  const savedNameSet = new Set(savedNames);
+  const missingCurrentControls = nodeName === "Qwen38LocalPromptRefiner"
+    ? !savedNameSet.has("example_preset")
+    : !savedNameSet.has("planning_quality") || !savedNameSet.has("director_execution");
+  const needsMigration = missingCurrentControls || hasLegacyWidgetValueShift(nodeName, oldValues);
+  if (!needsMigration) return false;
+
+  const sourceNames = missingCurrentControls ? savedNames : LEGACY_WIDGET_ORDERS[nodeName];
+  if (!sourceNames) return false;
+
+  const valueByName = new Map();
+  sourceNames.forEach((name, index) => {
+    if (index < oldValues.length) valueByName.set(name, oldValues[index]);
+  });
+  for (const widget of node.widgets ?? []) {
+    if (valueByName.has(widget.name)) setWidgetValue(widget, valueByName.get(widget.name));
+  }
+
+  // New controls did not exist in the saved node, so positional restoration
+  // leaves them holding unrelated old values. Reset only those new controls.
+  if (nodeName === "Qwen38LocalPromptRefiner") {
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "example_preset"), "None");
+  } else {
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "planning_quality"), "Balanced (recommended)");
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "director_execution"), "Preview plan only (Director blocked)");
+  }
+
+  // Persist the corrected current-order values the next time Comfy saves the
+  // workflow, so a later restart does not shift video_frame_samples, reference
+  // text, or literal LoRA trigger words again.
+  workflowNode.widgets_values = (node.widgets ?? []).map((widget) => widget.value);
+  node.properties ??= {};
+  node.properties.qwen38WidgetLayout = "2026-09-12";
+  node.setDirtyCanvas?.(true, true);
+  return true;
+}
+
+function refreshDirectorGroupPreviews() {
+  const graph = app.graph ?? app.canvas?.graph;
+  for (const graphNode of graph?._nodes ?? graph?.nodes ?? []) {
+    graphNode?._minimaxEditor?.syncExternalGroupsTimeline?.();
+  }
+}
+
 app.registerExtension({
   name: "Qwen38LocalPromptRefiner.ReferenceAutocomplete",
   beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== NODE_NAME) return;
+    if (!NODE_NAMES.has(nodeData.name)) return;
+    const originalOnConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function (workflowNode) {
+      const configured = originalOnConfigure?.apply(this, arguments);
+      migrateLegacyWidgetLayout(this, workflowNode, nodeData.name);
+      return configured;
+    };
     const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function (...args) {
       const result = originalOnNodeCreated?.apply(this, args);
@@ -192,12 +341,37 @@ app.registerExtension({
       const attach = () => {
         const widget = this.widgets?.find((item) => item?.name === WIDGET_NAME);
         if (widget?.inputEl ?? widget?.element) {
-          attachAutocomplete(this, widget);
-          return;
+          attachAutocomplete(this, this, widget);
         }
+        attachExternalBriefAutocomplete(this);
         if (attempts++ < 20) setTimeout(attach, 100);
       };
       attach();
+
+      if (isLongDirectorPlanner(this)) {
+        const restoredSpecs = normalizeDirectorGroupSpecs(this.properties?.qwen38DirectorGroupSpecs);
+        if (restoredSpecs.length) this._qwen38DirectorGroupSpecs = restoredSpecs;
+        const originalOnExecuted = this.onExecuted;
+        this.onExecuted = function (message) {
+          const executedResult = originalOnExecuted?.apply(this, arguments);
+          const specs = normalizeDirectorGroupSpecs(message?.qwen38_director_groups);
+          if (specs.length) {
+            this._qwen38DirectorGroupSpecs = specs;
+            this.properties ??= {};
+            this.properties.qwen38DirectorGroupSpecs = specs;
+            this.setDirtyCanvas?.(true, true);
+            queueMicrotask(refreshDirectorGroupPreviews);
+          }
+          return executedResult;
+        };
+      }
+
+      const originalOnConnectionsChange = this.onConnectionsChange;
+      this.onConnectionsChange = function (...connectionArgs) {
+        const connectionResult = originalOnConnectionsChange?.apply(this, connectionArgs);
+        requestAnimationFrame(() => attachExternalBriefAutocomplete(this));
+        return connectionResult;
+      };
       return result;
     };
   },

@@ -81,7 +81,19 @@ Ambient/foley audio description.
 non_diegetic_music:
 Background score description.
 
-#### 8. [VIDEO: MINIMAX 360° PANO I2V] (Triggers: @minimax-pano, @i2v-pano)
+#### 8. [VIDEO: MINIMAX FL2VA / FIRST-LAST-FRAME] (Triggers: @minimax-fl2v, @fl2v, @fl2va, "minimax first last frame")
+- Output EXACTLY these three sections:
+integrated_multimodal_description:
+overall_soundscape:
+non_diegetic_music:
+- <Picture 1>, when supplied, is the first-frame keyframe at 0.00 seconds. Fully preserve its identity, outfit, composition, and starting camera view.
+- <Picture 2>, when supplied, is the final-frame keyframe at the final frame. Fully preserve its identity, outfit, composition, and ending camera view.
+- With both keyframes, describe one continuous and physically plausible visual transition from <Picture 1> to <Picture 2>.
+- With only <Picture 1>, write forward motion that begins from it; do not invent a final keyframe.
+- With only <Picture 2>, write motion that resolves into it at the end; never call it the starting frame.
+- Treat <Picture 3> through <Picture 9> as supplemental visual references only. Keep dialogue inside <d>[Language] exact dialogue</d>.
+
+#### 9. [VIDEO: MINIMAX 360° PANO I2V] (Triggers: @minimax-pano, @i2v-pano)
 - Mandatory First Line:
 For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 
@@ -92,7 +104,7 @@ Spatial audio cues (e.g., sound echoing from behind).
 non_diegetic_music:
 Background score.
 
-#### 9. [VIDEO: MINIMAX FULL-REFERENCE / EXTENDED] (Triggers: @minimax-fullref, @minimax-a2v, @minimax-v2v)
+#### 10. [VIDEO: MINIMAX FULL-REFERENCE / EXTENDED] (Triggers: @minimax-fullref, @minimax-a2v, @minimax-v2v)
 - Output EXACTLY these 6 sections:
 subject_definitions:
 summary:
@@ -101,12 +113,12 @@ detailed_description:
 overall_soundscape:
 non_diegetic_music:
 
-#### 10. [VIDEO: LTX-2.3 & LTXV] (Triggers: @ltx, @ltx-video, @ltxv-i2v)
+#### 11. [VIDEO: LTX-2.3 & LTXV] (Triggers: @ltx, @ltx-video, @ltxv-i2v)
 - Format: Single continuous English prompt.
 - For T2V: [Subject + Action]. [Environment/Lighting]. [Camera Movement]. [Soundscape/Audio]. [Dialogue in quotes with voice tone]. [Quality descriptors].
 - For I2V: Focus strictly on temporal dynamics, motion trajectories, camera movement, and audio (omit redundant static visual descriptions).
 
-#### 11. [VIDEO: STORYBOARD] (Triggers: @storyboard, @scenes, "storyboard")
+#### 12. [VIDEO: STORYBOARD] (Triggers: @storyboard, @scenes, "storyboard")
 - Output exactly 10 scenes (or requested count).
 - Each scene on a single line, formatted as:
 [Reference Images], [Character Action and Camera Description], [Dialogue/Whisper in quotes], [Cinematic Tags], NO MUSIC
