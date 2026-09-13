@@ -44,7 +44,9 @@ Add **LLM / Prompt Refiner → Qwen3.8 Long Video Planner → MiniMax H3 Directo
 Director groups. The planner calls local Qwen once, splits the whole brief and dialogue into H3-safe 4–15 second
 segments, then returns a complete `MMX_DIR_GROUP` list. It is compatible with the external-group API of
 [AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director); do **not** put a
-`Director Groups Combine` node between this planner and the Director.
+`Director Groups Combine` node between this planner and the Director when using the **direct** output path. The
+separate **materialize native groups** workflow below deliberately creates a Combine node after you have reviewed a
+plan.
 
 1. Set **director mode**:
    - **MiniMax H3 Director FL2V (i2v_groups)** → connect `director_groups` directly to Director **i2v_groups** and
@@ -90,6 +92,32 @@ segments, then returns a complete `MMX_DIR_GROUP` list. It is compatible with th
    references, duration, model settings, or other planner inputs changed since Preview, Release deliberately still
    uses the old preview and marks `release_last_preview_input_changed` in `debug`; choose Preview once more when you
    want those edits to take effect. The in-memory cache is cleared when ComfyUI restarts.
+
+### Materialize native Director Groups (recommended for review)
+
+After a successful **Preview plan only** run, the Qwen planner node shows a **生成原生 Director Groups** button (the
+same command is available from its right-click menu). It converts the reviewed Qwen plan into the Director's own graph
+nodes, without patching or depending on a modified Director frontend:
+
+1. It creates one native `MiniMax H3 Director Group (Reference to Video)` node per R2V segment, or one native
+   `MiniMax H3 Director Group (Image to Video)` node per FL2V segment.
+2. It writes each segment's generated prompt and story-driven duration into that node, then copies only the exact
+   `Picture / Video / paired Video Audio / Audio` wires that Qwen assigned to the segment. FL2V maps project Picture 1
+   to only the first group’s first-frame input and project Picture 2 to only the last group’s last-frame input.
+3. It creates a native `MiniMax H3 Director Groups Combine`, connects every new Group in chronological order, and
+   connects the Combine output to Director `r2v_groups` or `i2v_groups`. The previous direct `director_groups` wire is
+   removed so the Director sees only its own native graph structure.
+4. It sets the Director task to R2V or FL2V, transfers Qwen's per-segment **引用上段** choices, and enables the
+   Director master **段间引导** only when at least one planned seam is continuous.
+5. It sets the Qwen planner node to **Never**. Therefore the next Queue runs the native Groups and Director without
+   another Qwen inference. To revise the story later, change the Qwen node back to **Always**, run Preview again, then
+   materialize the replacement plan. Clicking materialize again asks before replacing only the nodes tagged as generated
+   by that same Qwen node; it never deletes your unrelated Director Groups.
+
+This two-queue design is intentional: ComfyUI constructs its execution graph before a queue begins, so Group nodes
+created after Qwen finishes cannot execute during that same queue. It lets you inspect and edit native Director group
+cards, source-media wiring, durations, selection, and continuity before sampling. It is also robust to future Director
+updates because this plugin creates Director's published native nodes instead of modifying Director files.
 
 ### FL2V long projects
 
