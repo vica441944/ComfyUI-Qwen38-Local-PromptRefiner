@@ -604,6 +604,111 @@ N/A
         self.assertEqual(required["segment_duration_seconds"][1]["min"], 4.0)
         self.assertEqual(required["segment_duration_seconds"][1]["max"], 15.0)
 
+    def _plan_until_duration(self, **overrides: object) -> None:
+        planner = nodes.Qwen38LongVideoDirectorPlanner()
+        kwargs = dict(
+            brief="A complete night-office story.",
+            director_mode=R2V,
+            total_duration_seconds=60.0,
+            segment_duration_seconds=10.0,
+            model_name="missing.gguf",
+            mmproj_name="none",
+            vision_handler="auto (Qwen3-VL)",
+            context_length=32768,
+            gpu_layers=-1,
+            temperature=0.4,
+            top_p=0.9,
+            max_tokens=4096,
+            seed=1,
+            keep_model_loaded=False,
+        )
+        kwargs.update(overrides)
+        planner.plan(**kwargs)
+
+    def test_external_total_duration_overrides_widget_and_rejects_241(self) -> None:
+        input_types = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()
+        self.assertNotIn("external_total_duration_seconds", input_types["required"])
+        socket = input_types["optional"]["external_total_duration_seconds"]
+        self.assertEqual(socket[0], "FLOAT")
+        self.assertTrue(socket[1]["forceInput"])
+        self.assertNotIn("min", socket[1])
+        self.assertNotIn("max", socket[1])
+        self.assertEqual(input_types["required"]["segment_duration_seconds"][1]["min"], 4.0)
+        self.assertEqual(input_types["required"]["segment_duration_seconds"][1]["max"], 15.0)
+
+        overridden, source = nodes._effective_total_duration_seconds(60.0, 90)
+        self.assertEqual(overridden, 90.0)
+        self.assertEqual(source, "external_total_duration_seconds")
+        self.assertEqual(len(nodes._director_duration_schedule(overridden, 10.0)), 9)
+
+        from_int, int_source = nodes._effective_total_duration_seconds(60.0, 48)
+        self.assertEqual(from_int, 48.0)
+        self.assertEqual(int_source, "external_total_duration_seconds")
+
+        at_cap, cap_source = nodes._effective_total_duration_seconds(60.0, 240)
+        self.assertEqual(cap_source, "external_total_duration_seconds")
+        capped_schedule = nodes._director_duration_schedule(at_cap, 10.0)
+        self.assertEqual(len(capped_schedule), 24)
+        self.assertAlmostEqual(sum(capped_schedule), 240.0, places=3)
+
+        for missing in (None, "", "   "):
+            fallback, fallback_source = nodes._effective_total_duration_seconds(60.0, missing)
+            self.assertEqual(fallback, 60.0)
+            self.assertEqual(fallback_source, "total_duration_seconds")
+
+        illegal, illegal_source = nodes._effective_total_duration_seconds(60.0, 241)
+        self.assertEqual(illegal, 241.0)
+        self.assertEqual(illegal_source, "external_total_duration_seconds")
+        with self.assertRaises(nodes.PromptRefinerError) as over_limit:
+            nodes._director_duration_schedule(illegal, 10.0)
+        message = str(over_limit.exception)
+        self.assertIn("total_duration_seconds", message)
+        self.assertIn("240", message)
+        self.assertIn("241", message)
+        self.assertIn("not clamped", message)
+        self.assertNotIn("60", message)
+
+        below, below_source = nodes._effective_total_duration_seconds(60.0, 3)
+        self.assertEqual(below_source, "external_total_duration_seconds")
+        with self.assertRaises(nodes.PromptRefinerError) as under_limit:
+            nodes._director_duration_schedule(below, 10.0)
+        self.assertIn("3", str(under_limit.exception))
+
+        with self.assertRaises(nodes.PromptRefinerError) as bad_type:
+            nodes._effective_total_duration_seconds(60.0, "soon")
+        self.assertIn("external_total_duration_seconds", str(bad_type.exception))
+
+        seen: dict[str, float] = {}
+        real_schedule = nodes._director_duration_schedule
+
+        def capture(total: float, segment: float) -> tuple[float, ...]:
+            seen["total"] = total
+            seen["segment"] = segment
+            raise nodes.PromptRefinerError("stop-after-duration")
+
+        nodes._director_duration_schedule = capture
+        try:
+            for external, expected in ((90, 90.0), (48, 48.0), (None, 60.0)):
+                with self.assertRaises(nodes.PromptRefinerError) as stopped:
+                    self._plan_until_duration(external_total_duration_seconds=external)
+                self.assertEqual(str(stopped.exception), "stop-after-duration")
+                self.assertEqual(seen["total"], expected)
+                self.assertEqual(seen["segment"], 10.0)
+            with self.assertRaises(nodes.PromptRefinerError) as stopped_default:
+                self._plan_until_duration()
+            self.assertEqual(str(stopped_default.exception), "stop-after-duration")
+            self.assertEqual(seen["total"], 60.0)
+        finally:
+            nodes._director_duration_schedule = real_schedule
+
+        with self.assertRaises(nodes.PromptRefinerError) as planned_over_limit:
+            self._plan_until_duration(total_duration_seconds=60.0, external_total_duration_seconds=241)
+        planned_message = str(planned_over_limit.exception)
+        self.assertIn("total_duration_seconds", planned_message)
+        self.assertIn("241", planned_message)
+        self.assertIn("not clamped", planned_message)
+        self.assertNotIn("stop-after-duration", planned_message)
+
     def test_widget_default_and_cache_key(self) -> None:
         required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
         names = list(required)

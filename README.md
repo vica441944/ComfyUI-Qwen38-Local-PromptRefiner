@@ -54,7 +54,12 @@ plan.
    - **MiniMax H3 Director R2V (r2v_groups)** → connect `director_groups` directly to Director **r2v_groups** and
      set the Director task type to `r2v`.
 2. Set **total duration seconds** (4–240) and **segment duration seconds** (4–15). A total outside that range
-   is an error; the planner does not clamp it down to the maximum. The segment value is a preferred beat
+   is an error; the planner does not clamp it down to the maximum. The widget remains for local tweaking. For the
+   API or NVStudio, connect a Primitive float or Primitive int to the optional **external total duration seconds**
+   socket and tag that Primitive `(Input:duration)`. A connected number overrides the widget; an unconnected socket
+   keeps the widget value. The socket uses the same 4–240 check, so 241 and other illegal totals raise an error
+   instead of being clamped. Workflows saved before this socket existed still load, because the input is optional.
+   The segment value is a preferred beat
    length: the planner creates `ceil(total / segment)` groups, then Qwen assigns each group a story-driven 4–15 second
    duration while keeping the exact total. For example, 60 seconds at a 10-second target produces six groups, and
    240 seconds at a 10-second target produces 24 groups. Qwen may still vary the rhythm: six groups can be
