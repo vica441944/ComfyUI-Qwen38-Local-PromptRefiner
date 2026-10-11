@@ -53,10 +53,12 @@ plan.
      set the Director task type to `fl2v`.
    - **MiniMax H3 Director R2V (r2v_groups)** → connect `director_groups` directly to Director **r2v_groups** and
      set the Director task type to `r2v`.
-2. Set **total duration seconds** (4–120) and **segment duration seconds** (4–15). The latter is a preferred beat
+2. Set **total duration seconds** (4–240) and **segment duration seconds** (4–15). A total outside that range
+   is an error; the planner does not clamp it down to the maximum. The segment value is a preferred beat
    length: the planner creates `ceil(total / segment)` groups, then Qwen assigns each group a story-driven 4–15 second
-   duration while keeping the exact total. For example, 60 seconds at a 10-second target produces six groups, but a
-   natural rhythm can be `7 / 12 / 8 / 11 / 10 / 12` seconds instead of six mechanically equal clips.
+   duration while keeping the exact total. For example, 60 seconds at a 10-second target produces six groups, and
+   240 seconds at a 10-second target produces 24 groups. Qwen may still vary the rhythm: six groups can be
+   `7 / 12 / 8 / 11 / 10 / 12` seconds instead of six mechanically equal clips.
    If Qwen makes a simple arithmetic mistake (for example, its six beats total 70 seconds for a 60-second project), the
    node automatically rescales those beats to the exact requested total while preserving their relative rhythm and the
    legal 4–15 second limit. It does not spend another Qwen inference merely to correct duration math.
@@ -83,7 +85,7 @@ plan.
       to the beat, the previous card's handoff, a one-line look at the next beat, and the references assigned to the
       group. It does not see the H3 prompts written for the other groups, and its token ceiling is the selected
       profile's budget for **one** group (raised up to your `max_tokens`, and never multiplied by the group count).
-      A 60–120 second project therefore keeps the same per-beat density as a short one.
+      A 60–240 second project therefore keeps the same per-beat density as a short one.
 
    The model stays loaded across the structure pass and every segment refine inside that queue. **keep model loaded**
    still decides whether it remains available after the node finishes. `debug` prints a `per_segment_refine:` block
