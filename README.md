@@ -41,8 +41,8 @@ Add **LLM / Prompt Refiner → Qwen3.8 Local Prompt Refiner (GGUF)**.
 ## Long Video Planner for MiniMax H3 Director
 
 Add **LLM / Prompt Refiner → Qwen3.8 Long Video Planner → MiniMax H3 Director** when one story must span multiple
-Director groups. The planner calls local Qwen once, splits the whole brief and dialogue into H3-safe 4–15 second
-segments, then returns a complete `MMX_DIR_GROUP` list. It is compatible with the external-group API of
+Director groups. The planner splits the whole brief and dialogue into H3-safe 4–15 second segments, then writes each
+group's director prompt on its own. It returns a complete `MMX_DIR_GROUP` list and is compatible with the external-group API of
 [AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director); do **not** put a
 `Director Groups Combine` node between this planner and the Director when using the **direct** output path. The
 separate **materialize native groups** workflow below deliberately creates a Combine node after you have reviewed a
@@ -67,10 +67,33 @@ plan.
    visual references, sound, continuity, and shot timing more output budget. It is not merely longer prose: every
    profile now requires observable action, timestamped internal shots when a cut is warranted, stable speaker IDs,
    dialogue pacing, physical sound, and a usable continuity handoff. Use **context length = 32768** for Balanced or
-   High quality when VRAM permits; 16K can constrain a multi-group plan with visual references. The effective token
-   ceiling and a context recommendation are printed in `debug`. All profiles request zero reasoning tokens from
-   compatible llama.cpp builds, so they return final prompts directly rather than spending time on visible `<think>`
-   output.
+   High quality when a beat includes several visual references. Per-segment refinement no longer packs every group's
+   prompt into one completion, so context pressure does not grow with the group count the way a single mega-plan did.
+   The effective token ceiling, whether it applies per segment or to the whole plan, and a context recommendation are
+   printed in `debug`. All profiles request zero reasoning tokens from compatible llama.cpp builds, so they return
+   final prompts directly rather than spending time on visible `<think>` output.
+
+   **prompt refinement** defaults to **Per segment (recommended)**. Planning then has two phases:
+
+   1. **Structure.** One short Qwen call splits the brief into the group count from the duration math. Each card has
+      a 4–15 second duration, a continuity flag, the references that beat uses, a story slice, verbatim dialogue, and
+      an ending handoff. This pass does not write H3 prompts. A project with only one group skips it and refines the
+      brief directly.
+   2. **Independent refine.** Each group gets its own Qwen call. That call sees the story slice, the dialogue assigned
+      to the beat, the previous card's handoff, a one-line look at the next beat, and the references assigned to the
+      group. It does not see the H3 prompts written for the other groups, and its token ceiling is the selected
+      profile's budget for **one** group (raised up to your `max_tokens`, and never multiplied by the group count).
+      A 60–120 second project therefore keeps the same per-beat density as a short one.
+
+   The model stays loaded across the structure pass and every segment refine inside that queue. **keep model loaded**
+   still decides whether it remains available after the node finishes. `debug` prints a `per_segment_refine:` block
+   with one line per group (`attempt`, continuity, asset slots, `prompt_words`, `beat_chars`). `plan_json` stores the
+   same beat, dialogue, and handoff beside each prompt.
+
+   **Single shot (legacy)** restores the previous behavior: one Qwen call writes every group's H3 prompt. Choose it
+   when you want a single inference and accept that later beats get less room as the group count rises. Workflows
+   saved before this control existed load with **Per segment (recommended)**; other widget values are restored by
+   name. Release still never calls Qwen: it resends the last preview, including that preview's refine trace.
 3. Put the complete story and all dialogue in **brief**. The node preserves speaker IDs and splits dialogue at natural
    meaning boundaries rather than truncating it at a group boundary. Use `@reference_image_1`,
    `@reference_video_1`, `@reference_video_audio_1`, and `@reference_audio_1` to bind exact connected assets.
@@ -149,7 +172,8 @@ Outputs:
 - `director_groups`: ready-to-connect multi-group list for the correct Director port.
 - `segment_prompts`: readable Group 1…N prompts with time ranges and continuity flags.
 - `plan_json`: the serializable plan and asset assignment record, useful for review or copying.
-- `debug`: local execution summary including the required Director port.
+- `debug`: local execution summary including the required Director port. Per-segment runs also list each independent
+  refine step under `per_segment_refine:`.
 
 The planner uses a newline-safe marked response format internally instead of embedding every multi-line H3 prompt in
 one large JSON string. Existing valid JSON plans remain readable, but new long plans are more resilient to dialogue,
@@ -234,7 +258,10 @@ The node requires a current `llama-cpp-python` build with the generic `MTMDChatH
 
 Older workflows are migrated in the browser when they load. The migration restores widget values by their saved names,
 so later plugin additions cannot shift `video_frame_samples`, `reference_text`, or `manual_lora_trigger_words` into one
-another. After opening an old workflow once with the current plugin, save it to persist the corrected layout.
+another. A long-video workflow saved before **prompt refinement** existed keeps its other settings and defaults that
+new control to **Per segment (recommended)**. Choose **Single shot (legacy)** and queue Preview again when you need
+the previous one-call plan. After opening an old workflow once with the current plugin, save it to persist the
+corrected layout.
 
 ## Outputs
 
