@@ -321,6 +321,44 @@ def _effective_brief(widget_brief: Any, external_brief: Any) -> tuple[str, str]:
     return str(widget_brief or "").strip(), "brief"
 
 
+def _external_duration_is_unset(value: Any) -> bool:
+    """True when the duration socket is disconnected or carries no number."""
+
+    if value is None:
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _coerce_duration_seconds(value: Any, field_name: str) -> float:
+    """Parse a widget or socket duration without clamping it into range."""
+
+    raw = value.strip() if isinstance(value, str) else value
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError) as error:
+        raise PromptRefinerError(
+            f"{field_name} must be a number of seconds; received {value!r}."
+        ) from error
+    return seconds
+
+
+def _effective_total_duration_seconds(widget_seconds: Any, external_seconds: Any) -> tuple[float, str]:
+    """Prefer a connected duration socket without losing the editable widget.
+
+    ``None`` and blank text mean the socket is disconnected, matching
+    ``external_brief``. Any connected number, including one outside 4–240,
+    replaces the widget. Range checks stay in ``_director_duration_schedule``
+    so an illegal total is rejected instead of clamped.
+    """
+
+    if _external_duration_is_unset(external_seconds):
+        return _coerce_duration_seconds(widget_seconds, "total_duration_seconds"), "total_duration_seconds"
+    return (
+        _coerce_duration_seconds(external_seconds, "external_total_duration_seconds"),
+        "external_total_duration_seconds",
+    )
+
+
 def _route_system() -> str:
     """Load the prompt-refiner's local Ollama routing profile, with a safe fallback."""
 
@@ -3430,8 +3468,9 @@ class Qwen38LongVideoDirectorPlanner:
                         "step": 1.0,
                         "tooltip": (
                             f"Project length in seconds ({MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–"
-                            f"{MAX_DIRECTOR_TOTAL_SECONDS:.0f}). A value outside that range is rejected; "
-                            "the planner does not shorten an over-limit total."
+                            f"{MAX_DIRECTOR_TOTAL_SECONDS:.0f}) for local tweaking. A value outside that "
+                            "range is rejected; the planner does not shorten an over-limit total. A connected "
+                            "external_total_duration_seconds socket overrides this widget."
                         ),
                     },
                 ),
@@ -3532,6 +3571,19 @@ class Qwen38LongVideoDirectorPlanner:
                         ),
                     },
                 ),
+                "external_total_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "forceInput": True,
+                        "tooltip": (
+                            "Optional upstream FLOAT for API or NVStudio. Primitive int also connects. "
+                            "Wire a Primitive tagged (Input:duration) here. A connected number overrides "
+                            f"total_duration_seconds; leave this socket empty to keep the widget. Values outside "
+                            f"{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{MAX_DIRECTOR_TOTAL_SECONDS:.0f} seconds are "
+                            "rejected and are not clamped."
+                        ),
+                    },
+                ),
                 "reference_text": (
                     "STRING",
                     {
@@ -3588,6 +3640,7 @@ class Qwen38LongVideoDirectorPlanner:
         lora_preset_3: str = LORA_PRESET_NONE,
         video_frame_samples: int = 3,
         external_brief: str = "",
+        external_total_duration_seconds: float | None = None,
         reference_text: str = "",
         manual_lora_trigger_words: str = "",
         unique_id: str | int = "",
@@ -3596,10 +3649,14 @@ class Qwen38LongVideoDirectorPlanner:
         effective_brief, brief_source = _effective_brief(brief, external_brief)
         if not effective_brief:
             raise PromptRefinerError("Write the complete long-video brief before running the Director planner.")
+        effective_total_seconds, duration_source = _effective_total_duration_seconds(
+            total_duration_seconds,
+            external_total_duration_seconds,
+        )
         engine = _director_mode_engine(director_mode)
         quality_profile = _director_long_quality_profile(planning_quality)
         refinement = _director_prompt_refinement_mode(prompt_refinement)
-        schedule = _director_duration_schedule(float(total_duration_seconds), float(segment_duration_seconds))
+        schedule = _director_duration_schedule(effective_total_seconds, float(segment_duration_seconds))
         image_references = _get_image_inputs(assets)
         image_assets = {slot: assets[f"reference_image_{slot}"] for slot, _ in image_references}
         if director_mode == DIRECTOR_LONG_FL2V_MODE and not ({1, 2} & set(image_assets)):
@@ -3642,7 +3699,7 @@ class Qwen38LongVideoDirectorPlanner:
         draft_key = _director_draft_cache_key(
             brief=normalized_brief,
             director_mode=director_mode,
-            total_duration_seconds=total_duration_seconds,
+            total_duration_seconds=effective_total_seconds,
             segment_duration_seconds=segment_duration_seconds,
             model_name=model_name,
             mmproj_name=mmproj_name,
@@ -3791,7 +3848,7 @@ class Qwen38LongVideoDirectorPlanner:
             segment_prompts, plan_json = _director_long_plan_text(
                 title,
                 director_mode,
-                float(total_duration_seconds),
+                effective_total_seconds,
                 segments,
                 prompt_refinement=refinement,
                 refine_record=refine_record,
@@ -3804,7 +3861,8 @@ class Qwen38LongVideoDirectorPlanner:
             )
             debug = (
                 f"local llama.cpp | long_director={director_mode} | groups={len(groups)} | "
-                f"total={float(total_duration_seconds):.3f}s | target_group={float(segment_duration_seconds):.3f}s | "
+                f"total={effective_total_seconds:.3f}s | duration_source={duration_source} | "
+                f"target_group={float(segment_duration_seconds):.3f}s | "
                 f"beat_schedule={','.join(f'{item.duration_seconds:.3f}' for item in segments)} | "
                 f"connect_to=MiniMaxH3Director.{director_port} | group_packer={director_group_packer} | "
                 f"images={len(image_assets)} | "
