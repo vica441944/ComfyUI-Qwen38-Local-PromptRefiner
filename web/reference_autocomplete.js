@@ -282,21 +282,7 @@ function setWidgetValue(widget, value) {
   widget.callback?.(value);
 }
 
-function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
-  const oldValues = workflowNode?.widgets_values;
-  if (!Array.isArray(oldValues) || !Array.isArray(workflowNode?.inputs)) return false;
-
-  const savedNames = savedWidgetNames(workflowNode);
-  const savedNameSet = new Set(savedNames);
-  const missingCurrentControls = nodeName === "Qwen38LocalPromptRefiner"
-    ? !savedNameSet.has("example_preset")
-    : !savedNameSet.has("planning_quality") || !savedNameSet.has("director_execution");
-  const needsMigration = missingCurrentControls || hasLegacyWidgetValueShift(nodeName, oldValues);
-  if (!needsMigration) return false;
-
-  const sourceNames = missingCurrentControls ? savedNames : LEGACY_WIDGET_ORDERS[nodeName];
-  if (!sourceNames) return false;
-
+function applyNamedWidgetValues(node, sourceNames, oldValues) {
   const valueByName = new Map();
   sourceNames.forEach((name, index) => {
     if (index < oldValues.length) valueByName.set(name, oldValues[index]);
@@ -304,23 +290,75 @@ function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
   for (const widget of node.widgets ?? []) {
     if (valueByName.has(widget.name)) setWidgetValue(widget, valueByName.get(widget.name));
   }
+  return new Set(sourceNames);
+}
 
-  // New controls did not exist in the saved node, so positional restoration
-  // leaves them holding unrelated old values. Reset only those new controls.
-  if (nodeName === "Qwen38LocalPromptRefiner") {
-    setWidgetValue(node.widgets?.find((widget) => widget?.name === "example_preset"), "None");
-  } else {
-    setWidgetValue(node.widgets?.find((widget) => widget?.name === "planning_quality"), "Balanced (recommended)");
-    setWidgetValue(node.widgets?.find((widget) => widget?.name === "director_execution"), "Preview plan only (Director blocked)");
-  }
-
+function persistMigratedWidgets(node, workflowNode) {
   // Persist the corrected current-order values the next time Comfy saves the
   // workflow, so a later restart does not shift video_frame_samples, reference
   // text, or literal LoRA trigger words again.
   workflowNode.widgets_values = (node.widgets ?? []).map((widget) => widget.value);
   node.properties ??= {};
-  node.properties.qwen38WidgetLayout = "2026-09-12";
+  node.properties.qwen38WidgetLayout = "2026-10-11";
   node.setDirtyCanvas?.(true, true);
+}
+
+function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
+  const oldValues = workflowNode?.widgets_values;
+  if (!Array.isArray(oldValues) || !Array.isArray(workflowNode?.inputs)) return false;
+
+  const savedNames = savedWidgetNames(workflowNode);
+  const savedNameSet = new Set(savedNames);
+
+  if (nodeName === "Qwen38LocalPromptRefiner") {
+    const missingCurrentControls = !savedNameSet.has("example_preset");
+    const needsMigration = missingCurrentControls || hasLegacyWidgetValueShift(nodeName, oldValues);
+    if (!needsMigration) return false;
+    const sourceNames = missingCurrentControls ? savedNames : LEGACY_WIDGET_ORDERS[nodeName];
+    if (!sourceNames) return false;
+    applyNamedWidgetValues(node, sourceNames, oldValues);
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "example_preset"), "None");
+    persistMigratedWidgets(node, workflowNode);
+    return true;
+  }
+
+  if (nodeName !== "Qwen38LongVideoDirectorPlanner") return false;
+
+  const missingNamedControls = !savedNameSet.has("planning_quality") || !savedNameSet.has("director_execution");
+  const missingPromptRefinement = !savedNameSet.has("prompt_refinement");
+  const valuesLookLegacy = hasLegacyWidgetValueShift(nodeName, oldValues);
+  if (!missingNamedControls && !missingPromptRefinement && !valuesLookLegacy) return false;
+
+  // A workflow whose input names already include planning_quality, but whose
+  // widget values are still the older positional layout, must be restored from
+  // that older order.  Workflows that merely lack prompt_refinement keep the
+  // names they were saved with, then the new control is reset to its default.
+  let sourceNames;
+  if (valuesLookLegacy && savedNameSet.has("planning_quality")) {
+    sourceNames = LEGACY_WIDGET_ORDERS[nodeName];
+  } else if (missingNamedControls || missingPromptRefinement) {
+    sourceNames = savedNames;
+  } else {
+    sourceNames = LEGACY_WIDGET_ORDERS[nodeName];
+  }
+  if (!sourceNames) return false;
+  const restored = applyNamedWidgetValues(node, sourceNames, oldValues);
+  if (!restored.has("planning_quality")) {
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "planning_quality"), "Balanced (recommended)");
+  }
+  if (!restored.has("director_execution")) {
+    setWidgetValue(
+      node.widgets?.find((widget) => widget?.name === "director_execution"),
+      "Preview plan only (Director blocked)",
+    );
+  }
+  if (!restored.has("prompt_refinement")) {
+    setWidgetValue(
+      node.widgets?.find((widget) => widget?.name === "prompt_refinement"),
+      "Per segment (recommended)",
+    );
+  }
+  persistMigratedWidgets(node, workflowNode);
   return true;
 }
 

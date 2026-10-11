@@ -19,7 +19,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 from PIL import Image
@@ -83,6 +83,15 @@ DIRECTOR_EXECUTION_CHOICES = [
     DIRECTOR_EXECUTION_RELEASE,
     DIRECTOR_EXECUTION_DIRECT,
 ]
+# Per-segment refinement is the default because one completion that writes every
+# H3 prompt loses detail as the group count grows.  Single shot remains available
+# for workflows that intentionally want the previous one-call plan.
+DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT = "Per segment (recommended)"
+DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT = "Single shot (legacy)"
+DIRECTOR_PROMPT_REFINEMENT_CHOICES = [
+    DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+    DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT,
+]
 # A long-video preview must survive a second queue request.  ComfyUI normally
 # keeps node instances in its object cache, but that cache is an implementation
 # detail and can be cleared/rebuilt by some execution paths.  Keep the small
@@ -108,7 +117,13 @@ MAX_DIRECTOR_TOTAL_SECONDS = 120.0
 
 @dataclass(frozen=True)
 class _DirectorLongQualityProfile:
-    """Output-density settings for one complete Director timeline."""
+    """Output-density settings for Director group prompts.
+
+    ``*_tokens_per_segment`` is the generation floor for one group.  Single-shot
+    planning multiplies that floor by the group count inside one completion.
+    Per-segment refinement gives every group its own completion, so the floor
+    is not shared across the timeline.
+    """
 
     name: str
     r2v_detail_words: str
@@ -696,6 +711,9 @@ class _DirectorLongSegment:
     video_audio_slots: tuple[int, ...]
     audio_slots: tuple[int, ...]
     continuity_from_prev: bool
+    beat: str = ""
+    dialogue: str = ""
+    handoff: str = ""
 
 
 def _validate_reference_duration(kind: str, slot: int, duration: float, max_duration: float) -> None:
@@ -1162,19 +1180,7 @@ def _build_long_director_request(
     standalone_audios = sorted(set(audio_slots))
     paired_audios = sorted(set(video_audio_slots))
     engine = _director_mode_engine(mode)
-    inventory = [f"<Picture {slot}>: connected image reference." for slot, _ in images]
-    inventory.extend(
-        f"<Video {video.slot}>: connected Director IMAGE frame batch; {len(video.frame_uris)} visual samples attached."
-        for video in videos
-    )
-    inventory.extend(
-        f"<Video {slot}> paired audio track: connected; raw audio is not transcribed by Qwen-VL."
-        for slot in paired_audios
-    )
-    inventory.extend(
-        f"<Audio {slot}>: connected standalone audio; raw audio is not transcribed by Qwen-VL."
-        for slot in standalone_audios
-    )
+    inventory = _director_long_inventory_lines(images, videos, standalone_audios, paired_audios)
     prompt = f"{ENGINE_TAGS[engine]}\nLong-video project brief:\n{brief.strip()}"
     if inventory:
         prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
@@ -1187,18 +1193,7 @@ def _build_long_director_request(
         )
     prompt += _prompt_example_instruction(prompt_example) + _lora_instruction(lora_triggers)
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for slot, uri in images:
-        content.append({"type": "text", "text": f"Visual reference: <Picture {slot}>."})
-        content.append({"type": "image_url", "image_url": {"url": uri}})
-    for video in videos:
-        for index, uri in enumerate(video.frame_uris, start=1):
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"Visual sample {index}/{len(video.frame_uris)} from <Video {video.slot}>.",
-                }
-            )
-            content.append({"type": "image_url", "image_url": {"url": uri}})
+    _append_director_visual_content(content, images, videos)
     return [
         {
             "role": "system",
@@ -1344,6 +1339,964 @@ def _long_director_effective_max_tokens(
     return max(required, min(int(requested_max_tokens), quality.token_cap))
 
 
+def _director_prompt_refinement_mode(value: str) -> str:
+    """Return a supported refinement mode, including the pre-option default."""
+
+    if not value:
+        return DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT
+    if value not in DIRECTOR_PROMPT_REFINEMENT_CHOICES:
+        options = ", ".join(DIRECTOR_PROMPT_REFINEMENT_CHOICES)
+        raise PromptRefinerError(f"Unsupported prompt refinement mode: {value!r}. Choose one of: {options}.")
+    return value
+
+
+def _long_director_structure_max_tokens(segment_count: int, requested_max_tokens: int) -> int:
+    """Budget the beat-card pass without reserving a full H3 prompt per group.
+
+    Cards stay short, but a 120-second project can still carry verbatim dialogue
+    in every group.  The user's max-token widget may raise this ceiling.  It
+    cannot shrink the per-card floor, or the structure pass is cut off mid-plan.
+    """
+
+    needed = 512 + max(1, int(segment_count)) * 480
+    floor = min(16384, needed)
+    requested = max(0, int(requested_max_tokens))
+    return min(16384, max(floor, requested))
+
+
+def _long_director_segment_refine_max_tokens(
+    requested_max_tokens: int,
+    mode: str,
+    quality: _DirectorLongQualityProfile,
+) -> int:
+    """Give one group its own prompt budget, independent of how many groups exist."""
+
+    per_segment = (
+        quality.r2v_tokens_per_segment
+        if mode == DIRECTOR_LONG_R2V_MODE
+        else quality.fl2v_tokens_per_segment
+    )
+    requested = max(0, int(requested_max_tokens))
+    return min(quality.token_cap, max(per_segment, requested))
+
+
+def _director_long_inventory_lines(
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+    audio_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+) -> list[str]:
+    """List the references actually attached to this completion."""
+
+    inventory = [f"<Picture {slot}>: connected image reference." for slot, _ in image_references]
+    inventory.extend(
+        f"<Video {video.slot}>: connected Director IMAGE frame batch; {len(video.frame_uris)} visual samples attached."
+        for video in director_videos
+    )
+    inventory.extend(
+        f"<Video {slot}> paired audio track: connected; raw audio is not transcribed by Qwen-VL."
+        for slot in sorted(set(video_audio_slots))
+    )
+    inventory.extend(
+        f"<Audio {slot}>: connected standalone audio; raw audio is not transcribed by Qwen-VL."
+        for slot in sorted(set(audio_slots))
+    )
+    return inventory
+
+
+def _append_director_visual_content(
+    content: list[dict[str, Any]],
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+) -> None:
+    """Attach image and sampled-video inputs in Director slot order."""
+
+    for slot, uri in image_references:
+        content.append({"type": "text", "text": f"Visual reference: <Picture {slot}>."})
+        content.append({"type": "image_url", "image_url": {"url": uri}})
+    for video in director_videos:
+        for index, uri in enumerate(video.frame_uris, start=1):
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"Visual sample {index}/{len(video.frame_uris)} from <Video {video.slot}>.",
+                }
+            )
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+
+
+def _select_director_segment_assets(
+    mode: str,
+    raw_assets: Any,
+    index: int,
+    image_slots: Iterable[int],
+    video_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+    audio_slots: Iterable[int],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Validate model-selected slots.  R2V keeps every connected picture."""
+
+    if raw_assets is None:
+        raw_assets = {}
+    if not isinstance(raw_assets, dict):
+        raise PromptRefinerError(f"Director plan segment {index} assets must be a JSON object.")
+    if mode != DIRECTOR_LONG_R2V_MODE:
+        return (), (), (), ()
+    _plan_slot_list(
+        raw_assets.get("pictures"),
+        image_slots,
+        "pictures",
+        fallback_when_empty=True,
+    )
+    pictures = tuple(sorted(set(image_slots)))
+    videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
+    paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
+    audios = _plan_slot_list(raw_assets.get("audios"), audio_slots, "audios")
+    if any(slot not in videos for slot in paired):
+        raise PromptRefinerError(
+            f"Director plan segment {index} selected a paired video-audio slot without its matching video slot."
+        )
+    return pictures, videos, paired, audios
+
+
+def _required_h3_fields(engine: str) -> tuple[str, ...]:
+    if engine == FULL_REFERENCE_ENGINE:
+        return (
+            "subject_definitions:",
+            "summary:",
+            "retention_analysis:",
+            "detailed_description:",
+            "overall_soundscape:",
+            "non_diegetic_music:",
+        )
+    return ("integrated_multimodal_description:", "overall_soundscape:", "non_diegetic_music:")
+
+
+def _extract_director_segment_prompt(text: str, engine: str) -> str:
+    """Keep the H3 field block from one segment refine, dropping wrappers."""
+
+    cleaned = _strip_reasoning(text or "").strip()
+    cleaned = re.sub(r"^```[a-z0-9_-]*\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.replace("\r\n", "\n").strip()
+    anchor = _required_h3_fields(engine)[0]
+    position = cleaned.lower().find(anchor)
+    if position >= 0:
+        cleaned = cleaned[position:]
+    cleaned = re.sub(
+        r"(?is)\n*===\s*END\s+SEGMENT(?:\s+\d+)?\s*===\s*$",
+        "",
+        cleaned,
+    ).strip()
+    return cleaned
+
+
+def _decorate_full_reference_prompt(
+    prompt: str,
+    engine: str,
+    picture_slots: Iterable[int],
+    lora_triggers: Iterable[str],
+) -> str:
+    """Insert any reference labels or LoRA triggers the refine pass dropped."""
+
+    if engine != FULL_REFERENCE_ENGINE:
+        return prompt
+    prompt = _ensure_lora_triggers(prompt, engine, lora_triggers)
+    return _ensure_full_reference_picture_labels(prompt, picture_slots)
+
+
+def _finalize_director_segment_prompt(
+    text: str,
+    *,
+    engine: str,
+    picture_slots: Iterable[int],
+    lora_triggers: Iterable[str],
+    index: int,
+) -> str:
+    """Accept one group's H3 prompt, or raise a segment-specific error for retry."""
+
+    prompt = _extract_director_segment_prompt(text, engine)
+    if not prompt:
+        raise PromptRefinerError(f"Director plan segment {index} has no prompt.")
+    missing = [field for field in _required_h3_fields(engine) if field not in prompt]
+    if missing:
+        raise PromptRefinerError(
+            f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
+        )
+    return _decorate_full_reference_prompt(prompt, engine, picture_slots, lora_triggers)
+
+
+def _segment_visual_references(
+    mode: str,
+    segment_index: int,
+    segment_count: int,
+    picture_slots: Iterable[int],
+    video_slots: Iterable[int],
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+) -> tuple[list[tuple[int, str]], list[_DirectorVideoFrames]]:
+    """Limit a refine call to the frames that belong to this group.
+
+    R2V pictures are project-wide anchors, so every connected picture travels
+    with every group.  FL2V sends the first frame only to group 1, the last
+    frame only to the final group, and supplemental pictures 3–9 to planning.
+    Video batches are attached only when the structure pass assigned them.
+    """
+
+    images = list(image_references)
+    videos = list(director_videos)
+    if mode == DIRECTOR_LONG_R2V_MODE:
+        allowed_pictures = set(picture_slots)
+    else:
+        allowed_pictures = {slot for slot, _ in images if slot >= 3}
+        if segment_index == 1:
+            allowed_pictures.add(1)
+        if segment_index == segment_count:
+            allowed_pictures.add(2)
+    selected_images = [(slot, uri) for slot, uri in images if slot in allowed_pictures]
+    allowed_videos = set(video_slots)
+    selected_videos = [video for video in videos if video.slot in allowed_videos]
+    return selected_images, selected_videos
+
+
+_MARKED_PLAN_FIELD_PATTERN = re.compile(
+    r"^\s*(DURATION_SECONDS|CONTINUITY_FROM_PREV|PICTURES|VIDEOS|VIDEO_AUDIOS|AUDIOS|BEAT|DIALOGUE|HANDOFF|PROMPT)\s*:\s*",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_STRUCTURE_EMPTY_TEXT = re.compile(r"(?i)\s*(none|n/?a|null|无|no dialogue|-|—)\s*")
+
+
+def _marked_plan_fields(block: str) -> dict[str, str]:
+    """Split one SEGMENT block into its labeled values, preserving multiline bodies."""
+
+    matches = list(_MARKED_PLAN_FIELD_PATTERN.finditer(block))
+    fields: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(block)
+        fields[match.group(1).upper()] = block[start:end].strip()
+    return fields
+
+
+def _clip_text(text: str, limit: int) -> str:
+    collapsed = (text or "").strip()
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit].rstrip() + "…"
+
+
+def _clean_structure_dialogue(value: str) -> str:
+    text = (value or "").strip()
+    if not text or _STRUCTURE_EMPTY_TEXT.fullmatch(text):
+        return ""
+    return text
+
+
+def _fallback_handoff(beat: str) -> str:
+    sentences = re.split(r"(?<=[.!?。！？])\s+", (beat or "").strip())
+    tail = sentences[-1].strip() if sentences else ""
+    return _clip_text(tail, 400) or "Continue from this group's ending pose, prop state, and camera direction."
+
+
+def _structure_handoff(value: str, beat: str) -> str:
+    text = (value or "").strip()
+    if not text or _STRUCTURE_EMPTY_TEXT.fullmatch(text):
+        return _fallback_handoff(beat)
+    return text
+
+
+def _parse_duration_token(raw: str, index: int) -> float:
+    match = re.search(r"\d+(?:\.\d+)?", raw or "")
+    if not match:
+        raise PromptRefinerError(f"Director plan segment {index} is missing a valid DURATION_SECONDS value.")
+    duration = float(match.group(0))
+    if not MIN_DIRECTOR_SEGMENT_SECONDS <= duration <= MAX_DIRECTOR_SEGMENT_SECONDS:
+        raise PromptRefinerError(
+            f"Director plan segment {index} is {duration:.3f}s; every H3 group must be "
+            f"{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{MAX_DIRECTOR_SEGMENT_SECONDS:.0f}s."
+        )
+    return round(duration, 3)
+
+
+def _parse_structure_continuity(raw: str | None, index: int) -> bool:
+    """Segment 1 never continues.  Later seams default to continuation."""
+
+    if index <= 1:
+        return False
+    if raw is None or not str(raw).strip():
+        return True
+    token = str(raw).strip().lower()
+    if token.startswith(("false", "no", "off", "0")):
+        return False
+    if token.startswith(("true", "yes", "on", "1")):
+        return True
+    return True
+
+
+def _parse_director_structure_output(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Read beat cards.  A full H3 prompt left in PROMPT becomes the beat fallback."""
+
+    cleaned = _strip_reasoning(text or "").strip()
+    cleaned = re.sub(r"^```[a-z0-9_-]*\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.replace("\r\n", "\n")
+    if not cleaned:
+        raise PromptRefinerError(
+            "The local model did not finish a Director structure plan. "
+            "Expected TITLE and === SEGMENT n === beat cards with BEAT, DIALOGUE, and HANDOFF."
+        )
+    title_match = re.search(r"^\s*TITLE\s*:\s*(.+?)\s*$", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    block_pattern = re.compile(
+        r"^\s*===\s*SEGMENT\s+(\d+)\s*===\s*$"
+        r"(.*?)"
+        r"^\s*===\s*END\s+SEGMENT(?:\s+\d+)?\s*===\s*$",
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    cards: list[dict[str, Any]] = []
+    for match in block_pattern.finditer(cleaned):
+        fields = _marked_plan_fields(match.group(2))
+        beat = fields.get("BEAT", "").strip()
+        dialogue = fields.get("DIALOGUE", "").strip()
+        handoff = fields.get("HANDOFF", "").strip()
+        prompt = fields.get("PROMPT", "").strip()
+        if not beat and prompt:
+            spoken = re.findall(r"<d>.*?</d>", prompt, flags=re.IGNORECASE | re.DOTALL)
+            beat = _clip_text(prompt, 1500)
+            if not dialogue and spoken:
+                dialogue = "\n".join(spoken)
+        cards.append(
+            {
+                "index": int(match.group(1)),
+                "duration_raw": fields.get("DURATION_SECONDS", ""),
+                "continuity_raw": fields.get("CONTINUITY_FROM_PREV"),
+                "assets": {
+                    "pictures": _slot_numbers(fields.get("PICTURES", "")),
+                    "videos": _slot_numbers(fields.get("VIDEOS", "")),
+                    "video_audios": _slot_numbers(fields.get("VIDEO_AUDIOS", "")),
+                    "audios": _slot_numbers(fields.get("AUDIOS", "")),
+                },
+                "beat": beat,
+                "dialogue": dialogue,
+                "handoff": handoff,
+            }
+        )
+    if not cards:
+        raise PromptRefinerError(
+            "The local model did not finish a Director structure plan. "
+            "Expected TITLE and === SEGMENT n === beat cards with BEAT, DIALOGUE, and HANDOFF."
+        )
+    title = title_match.group(1).strip() if title_match else "Untitled MiniMax H3 Director project"
+    return title or "Untitled MiniMax H3 Director project", cards
+
+
+def _slot_numbers(text: str) -> list[int]:
+    return [int(value) for value in re.findall(r"\d+", text or "")]
+
+
+def _segments_from_structure_cards(
+    cards: list[dict[str, Any]],
+    mode: str,
+    schedule: Iterable[float],
+    image_slots: Iterable[int],
+    video_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+    audio_slots: Iterable[int],
+) -> tuple[list[_DirectorLongSegment], bool]:
+    """Turn beat cards into duration-safe groups that still need H3 prompts."""
+
+    target_schedule = tuple(schedule)
+    expected = len(target_schedule)
+    if len(cards) != expected:
+        raise PromptRefinerError(
+            f"The local model returned {len(cards)} segments, "
+            f"but this project requires exactly {expected} groups. Run again with a simpler brief if needed."
+        )
+    indexes = [int(card["index"]) for card in cards]
+    if sorted(indexes) != list(range(1, expected + 1)):
+        rendered = ", ".join(str(value) for value in indexes)
+        raise PromptRefinerError(
+            f"The local model returned segment numbers {rendered}, but this project requires groups 1–{expected}."
+        )
+    ordered = sorted(cards, key=lambda card: int(card["index"]))
+    segments: list[_DirectorLongSegment] = []
+    for card in ordered:
+        index = int(card["index"])
+        beat = str(card.get("beat") or "").strip()
+        if not beat:
+            raise PromptRefinerError(
+                f"Director structure segment {index} has no BEAT. "
+                "The structure pass must describe that group's story slice before prompt refinement."
+            )
+        duration = _parse_duration_token(str(card.get("duration_raw") or ""), index)
+        pictures, videos, paired, audios = _select_director_segment_assets(
+            mode,
+            card.get("assets") or {},
+            index,
+            image_slots,
+            video_slots,
+            video_audio_slots,
+            audio_slots,
+        )
+        segments.append(
+            _DirectorLongSegment(
+                index=index,
+                duration_seconds=duration,
+                prompt="",
+                picture_slots=pictures,
+                video_slots=videos,
+                video_audio_slots=paired,
+                audio_slots=audios,
+                continuity_from_prev=_parse_structure_continuity(card.get("continuity_raw"), index),
+                beat=beat,
+                dialogue=_clean_structure_dialogue(str(card.get("dialogue") or "")),
+                handoff=_structure_handoff(str(card.get("handoff") or ""), beat),
+            )
+        )
+    total_seconds = sum(target_schedule)
+    actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
+    durations_rebalanced = False
+    if abs(actual_total - total_seconds) > 0.02:
+        segments = _rebalance_director_segment_durations(segments, total_seconds)
+        durations_rebalanced = True
+    return segments, durations_rebalanced
+
+
+def _long_director_structure_system(mode: str, schedule: Iterable[float]) -> str:
+    """Ask for beat cards only.  H3 prompts are written later, one group at a time."""
+
+    durations = tuple(schedule)
+    engine = _director_mode_engine(mode)
+    total_seconds = sum(durations)
+    target_seconds = total_seconds / len(durations)
+    asset_rules = (
+        "This is R2V. For each segment, PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS must contain only "
+        "connected reference slot numbers that the segment actually uses; use an empty value after the colon when "
+        "none apply. Every connected picture is still a project-wide anchor and may be listed on every segment."
+        if engine == FULL_REFERENCE_ENGINE
+        else "This is FL2V. Leave PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS empty. Segment 1 starts from the "
+        "optional first frame; only the final segment resolves into the optional last frame."
+    )
+    return f"""
+This is MiniMax H3 Director long-plan STRUCTURE mode. This instruction overrides every normal final-output format in
+the route profile. Return only the marked beat-card format below: no markdown fence, no explanation, no <think> block,
+no JSON, and no H3 prompt fields.
+
+The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups
+(about {target_seconds:.3f} seconds each). Produce exactly {len(durations)} segments. Choose each DURATION_SECONDS
+from the dramatic beat, always within 4–15 seconds, and make their sum exactly {total_seconds:.3f} seconds. Do not
+mechanically equalize every group. Do not write subject_definitions, detailed_description,
+integrated_multimodal_description, or any other H3 prompt field. A later independent pass writes each group's prompt.
+
+Exact return template (repeat the SEGMENT block exactly {len(durations)} times):
+TITLE: short project title
+=== SEGMENT 1 ===
+DURATION_SECONDS: {target_seconds:.3f}
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+focused story slice for this group only
+DIALOGUE:
+exact spoken lines assigned to this group, or NONE
+HANDOFF:
+one sentence describing the physical ending state the next group inherits
+=== END SEGMENT ===
+
+{asset_rules}
+BEAT is only what a viewer sees and hears in THIS group: starting state, the change, and the ending state. Write
+50–90 English words. Do not summarize the rest of the film inside a card.
+DIALOGUE must quote the brief verbatim, split at natural meaning boundaries. Never drop, rewrite, or repeat a
+completed line. Use NONE when the group has no speech. Do not assign more speech than the duration can hold
+(about 2–2.5 words per second). Keep the brief's original language and wording.
+HANDOFF is the concrete pose, prop state, camera heading, and audio state at the cut. Write it in English.
+Set CONTINUITY_FROM_PREV false for segment 1 and true for later segments unless a deliberate hard scene break is
+explicitly requested. Use true only when the new group continues the same action, shot, place, time, and audio state.
+Use false for a hard cut, new camera setup, time jump, location/subject change, independent insert, or any brief
+wording such as "hard cut", "cut to", "镜头切到", "硬切", "转场", or "新场景". Do not use true merely because the
+same character appears again.
+Keep speaker IDs stable, such as (S1) and (S2), inside BEAT and DIALOGUE.
+""".strip()
+
+
+def _long_director_segment_system(mode: str, quality: _DirectorLongQualityProfile) -> str:
+    """H3 contract for exactly one group, at the selected prompt density."""
+
+    engine = _director_mode_engine(mode)
+    if engine == FULL_REFERENCE_ENGINE:
+        mode_rules = (
+            "This completion writes exactly one R2V group. Use all six full-reference fields in this exact order: "
+            "subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, "
+            "non_diegetic_music:. Every attached <Picture N> is an authoritative project reference: name its "
+            "<Picture N> label in subject_definitions and retention_analysis, and preserve the matching identity, "
+            "outfit, environment, and visible prop state. Write this group's next observable beat. Do not restart "
+            "the scene and do not dramatize any other group."
+        )
+        density_target = (
+            f"Keep detailed_description to approximately {quality.r2v_detail_words} English words "
+            "(dialogue is additional)."
+        )
+    else:
+        mode_rules = (
+            "This completion writes exactly one FL2V group. Use exactly the three H3 fields in this exact order: "
+            "integrated_multimodal_description:, overall_soundscape:, non_diegetic_music:. The opening group may "
+            "start from an attached first frame. The final group may resolve into an attached last frame. "
+            "Intermediate groups have no keyframe of their own."
+        )
+        density_target = (
+            f"Keep integrated_multimodal_description to approximately {quality.fl2v_detail_words} English words "
+            "(dialogue is additional)."
+        )
+    return f"""
+This is MiniMax H3 Director SINGLE-SEGMENT refine mode. This instruction overrides every normal final-output format
+in the route profile. Return only the H3 prompt for this one group: no markdown fence, no TITLE, no SEGMENT wrapper,
+no explanation, no <think> block, and no JSON.
+
+{mode_rules}
+Write only the beat described in the user message. Do not summarize the full film, do not borrow events from the
+next group, and do not repeat a previous group's shots.
+
+H3 production contract for this prompt:
+1. subject_definitions (R2V only): give each visible person, prop, or environment a stable <Subject N> or
+   <Environment> label, identify its source <Picture N>/<Video N> where applicable, and state what must remain
+   visually preserved.
+2. summary (R2V only): one precise sentence stating the starting situation, the action that changes during this
+   group, and the observable ending state.
+3. retention_analysis (R2V only): one explicit line for every supplied <Picture N>, <Video N>, and referenced audio
+   source used by this group.
+4. detailed_description, or integrated_multimodal_description for FL2V: write a chronological, physically plausible
+   shot plan. Start with [Shot 1] without a timestamp. Later shots must be written as [Shot N] At MM:SS.mmm with
+   strictly increasing times inside this group's DURATION_SECONDS; do not cut more often than every three seconds
+   unless the brief explicitly requests a hard cut. Put camera type, direction, speed, and target naturally inside
+   the action sentence. Describe only details a viewer can see or hear. When continuity from the previous group is
+   true, the first sentence must start in the supplied previous handoff rather than reintroducing the scene. End at
+   the supplied handoff. Give speakers stable (S1), (S2), etc. IDs. Put every spoken word only in
+   <d>[Language] exact dialogue</d>; preserve user wording and language, use one speaker per shot when possible, and
+   keep speech below about 2–2.5 words per available second after visible action.
+5. overall_soundscape: one to four English sentences describing continuous ambient sound, physical foley, and
+   non-verbal human sound in this group. Never repeat dialogue or music here.
+6. non_diegetic_music: use N/A when no score is requested; otherwise specify instruments, rhythm, and dynamic change.
+
+Prompt density: {quality.name}. {_director_long_craft_requirement(quality)} Do not expose reasoning or repeat a
+character's full appearance unless it changes in this beat. {density_target} This density setting never permits
+omitting a required field, a connected reference label, a literal LoRA trigger, or assigned dialogue.
+""".strip()
+
+
+def _build_long_director_structure_request(
+    mode: str,
+    brief: str,
+    reference_text: str,
+    schedule: Iterable[float],
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+    audio_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+) -> list[dict[str, Any]]:
+    """One multimodal request that splits the story and does not write H3 prompts."""
+
+    images = list(image_references)
+    videos = list(director_videos)
+    engine = _director_mode_engine(mode)
+    prompt = (
+        f"{ENGINE_TAGS[engine]}\nLong-video project brief:\n{brief.strip()}\n\n"
+        "Split this brief into the exact group count required by the system instruction. "
+        "Return beat cards only. A later pass writes each Director prompt independently, so every card needs its "
+        "own story slice, verbatim dialogue, asset slots, continuity flag, and ending handoff."
+    )
+    inventory = _director_long_inventory_lines(images, videos, audio_slots, video_audio_slots)
+    if inventory:
+        prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
+    if reference_text.strip():
+        prompt += f"\n\nAdditional reference notes:\n{reference_text.strip()}"
+    if images or videos:
+        prompt += (
+            "\nThe attached images and sampled video frames are authoritative. Assign a video or audio reference "
+            "only to segments that actually use it."
+        )
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    _append_director_visual_content(content, images, videos)
+    return [
+        {
+            "role": "system",
+            "content": _route_system() + "\n\n" + _long_director_structure_system(mode, schedule),
+        },
+        {"role": "user", "content": content},
+    ]
+
+
+def _build_long_director_segment_request(
+    mode: str,
+    brief: str,
+    reference_text: str,
+    segments: Iterable[_DirectorLongSegment],
+    segment: _DirectorLongSegment,
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+    lora_triggers: Iterable[str],
+    prompt_example: _PromptExamplePreset | None,
+    quality: _DirectorLongQualityProfile,
+) -> list[dict[str, Any]]:
+    """One focused request.  Other groups appear only as handoff context, not as prompts."""
+
+    ordered = list(segments)
+    images, videos = _segment_visual_references(
+        mode,
+        segment.index,
+        len(ordered),
+        segment.picture_slots,
+        segment.video_slots,
+        image_references,
+        director_videos,
+    )
+    engine = _director_mode_engine(mode)
+    previous = ordered[segment.index - 2] if segment.index > 1 else None
+    following = ordered[segment.index] if segment.index < len(ordered) else None
+    if segment.dialogue:
+        dialogue_rule = (
+            "Copy these lines verbatim inside <d>[Language] ...</d>. Do not invent, translate, or repeat a line "
+            "that belongs to another group."
+        )
+        dialogue_body = segment.dialogue
+    else:
+        dialogue_rule = (
+            "No dialogue was pre-assigned. Use a spoken line from the project brief only when it belongs to this "
+            "beat; otherwise write no dialogue."
+        )
+        dialogue_body = "NONE"
+    if previous is None:
+        previous_block = "Previous group: none. This group opens the project."
+    else:
+        previous_block = (
+            f"Previous group handoff: {previous.handoff}\n"
+            f"CONTINUITY_FROM_PREV: {str(segment.continuity_from_prev).lower()}."
+        )
+        if segment.continuity_from_prev:
+            previous_block += " Start the first sentence in that handoff state."
+        else:
+            previous_block += " This seam is a hard cut. Do not continue the previous action, camera, or audio."
+    if following is None:
+        following_block = "Next group: none. This is the final group. Resolve the action at this group's handoff."
+    else:
+        following_block = (
+            "Next group story slice (context only; do not write its action or dialogue):\n"
+            f"{_clip_text(following.beat, 500)}"
+        )
+    keyframe_note = ""
+    if mode == DIRECTOR_LONG_FL2V_MODE:
+        if segment.index == 1 and any(slot == 1 for slot, _ in images):
+            keyframe_note = "\n<Picture 1>, if attached, is this group's opening keyframe."
+        if segment.index == len(ordered) and any(slot == 2 for slot, _ in images):
+            keyframe_note += "\n<Picture 2>, if attached, is the final keyframe this group must resolve into."
+        if segment.index not in (1, len(ordered)):
+            keyframe_note = "\nThis intermediate FL2V group has no first or last keyframe of its own."
+    prompt = (
+        f"{ENGINE_TAGS[engine]}\n"
+        f"Segment {segment.index} of {len(ordered)}. Duration: {segment.duration_seconds:.3f} seconds. "
+        f"CONTINUITY_FROM_PREV: {str(segment.continuity_from_prev).lower()}.\n\n"
+        "Story slice for this segment only (dramatize this and nothing else):\n"
+        f"{segment.beat}\n\n"
+        f"Dialogue assigned to this segment:\n{dialogue_body}\n{dialogue_rule}\n\n"
+        f"{previous_block}\n\n"
+        f"This group's required ending handoff:\n{segment.handoff}\n\n"
+        f"{following_block}\n\n"
+        "Project source (facts and exact names only; do not narrate beats other than the story slice above):\n"
+        f"{brief.strip()}"
+        f"{keyframe_note}"
+    )
+    inventory = _director_long_inventory_lines(
+        images, videos, segment.audio_slots, segment.video_audio_slots
+    )
+    if inventory:
+        prompt += "\n\nReferences attached to this segment:\n" + "\n".join(inventory)
+    if reference_text.strip():
+        prompt += f"\n\nAdditional reference notes:\n{reference_text.strip()}"
+    if images or videos:
+        prompt += (
+            "\nThe attached images and sampled video frames are authoritative for this segment. Name a reference "
+            "only when it is listed above."
+        )
+    prompt += _prompt_example_instruction(prompt_example) + _lora_instruction(lora_triggers)
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    _append_director_visual_content(content, images, videos)
+    return [
+        {
+            "role": "system",
+            "content": _route_system() + "\n\n" + _long_director_segment_system(mode, quality),
+        },
+        {"role": "user", "content": content},
+    ]
+
+
+def _single_group_structure_segment(
+    mode: str,
+    schedule: Iterable[float],
+    brief: str,
+    image_slots: Iterable[int],
+    video_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+    audio_slots: Iterable[int],
+) -> _DirectorLongSegment:
+    """A one-group project has nothing to split, so refine the brief directly."""
+
+    duration = round(float(tuple(schedule)[0]), 3)
+    pictures, videos, paired, audios = _select_director_segment_assets(
+        mode,
+        {
+            "pictures": list(image_slots),
+            "videos": list(video_slots),
+            "video_audios": list(video_audio_slots),
+            "audios": list(audio_slots),
+        },
+        1,
+        image_slots,
+        video_slots,
+        video_audio_slots,
+        audio_slots,
+    )
+    beat = _clip_text(
+        "Dramatize the full project brief as this single group. Keep every required action, identity, and line.",
+        500,
+    )
+    return _DirectorLongSegment(
+        index=1,
+        duration_seconds=duration,
+        prompt="",
+        picture_slots=pictures,
+        video_slots=videos,
+        video_audio_slots=paired,
+        audio_slots=audios,
+        continuity_from_prev=False,
+        beat=beat + "\n\n" + brief.strip(),
+        dialogue="",
+        handoff="End on a concrete pose, prop state, camera direction, and audio state.",
+    )
+
+
+def _prompt_word_count(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
+
+
+def _debug_with_execution(debug: str, note: str) -> str:
+    """Keep the execution note on the summary line when a refine trace follows."""
+
+    marker = f" | director_execution={note}"
+    if "\n" not in debug:
+        return f"{debug}{marker}"
+    first, rest = debug.split("\n", 1)
+    return f"{first}{marker}\n{rest}"
+
+
+def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
+    """Render one readable refine step per group for the node debug output."""
+
+    steps = list(record.get("passes") or [])
+    total = len(steps)
+    structure_attempts = record.get("structure_attempts")
+    structure_state = "skipped_single_group" if record.get("structure_skipped") else "ok"
+    lines = [
+        f"prompt_refinement={record.get('mode', DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT)}",
+        f"structure_max_tokens={record.get('structure_max_tokens', 0)}",
+        f"segment_refine_max_tokens={record.get('segment_refine_max_tokens', 0)}",
+        f"refine_passes={total}",
+        "per_segment_refine:",
+        (
+            f"- structure {structure_state} | attempts={structure_attempts} | groups={total} | "
+            f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()}"
+        ),
+    ]
+    for step in steps:
+        pictures = ",".join(str(slot) for slot in step.get("pictures") or []) or "-"
+        videos = ",".join(str(slot) for slot in step.get("videos") or []) or "-"
+        video_audios = ",".join(str(slot) for slot in step.get("video_audios") or []) or "-"
+        audios = ",".join(str(slot) for slot in step.get("audios") or []) or "-"
+        lines.append(
+            f"- segment {step['index']}/{total} | refine=independent | attempt={step['attempts']} | "
+            f"continuity={str(bool(step['continuity_from_prev'])).lower()} | "
+            f"pictures={pictures} | videos={videos} | video_audios={video_audios} | audios={audios} | "
+            f"prompt_words={step['prompt_words']} | beat_chars={step['beat_chars']}"
+        )
+    return "\n".join(lines)
+
+
+def _plan_director_with_independent_segment_refine(
+    complete: Callable[[list[dict[str, Any]], int, int], str],
+    *,
+    mode: str,
+    brief: str,
+    reference_text: str,
+    schedule: Iterable[float],
+    image_references: Iterable[tuple[int, str]],
+    director_videos: Iterable[_DirectorVideoFrames],
+    audio_slots: Iterable[int],
+    video_audio_slots: Iterable[int],
+    lora_triggers: Iterable[str],
+    prompt_example: _PromptExamplePreset | None,
+    quality: _DirectorLongQualityProfile,
+    requested_max_tokens: int,
+    seed: int,
+) -> tuple[str, list[_DirectorLongSegment], bool, str, dict[str, Any]]:
+    """Split the timeline once, then write each Director prompt in its own completion.
+
+    ``complete(messages, max_tokens, seed)`` is one local Qwen call.  Segment N
+    does not receive segment N-1's generated prompt.  Continuity travels through
+    the structure card's handoff and CONTINUITY_FROM_PREV flag, so a long project
+    cannot dilute later beats by prefixing them with every earlier H3 prompt.
+    """
+
+    target_schedule = tuple(schedule)
+    image_slots = [slot for slot, _ in image_references]
+    video_slots = [video.slot for video in director_videos]
+    refine_max_tokens = _long_director_segment_refine_max_tokens(requested_max_tokens, mode, quality)
+    structure_max_tokens = _long_director_structure_max_tokens(len(target_schedule), requested_max_tokens)
+    completion_seed = int(seed)
+    structure_attempts = 0
+    structure_skipped = len(target_schedule) == 1
+    if structure_skipped:
+        first_line = next((line.strip() for line in brief.splitlines() if line.strip()), "")
+        title = _clip_text(first_line, 80) or "Untitled MiniMax H3 Director project"
+        segments = [
+            _single_group_structure_segment(
+                mode,
+                target_schedule,
+                brief,
+                image_slots,
+                video_slots,
+                video_audio_slots,
+                audio_slots,
+            )
+        ]
+        durations_rebalanced = False
+    else:
+        messages = _build_long_director_structure_request(
+            mode,
+            brief,
+            reference_text,
+            target_schedule,
+            image_references,
+            director_videos,
+            audio_slots,
+            video_audio_slots,
+        )
+        last_error: Exception | None = None
+        title = "Untitled MiniMax H3 Director project"
+        segments = []
+        durations_rebalanced = False
+        for attempt in (1, 2):
+            structure_attempts = attempt
+            text = complete(messages, structure_max_tokens, completion_seed)
+            try:
+                title, cards = _parse_director_structure_output(text or "")
+                segments, durations_rebalanced = _segments_from_structure_cards(
+                    cards,
+                    mode,
+                    target_schedule,
+                    image_slots,
+                    video_slots,
+                    video_audio_slots,
+                    audio_slots,
+                )
+                last_error = None
+                break
+            except PromptRefinerError as error:
+                last_error = error
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": text or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The structure plan was rejected: {error}\n"
+                            "Return only the marked SEGMENT beat cards. Do not write an H3 prompt. "
+                            "Each block needs DURATION_SECONDS, CONTINUITY_FROM_PREV, PICTURES, VIDEOS, "
+                            "VIDEO_AUDIOS, AUDIOS, BEAT, DIALOGUE, and HANDOFF."
+                        ),
+                    },
+                ]
+        if last_error is not None:
+            raise PromptRefinerError(
+                f"Director structure pass failed after 2 attempts. {last_error}"
+            ) from last_error
+
+    engine = _director_mode_engine(mode)
+    refined: list[_DirectorLongSegment] = []
+    passes: list[dict[str, Any]] = []
+    for segment in segments:
+        request = _build_long_director_segment_request(
+            mode,
+            brief,
+            reference_text,
+            segments,
+            segment,
+            image_references,
+            director_videos,
+            lora_triggers,
+            prompt_example,
+            quality,
+        )
+        last_error = None
+        prompt = ""
+        attempts = 0
+        messages = request
+        for attempt in (1, 2):
+            attempts = attempt
+            text = complete(messages, refine_max_tokens, completion_seed)
+            try:
+                prompt = _finalize_director_segment_prompt(
+                    text or "",
+                    engine=engine,
+                    picture_slots=segment.picture_slots,
+                    lora_triggers=lora_triggers,
+                    index=segment.index,
+                )
+                last_error = None
+                break
+            except PromptRefinerError as error:
+                last_error = error
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": text or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"That answer was rejected: {error} "
+                            "Return only the corrected H3 prompt for this one segment, starting at the first "
+                            "required field label. Do not add a SEGMENT wrapper or describe any other group."
+                        ),
+                    },
+                ]
+        if last_error is not None or not prompt:
+            raise PromptRefinerError(
+                f"Director segment {segment.index} prompt refinement failed after 2 attempts. {last_error}"
+            ) from last_error
+        refined.append(replace(segment, prompt=prompt))
+        passes.append(
+            {
+                "index": segment.index,
+                "attempts": attempts,
+                "continuity_from_prev": segment.continuity_from_prev,
+                "pictures": list(segment.picture_slots),
+                "videos": list(segment.video_slots),
+                "video_audios": list(segment.video_audio_slots),
+                "audios": list(segment.audio_slots),
+                "prompt_words": _prompt_word_count(prompt),
+                "beat_chars": len(segment.beat),
+                "max_tokens": refine_max_tokens,
+            }
+        )
+    record = {
+        "mode": DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+        "structure_skipped": structure_skipped,
+        "structure_attempts": structure_attempts,
+        "structure_max_tokens": 0 if structure_skipped else structure_max_tokens,
+        "segment_refine_max_tokens": refine_max_tokens,
+        "durations_rebalanced": durations_rebalanced,
+        "passes": passes,
+    }
+    return title, refined, durations_rebalanced, _format_per_segment_refine_debug(record), record
+
+
 def _director_draft_cache_key(
     *,
     brief: str,
@@ -1359,6 +2312,7 @@ def _director_draft_cache_key(
     top_p: float,
     max_tokens: int,
     planning_quality: str,
+    prompt_refinement: str,
     seed: int,
     example_preset: str,
     lora_presets: Iterable[str],
@@ -1383,6 +2337,7 @@ def _director_draft_cache_key(
         "top_p": float(top_p),
         "max_tokens": int(max_tokens),
         "planning_quality": planning_quality,
+        "prompt_refinement": prompt_refinement,
         "seed": int(seed),
         "example": example_preset,
         "lora_presets": list(lora_presets),
@@ -1595,52 +2550,25 @@ def _validate_long_director_plan(
         prompt = _strip_reasoning(str(raw.get("prompt") or "")).strip()
         if not prompt:
             raise PromptRefinerError(f"Director plan segment {index} has no prompt.")
-        required_fields = (
-            (
-                "subject_definitions:",
-                "summary:",
-                "retention_analysis:",
-                "detailed_description:",
-                "overall_soundscape:",
-                "non_diegetic_music:",
-            )
-            if engine == FULL_REFERENCE_ENGINE
-            else ("integrated_multimodal_description:", "overall_soundscape:", "non_diegetic_music:")
-        )
-        missing = [field for field in required_fields if field not in prompt]
+        missing = [field for field in _required_h3_fields(engine) if field not in prompt]
         if missing:
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        raw_assets = raw.get("assets", {})
-        if raw_assets is None:
-            raw_assets = {}
-        if not isinstance(raw_assets, dict):
-            raise PromptRefinerError(f"Director plan segment {index} assets must be a JSON object.")
-        if mode == DIRECTOR_LONG_R2V_MODE:
-            # Validate Qwen's routing JSON, but carry all connected pictures
-            # into every R2V group.  They are the project's stable visual
-            # anchors; otherwise one omitted/empty model list could silently
-            # turn a reference-driven group into an unreferenced generation.
-            _plan_slot_list(
-                raw_assets.get("pictures"),
-                image_slots,
-                "pictures",
-                fallback_when_empty=True,
-            )
-            pictures = tuple(sorted(set(image_slots)))
-            videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
-            paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
-            audios = _plan_slot_list(raw_assets.get("audios"), audio_slots, "audios")
-            if any(slot not in videos for slot in paired):
-                raise PromptRefinerError(
-                    f"Director plan segment {index} selected a paired video-audio slot without its matching video slot."
-                )
-        else:
-            pictures = videos = paired = audios = ()
-        if engine == FULL_REFERENCE_ENGINE:
-            prompt = _ensure_lora_triggers(prompt, engine, lora_triggers)
-            prompt = _ensure_full_reference_picture_labels(prompt, pictures)
+        # Validate Qwen's routing, but carry all connected pictures into every
+        # R2V group.  They are the project's stable visual anchors; otherwise
+        # one omitted model list could turn a reference-driven group into an
+        # unreferenced generation.  FL2V ignores asset lists.
+        pictures, videos, paired, audios = _select_director_segment_assets(
+            mode,
+            raw.get("assets", {}),
+            index,
+            image_slots,
+            video_slots,
+            video_audio_slots,
+            audio_slots,
+        )
+        prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
         continuity = _plan_continuity_flag(raw_continuity, index > 1) if index > 1 else False
         segments.append(
@@ -1778,6 +2706,9 @@ def _director_long_plan_text(
     mode: str,
     total_seconds: float,
     segments: Iterable[_DirectorLongSegment],
+    *,
+    prompt_refinement: str = "",
+    refine_record: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return a review-friendly prompt bundle and a serializable plan record."""
 
@@ -1798,28 +2729,32 @@ def _director_long_plan_text(
             f"{segment.duration_seconds:.3f}s | continue_from_previous={segment.continuity_from_prev} ===\n"
             f"{segment.prompt}"
         )
-        serializable.append(
-            {
-                "index": segment.index,
-                "start_seconds": round(start, 3),
-                "end_seconds": round(end, 3),
-                "duration_seconds": segment.duration_seconds,
-                "continuity_from_prev": segment.continuity_from_prev,
-                "assets": refs,
-                "prompt": segment.prompt,
-            }
-        )
+        entry = {
+            "index": segment.index,
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "duration_seconds": segment.duration_seconds,
+            "continuity_from_prev": segment.continuity_from_prev,
+            "assets": refs,
+            "prompt": segment.prompt,
+        }
+        if segment.beat:
+            entry["beat"] = segment.beat
+            entry["dialogue"] = segment.dialogue
+            entry["handoff"] = segment.handoff
+        serializable.append(entry)
         cursor = end
-    plan = json.dumps(
-        {
-            "title": title,
-            "director_mode": mode,
-            "total_duration_seconds": total_seconds,
-            "segments": serializable,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    payload: dict[str, Any] = {
+        "title": title,
+        "director_mode": mode,
+        "total_duration_seconds": total_seconds,
+        "segments": serializable,
+    }
+    if prompt_refinement:
+        payload["prompt_refinement"] = prompt_refinement
+    if refine_record:
+        payload["refine"] = refine_record
+    plan = json.dumps(payload, ensure_ascii=False, indent=2)
     return "\n\n".join(rendered), plan
 
 
@@ -2396,7 +3331,12 @@ def _create_prompt_completion(llm: Any, **kwargs: Any) -> Any:
 
 
 class Qwen38LongVideoDirectorPlanner:
-    """Create a continuous multi-group MiniMax H3 Director timeline with local Qwen-VL."""
+    """Create a continuous multi-group MiniMax H3 Director timeline with local Qwen-VL.
+
+    The default prompt refinement mode splits the story once, then writes each
+    group's Director prompt in its own Qwen call.  Single shot keeps the older
+    one-completion plan.
+    """
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -2466,6 +3406,17 @@ class Qwen38LongVideoDirectorPlanner:
                             "mode. High quality allocates more detail and tokens for complex multi-group stories. "
                             "Use context_length=32768 for Balanced or High quality when VRAM permits. All modes "
                             "return only final prompts; they do not expose model reasoning."
+                        ),
+                    },
+                ),
+                "prompt_refinement": (
+                    DIRECTOR_PROMPT_REFINEMENT_CHOICES,
+                    {
+                        "default": DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+                        "tooltip": (
+                            "Per segment splits the story once, then writes each Director group's prompt in its "
+                            "own Qwen call so longer timelines keep the selected prompt density. "
+                            "Single shot (legacy) plans every group in one call."
                         ),
                     },
                 ),
@@ -2624,6 +3575,7 @@ class Qwen38LongVideoDirectorPlanner:
         keep_model_loaded: bool,
         director_execution: str = DIRECTOR_EXECUTION_PREVIEW,
         planning_quality: str = DIRECTOR_LONG_QUALITY_BALANCED,
+        prompt_refinement: str = DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
         example_preset: str = PROMPT_EXAMPLE_PRESET_NONE,
         lora_preset_1: str = LORA_PRESET_NONE,
         lora_preset_2: str = LORA_PRESET_NONE,
@@ -2640,6 +3592,7 @@ class Qwen38LongVideoDirectorPlanner:
             raise PromptRefinerError("Write the complete long-video brief before running the Director planner.")
         engine = _director_mode_engine(director_mode)
         quality_profile = _director_long_quality_profile(planning_quality)
+        refinement = _director_prompt_refinement_mode(prompt_refinement)
         schedule = _director_duration_schedule(float(total_duration_seconds), float(segment_duration_seconds))
         image_references = _get_image_inputs(assets)
         image_assets = {slot: assets[f"reference_image_{slot}"] for slot, _ in image_references}
@@ -2694,6 +3647,7 @@ class Qwen38LongVideoDirectorPlanner:
             top_p=top_p,
             max_tokens=max_tokens,
             planning_quality=quality_profile.name,
+            prompt_refinement=refinement,
             seed=seed,
             example_preset=example_preset,
             lora_presets=(lora_preset_1, lora_preset_2, lora_preset_3),
@@ -2728,7 +3682,7 @@ class Qwen38LongVideoDirectorPlanner:
                 if cache_matches_current_inputs
                 else "release_last_preview_input_changed"
             )
-            cached_debug = f"{cached_draft['debug']} | director_execution={release_note}"
+            cached_debug = _debug_with_execution(cached_draft["debug"], release_note)
             return {
                 "ui": {"qwen38_director_groups": [cached_draft["ui_specs"]]},
                 "result": (
@@ -2747,42 +3701,79 @@ class Qwen38LongVideoDirectorPlanner:
             n_gpu_layers=gpu_layers,
         )
         runtime = _RuntimeCache.get(key)
-        effective_max_tokens = _long_director_effective_max_tokens(
-            int(max_tokens), director_mode, schedule, quality_profile
-        )
-        messages = _build_long_director_request(
-            director_mode,
-            normalized_brief,
-            reference_text,
-            schedule,
-            image_references,
-            director_videos,
-            audio_assets,
-            video_audio_assets,
-            lora_triggers,
-            prompt_example,
-            quality_profile,
-        )
-        try:
+
+        def complete(messages: list[dict[str, Any]], max_tokens_for_call: int, completion_seed: int) -> str:
             response = _create_prompt_completion(
                 runtime.llm,
                 messages=messages,
                 temperature=temperature,
                 top_p=top_p,
-                max_tokens=effective_max_tokens,
-                seed=seed,
+                max_tokens=max_tokens_for_call,
+                seed=completion_seed,
             )
             content = response["choices"][0]["message"]["content"]
-            title, segments, durations_rebalanced = _validate_long_director_plan(
-                content or "",
-                director_mode,
-                schedule,
-                image_assets,
-                video_assets,
-                video_audio_assets,
-                audio_assets,
-                lora_triggers,
-            )
+            return content or ""
+
+        try:
+            refine_record: dict[str, Any] | None = None
+            if refinement == DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT:
+                # Structure stays global.  Each group's H3 prompt is a separate
+                # completion whose token budget does not shrink as group count grows.
+                title, segments, durations_rebalanced, refine_trace, refine_record = (
+                    _plan_director_with_independent_segment_refine(
+                        complete,
+                        mode=director_mode,
+                        brief=normalized_brief,
+                        reference_text=reference_text,
+                        schedule=schedule,
+                        image_references=image_references,
+                        director_videos=director_videos,
+                        audio_slots=audio_assets,
+                        video_audio_slots=video_audio_assets,
+                        lora_triggers=lora_triggers,
+                        prompt_example=prompt_example,
+                        quality=quality_profile,
+                        requested_max_tokens=int(max_tokens),
+                        seed=int(seed),
+                    )
+                )
+                effective_max_tokens = int(refine_record["segment_refine_max_tokens"])
+                token_scope = "per_segment"
+            else:
+                effective_max_tokens = _long_director_effective_max_tokens(
+                    int(max_tokens), director_mode, schedule, quality_profile
+                )
+                content = complete(
+                    _build_long_director_request(
+                        director_mode,
+                        normalized_brief,
+                        reference_text,
+                        schedule,
+                        image_references,
+                        director_videos,
+                        audio_assets,
+                        video_audio_assets,
+                        lora_triggers,
+                        prompt_example,
+                        quality_profile,
+                    ),
+                    effective_max_tokens,
+                    int(seed),
+                )
+                title, segments, durations_rebalanced = _validate_long_director_plan(
+                    content or "",
+                    director_mode,
+                    schedule,
+                    image_assets,
+                    video_assets,
+                    video_audio_assets,
+                    audio_assets,
+                    lora_triggers,
+                )
+                refine_trace = (
+                    f"prompt_refinement={DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT} | refine_passes=1"
+                )
+                token_scope = "whole_plan"
             groups, director_group_packer = _pack_director_long_groups(
                 director_mode,
                 segments,
@@ -2792,7 +3783,12 @@ class Qwen38LongVideoDirectorPlanner:
                 audio_assets,
             )
             segment_prompts, plan_json = _director_long_plan_text(
-                title, director_mode, float(total_duration_seconds), segments
+                title,
+                director_mode,
+                float(total_duration_seconds),
+                segments,
+                prompt_refinement=refinement,
+                refine_record=refine_record,
             )
             director_port = "i2v_groups" if director_mode == DIRECTOR_LONG_FL2V_MODE else "r2v_groups"
             context_note = (
@@ -2810,10 +3806,11 @@ class Qwen38LongVideoDirectorPlanner:
                 f"audios={len(audio_assets)} | lora_triggers={len(lora_triggers)} | "
                 f"example={prompt_example.name if prompt_example else 'none'} ({example_adapter_status}) | "
                 f"planning_quality={quality_profile.name} | "
-                f"context={int(context_length)} (quality_recommendation={context_note}) | "
-                f"max_tokens={effective_max_tokens} (requested={int(max_tokens)}) | "
+                f"context={int(context_length)} (quality_recommendation={context_note}, scope={token_scope}) | "
+                f"max_tokens={effective_max_tokens} (requested={int(max_tokens)}, scope={token_scope}) | "
                 f"brief_source={brief_source} | durations_rebalanced={durations_rebalanced} | "
-                f"cached={keep_model_loaded}"
+                f"cached={keep_model_loaded}\n"
+                f"{refine_trace}"
             )
             ui_specs = _director_ui_group_specs(director_mode, segments)
             draft = {
@@ -2859,7 +3856,7 @@ class Qwen38LongVideoDirectorPlanner:
                     director_groups,
                     segment_prompts,
                     plan_json,
-                    f"{debug} | director_execution={execution_note}",
+                    _debug_with_execution(debug, execution_note),
                 ),
             }
         finally:
