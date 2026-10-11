@@ -112,7 +112,7 @@ REFERENCE_DURATION_TOLERANCE_SECONDS = 0.05
 VIDEO_FRAME_MAX_SIDE = 1024
 MIN_DIRECTOR_SEGMENT_SECONDS = 4.0
 MAX_DIRECTOR_SEGMENT_SECONDS = 15.0
-MAX_DIRECTOR_TOTAL_SECONDS = 120.0
+MAX_DIRECTOR_TOTAL_SECONDS = 240.0
 
 
 @dataclass(frozen=True)
@@ -1051,7 +1051,8 @@ def _director_duration_schedule(total_seconds: float, target_segment_seconds: fl
     if not MIN_DIRECTOR_SEGMENT_SECONDS <= total_seconds <= MAX_DIRECTOR_TOTAL_SECONDS:
         raise PromptRefinerError(
             f"total_duration_seconds must be between {MIN_DIRECTOR_SEGMENT_SECONDS:.0f} and "
-            f"{MAX_DIRECTOR_TOTAL_SECONDS:.0f} seconds."
+            f"{MAX_DIRECTOR_TOTAL_SECONDS:.0f} seconds; received {total_seconds:g}. "
+            "Out-of-range totals are rejected and are not clamped."
         )
     count = max(1, int(np.ceil(total_seconds / target_segment_seconds)))
     each = total_seconds / count
@@ -1353,7 +1354,7 @@ def _director_prompt_refinement_mode(value: str) -> str:
 def _long_director_structure_max_tokens(segment_count: int, requested_max_tokens: int) -> int:
     """Budget the beat-card pass without reserving a full H3 prompt per group.
 
-    Cards stay short, but a 120-second project can still carry verbatim dialogue
+    Cards stay short, but a 240-second project can still carry verbatim dialogue
     in every group.  The user's max-token widget may raise this ceiling.  It
     cannot shrink the per-card floor, or the structure pass is cut off mid-plan.
     """
@@ -3391,7 +3392,7 @@ class Qwen38LongVideoDirectorPlanner:
                         "default": "",
                         "dynamicPrompts": False,
                         "tooltip": (
-                            "Write the whole 40–120 second story and dialogue. Use @reference_image_1, "
+                            "Write the whole 40–240 second story and dialogue. Use @reference_image_1, "
                             "@reference_video_1, @reference_video_audio_1, or @reference_audio_1 for exact assets."
                         ),
                     },
@@ -3427,6 +3428,11 @@ class Qwen38LongVideoDirectorPlanner:
                         "min": MIN_DIRECTOR_SEGMENT_SECONDS,
                         "max": MAX_DIRECTOR_TOTAL_SECONDS,
                         "step": 1.0,
+                        "tooltip": (
+                            f"Project length in seconds ({MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–"
+                            f"{MAX_DIRECTOR_TOTAL_SECONDS:.0f}). A value outside that range is rejected; "
+                            "the planner does not shorten an over-limit total."
+                        ),
                     },
                 ),
                 "segment_duration_seconds": (

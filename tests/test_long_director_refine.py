@@ -567,6 +567,43 @@ N/A
         self.assertIn("FRESH_TWO", segments[1].prompt)
         self.assertNotIn("OLD_BEAT_ONE", segments[0].prompt)
 
+    def test_total_duration_accepts_240_seconds_and_rejects_241(self) -> None:
+        schedule = nodes._director_duration_schedule(240.0, 10.0)
+        self.assertEqual(len(schedule), 24)
+        self.assertEqual(schedule, (10.0,) * 24)
+        self.assertAlmostEqual(sum(schedule), 240.0, places=3)
+
+        # A total above the old 120s ceiling, including one past 180s, stays intact.
+        over_old_ceiling = nodes._director_duration_schedule(180.0, 10.0)
+        self.assertEqual(len(over_old_ceiling), 18)
+        self.assertAlmostEqual(sum(over_old_ceiling), 180.0, places=3)
+
+        with self.assertRaises(nodes.PromptRefinerError) as over_limit:
+            nodes._director_duration_schedule(241.0, 10.0)
+        message = str(over_limit.exception)
+        self.assertIn("total_duration_seconds", message)
+        self.assertIn("240", message)
+        self.assertIn("241", message)
+        self.assertIn("not clamped", message)
+
+        with self.assertRaises(nodes.PromptRefinerError) as under_limit:
+            nodes._director_duration_schedule(3.9, 10.0)
+        self.assertIn("total_duration_seconds", str(under_limit.exception))
+
+        with self.assertRaises(nodes.PromptRefinerError) as bad_segment:
+            nodes._director_duration_schedule(240.0, 16.0)
+        self.assertIn("segment_duration_seconds", str(bad_segment.exception))
+
+        self.assertEqual(nodes.MAX_DIRECTOR_TOTAL_SECONDS, 240.0)
+        self.assertEqual(nodes.MIN_DIRECTOR_SEGMENT_SECONDS, 4.0)
+        self.assertEqual(nodes.MAX_DIRECTOR_SEGMENT_SECONDS, 15.0)
+        self.assertEqual(nodes.MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS, 120.0)
+        required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
+        self.assertEqual(required["total_duration_seconds"][1]["max"], 240.0)
+        self.assertEqual(required["total_duration_seconds"][1]["min"], 4.0)
+        self.assertEqual(required["segment_duration_seconds"][1]["min"], 4.0)
+        self.assertEqual(required["segment_duration_seconds"][1]["max"], 15.0)
+
     def test_widget_default_and_cache_key(self) -> None:
         required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
         names = list(required)
