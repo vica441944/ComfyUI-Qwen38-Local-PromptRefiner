@@ -7,11 +7,16 @@ so the new path cannot silently change those contracts.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import sys
 import types
 import unittest
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -859,6 +864,36 @@ HANDOFF_END stopped at the glass.
         blob = json.dumps(messages[1]["content"])
         self.assertIn("uri-picture-1", blob)
         self.assertIn("uri-video-1", blob)
+
+
+def _png_size(uri: str) -> tuple[int, int]:
+    prefix = "data:image/png;base64,"
+    if not uri.startswith(prefix):
+        raise AssertionError("expected a PNG data URI")
+    with Image.open(io.BytesIO(base64.b64decode(uri[len(prefix) :]))) as image:
+        return image.size
+
+
+class VisionStillImageScaleTests(unittest.TestCase):
+    def test_still_references_share_video_frame_max_side(self) -> None:
+        self.assertEqual(nodes.VIDEO_FRAME_MAX_SIDE, 1024)
+        # 1536×1024 is the still size that failed mtmd when several were attached.
+        array = np.zeros((1024, 1536, 3), dtype=np.uint8)
+        uri = nodes._image_to_data_uri(array)
+        self.assertEqual(_png_size(uri), (1024, 683))
+
+        batch = (array.astype(np.float32) / 255.0)[np.newaxis, ...]
+        self.assertEqual(_png_size(nodes._image_to_data_uri(batch)), (1024, 683))
+
+        small = np.zeros((64, 80, 3), dtype=np.uint8)
+        self.assertEqual(_png_size(nodes._image_to_data_uri(small)), (80, 64))
+
+        inputs = nodes._get_image_inputs({"reference_image_3": array, "reference_image_1": None})
+        self.assertEqual(inputs[0][0], 3)
+        self.assertEqual(_png_size(inputs[0][1]), (1024, 683))
+
+        video_uri = nodes._array_to_data_uri(array, max_side=nodes.VIDEO_FRAME_MAX_SIDE)
+        self.assertEqual(_png_size(video_uri), _png_size(uri))
 
 
 if __name__ == "__main__":
