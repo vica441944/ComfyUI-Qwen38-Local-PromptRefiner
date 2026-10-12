@@ -874,26 +874,354 @@ def _png_size(uri: str) -> tuple[int, int]:
         return image.size
 
 
+def _beat_plan(indexes: list[int], duration: float, *, empty_beat_at: int | None = None) -> str:
+    blocks = ["TITLE: Drift"]
+    for index in indexes:
+        beat = (
+            ""
+            if index == empty_beat_at
+            else f"BEAT_{index} starts, changes, and ends in a readable pose."
+        )
+        continuity = "false" if index == indexes[0] else "true"
+        blocks.append(
+            f"""=== SEGMENT {index} ===
+DURATION_SECONDS: {duration}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES: 1
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+HANDOFF_{index} holds the ending pose.
+=== END SEGMENT ==="""
+        )
+    return "\n".join(blocks)
+
+
+def _segments_from_plan(text: str, schedule: tuple[float, ...]):
+    _title, cards = nodes._parse_director_structure_output(text)
+    return nodes._segments_from_structure_cards(
+        cards,
+        R2V,
+        schedule,
+        (1,),
+        (),
+        (),
+        (),
+    )
+
+
+class StructureSegmentCountTests(unittest.TestCase):
+    def test_off_by_one_cards_are_accepted_and_rebalanced(self) -> None:
+        schedule = (10.0,) * 12
+        short, short_rebalanced = _segments_from_plan(_beat_plan(list(range(1, 12)), 10), schedule)
+        self.assertTrue(short_rebalanced)
+        self.assertEqual([segment.index for segment in short], list(range(1, 12)))
+        self.assertAlmostEqual(sum(segment.duration_seconds for segment in short), 120.0, places=3)
+        self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in short))
+        self.assertIn("BEAT_11", short[-1].beat)
+        self.assertIn("HANDOFF_1", short[0].handoff)
+
+        long, long_rebalanced = _segments_from_plan(_beat_plan(list(range(1, 14)), 8), schedule)
+        self.assertTrue(long_rebalanced)
+        self.assertEqual(len(long), 13)
+        self.assertEqual([segment.index for segment in long], list(range(1, 14)))
+        self.assertAlmostEqual(sum(segment.duration_seconds for segment in long), 120.0, places=3)
+        self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in long))
+
+    def test_larger_count_mismatch_and_incoherent_indexes_still_fail(self) -> None:
+        schedule = (10.0,) * 12
+        with self.assertRaises(nodes.PromptRefinerError) as mismatch:
+            _segments_from_plan(_beat_plan(list(range(1, 11)), 10), schedule)
+        self.assertIn("exactly 12 groups", str(mismatch.exception))
+
+        with self.assertRaises(nodes.PromptRefinerError) as incoherent:
+            _segments_from_plan(_beat_plan(list(range(1, 11)) + [12], 10), schedule)
+        self.assertIn("segment numbers", str(incoherent.exception))
+        self.assertIn("1–11", str(incoherent.exception))
+
+        with self.assertRaises(nodes.PromptRefinerError) as empty_beat:
+            _segments_from_plan(_beat_plan(list(range(1, 12)), 10, empty_beat_at=5), schedule)
+        self.assertIn("segment 5 has no BEAT", str(empty_beat.exception))
+
+    def test_off_by_one_structure_refines_the_returned_group_count(self) -> None:
+        plan = _beat_plan(list(range(1, 12)), 10)
+
+        def complete(messages, max_tokens, seed):
+            del max_tokens, seed
+            system = messages[0]["content"]
+            user = messages[1]["content"][0]["text"]
+            if "STRUCTURE mode" in system:
+                return plan
+            self.assertIn("Segment ", user)
+            self.assertIn(" of 11", user)
+            return r2v_prompt(user.split("Segment ", 1)[1][:2])
+
+        _title, segments, rebalanced, debug, _record = nodes._plan_director_with_independent_segment_refine(
+            complete,
+            mode=R2V,
+            brief="A two-minute office story.",
+            reference_text="",
+            schedule=(10.0,) * 12,
+            image_references=((1, "uri-picture-1"),),
+            director_videos=(),
+            audio_slots=(),
+            video_audio_slots=(),
+            lora_triggers=(),
+            prompt_example=None,
+            quality=BALANCED,
+            requested_max_tokens=4096,
+            seed=11,
+        )
+        self.assertTrue(rebalanced)
+        self.assertEqual(len(segments), 11)
+        self.assertAlmostEqual(sum(segment.duration_seconds for segment in segments), 120.0, places=3)
+        self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in segments))
+        self.assertIn("durations_rebalanced=true", debug)
+        self.assertIn("segment 11/11", debug)
+
+    def test_json_plan_accepts_off_by_one_and_rejects_a_larger_gap(self) -> None:
+        def payload(count: int, indexes: list[int] | None = None) -> str:
+            segments = []
+            for position in range(count):
+                index = (indexes or list(range(1, count + 1)))[position]
+                segments.append(
+                    {
+                        "index": index,
+                        "duration_seconds": 10,
+                        "prompt": r2v_prompt(f"JSON_{index}"),
+                        "assets": {"pictures": [1], "videos": [], "video_audios": [], "audios": []},
+                        "continuity_from_prev": index > 1,
+                    }
+                )
+            return json.dumps({"title": "JSON drift", "segments": segments})
+
+        title, segments, rebalanced = nodes._validate_long_director_plan(
+            payload(3),
+            R2V,
+            (10.0, 10.0),
+            (1,),
+            (),
+            (),
+            (),
+            (),
+        )
+        self.assertEqual(title, "JSON drift")
+        self.assertTrue(rebalanced)
+        self.assertEqual([segment.index for segment in segments], [1, 2, 3])
+        self.assertAlmostEqual(sum(segment.duration_seconds for segment in segments), 20.0, places=3)
+        self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in segments))
+        self.assertIn("JSON_3", segments[2].prompt)
+
+        with self.assertRaises(nodes.PromptRefinerError) as mismatch:
+            nodes._validate_long_director_plan(
+                payload(4),
+                R2V,
+                (10.0, 10.0),
+                (1,),
+                (),
+                (),
+                (),
+                (),
+            )
+        self.assertIn("exactly 2 groups", str(mismatch.exception))
+
+        with self.assertRaises(nodes.PromptRefinerError) as incoherent:
+            nodes._validate_long_director_plan(
+                payload(2, indexes=[1, 3]),
+                R2V,
+                (10.0, 10.0),
+                (1,),
+                (),
+                (),
+                (),
+                (),
+            )
+        self.assertIn("segment numbers 1, 3", str(incoherent.exception))
+
+
+class StructureVisionSplitTests(unittest.TestCase):
+    def test_structure_request_has_picture_labels_and_no_still_image_url(self) -> None:
+        videos = (
+            nodes._DirectorVideoFrames(slot=1, frames="frames", frame_uris=("uri-video-1",)),
+        )
+        messages = nodes._build_long_director_structure_request(
+            R2V,
+            "Brief with seven stills.",
+            "",
+            (10.0, 10.0),
+            ((1, "uri-picture-1"), (7, "uri-picture-7")),
+            videos,
+            (),
+            (),
+        )
+        content = messages[1]["content"]
+        text = content[0]["text"]
+        self.assertIn("<Picture 1>", text)
+        self.assertIn("<Picture 7>", text)
+        urls = [
+            part["image_url"]["url"]
+            for part in content
+            if part.get("type") == "image_url"
+        ]
+        self.assertNotIn("uri-picture-1", urls)
+        self.assertNotIn("uri-picture-7", urls)
+        self.assertEqual(urls, ["uri-video-1"])
+
+        stills_only = nodes._build_long_director_structure_request(
+            R2V,
+            "Brief",
+            "",
+            (10.0, 10.0),
+            ((1, "uri-picture-1"), (2, "uri-picture-2")),
+            (),
+            (),
+            (),
+        )
+        still_content = stills_only[1]["content"]
+        self.assertTrue(all(part.get("type") != "image_url" for part in still_content))
+        self.assertIn("<Picture 1>", still_content[0]["text"])
+        self.assertIn("<Picture 2>", still_content[0]["text"])
+
+        segment = nodes._DirectorLongSegment(
+            index=1,
+            duration_seconds=10.0,
+            prompt="",
+            picture_slots=(1, 7),
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            continuity_from_prev=False,
+            beat="One beat.",
+            dialogue="",
+            handoff="Hold the pose.",
+        )
+        refine = nodes._build_long_director_segment_request(
+            R2V,
+            "Brief",
+            "",
+            (segment,),
+            segment,
+            ((1, "uri-picture-1"), (7, "uri-picture-7")),
+            (),
+            (),
+            None,
+            BALANCED,
+        )
+        refine_urls = [
+            part["image_url"]["url"]
+            for part in refine[1]["content"]
+            if part.get("type") == "image_url"
+        ]
+        self.assertEqual(refine_urls, ["uri-picture-1", "uri-picture-7"])
+
+
 class VisionStillImageScaleTests(unittest.TestCase):
-    def test_still_references_share_video_frame_max_side(self) -> None:
+    def test_still_references_use_still_max_side(self) -> None:
+        self.assertEqual(nodes.STILL_IMAGE_MAX_SIDE, 512)
         self.assertEqual(nodes.VIDEO_FRAME_MAX_SIDE, 1024)
         # 1536×1024 is the still size that failed mtmd when several were attached.
         array = np.zeros((1024, 1536, 3), dtype=np.uint8)
         uri = nodes._image_to_data_uri(array)
-        self.assertEqual(_png_size(uri), (1024, 683))
+        self.assertEqual(_png_size(uri), (512, 341))
 
         batch = (array.astype(np.float32) / 255.0)[np.newaxis, ...]
-        self.assertEqual(_png_size(nodes._image_to_data_uri(batch)), (1024, 683))
+        self.assertEqual(_png_size(nodes._image_to_data_uri(batch)), (512, 341))
 
         small = np.zeros((64, 80, 3), dtype=np.uint8)
         self.assertEqual(_png_size(nodes._image_to_data_uri(small)), (80, 64))
 
         inputs = nodes._get_image_inputs({"reference_image_3": array, "reference_image_1": None})
         self.assertEqual(inputs[0][0], 3)
-        self.assertEqual(_png_size(inputs[0][1]), (1024, 683))
+        self.assertEqual(_png_size(inputs[0][1]), (512, 341))
 
         video_uri = nodes._array_to_data_uri(array, max_side=nodes.VIDEO_FRAME_MAX_SIDE)
-        self.assertEqual(_png_size(video_uri), _png_size(uri))
+        self.assertEqual(_png_size(video_uri), (1024, 683))
+        self.assertNotEqual(_png_size(video_uri), _png_size(uri))
+
+        frames = np.zeros((2, 1024, 1536, 3), dtype=np.uint8)
+        videos = nodes._get_director_video_frame_inputs(
+            {"reference_video_frames_1": frames},
+            sample_count=1,
+        )
+        self.assertEqual(_png_size(videos[0].frame_uris[0]), (1024, 683))
+
+
+class LlamaPerformanceKwargTests(unittest.TestCase):
+    def test_optional_llama_flags_follow_the_installed_signature(self) -> None:
+        names = ["n_ctx", "n_batch", "n_ubatch", "n_gpu_layers", "flash_attn", "swa_full", "verbose"]
+        cpu = nodes._llama_performance_kwargs(32768, 0, names)
+        self.assertEqual(cpu["n_batch"], 2048)
+        self.assertEqual(cpu["n_ubatch"], 1024)
+        self.assertNotIn("flash_attn", cpu)
+        self.assertTrue(cpu["swa_full"])
+
+        gpu = nodes._llama_performance_kwargs(32768, -1, names)
+        self.assertTrue(gpu["flash_attn"])
+        self.assertLessEqual(gpu["n_ubatch"], gpu["n_batch"])
+        self.assertLessEqual(gpu["n_batch"], 32768)
+
+        self.assertEqual(
+            nodes._llama_performance_kwargs(32768, -1, ["n_ctx", "n_gpu_layers", "verbose"]),
+            {},
+        )
+        tiny = nodes._llama_performance_kwargs(512, -1, names)
+        self.assertNotIn("n_batch", tiny)
+        self.assertNotIn("n_ubatch", tiny)
+        self.assertTrue(tiny["flash_attn"])
+
+        class Declared:
+            def __init__(self, model_path, n_ctx=512, n_batch=512, verbose=True, **kwargs):
+                del model_path, n_ctx, n_batch, verbose, kwargs
+
+        explicit = nodes._llama_explicit_parameter_names(Declared)
+        self.assertIn("n_batch", explicit)
+        self.assertNotIn("flash_attn", explicit)
+        self.assertNotIn("kwargs", explicit)
+        self.assertNotIn("swa_full", nodes._llama_performance_kwargs(32768, -1, explicit))
+
+    def test_rejected_attention_flags_fall_back_without_hiding_load_errors(self) -> None:
+        class FlashRejected:
+            def __init__(self, **kwargs):
+                if kwargs.get("flash_attn") or kwargs.get("swa_full"):
+                    raise RuntimeError("flash attention / swa_full is not supported")
+                self.kwargs = kwargs
+
+        kept = nodes._instantiate_llama(
+            FlashRejected,
+            {"model_path": "m", "n_ctx": 32768},
+            {"n_batch": 2048, "n_ubatch": 1024, "flash_attn": True, "swa_full": True},
+        )
+        self.assertEqual(kept.kwargs["n_batch"], 2048)
+        self.assertEqual(kept.kwargs["n_ubatch"], 1024)
+        self.assertNotIn("flash_attn", kept.kwargs)
+        self.assertNotIn("swa_full", kept.kwargs)
+
+        class OldApi:
+            def __init__(self, **kwargs):
+                if "n_batch" in kwargs or "flash_attn" in kwargs or "swa_full" in kwargs:
+                    raise TypeError("unexpected keyword argument")
+                self.kwargs = kwargs
+
+        plain = nodes._instantiate_llama(
+            OldApi,
+            {"model_path": "m"},
+            {"n_batch": 2048, "flash_attn": True},
+        )
+        self.assertEqual(plain.kwargs, {"model_path": "m"})
+
+        class MissingModel:
+            def __init__(self, **kwargs):
+                del kwargs
+                raise RuntimeError("model file not found")
+
+        with self.assertRaises(RuntimeError) as missing:
+            nodes._instantiate_llama(MissingModel, {"model_path": "m"}, {"n_batch": 2048})
+        self.assertIn("model file not found", str(missing.exception))
 
 
 if __name__ == "__main__":

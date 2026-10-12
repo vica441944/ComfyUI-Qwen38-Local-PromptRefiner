@@ -109,10 +109,11 @@ MIN_REFERENCE_MEDIA_SECONDS = 2.0
 MAX_REFERENCE_MEDIA_SECONDS = 15.0
 MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS = 120.0
 REFERENCE_DURATION_TOLERANCE_SECONDS = 0.05
-# Longest side sent to Qwen-VL / mtmd.  Sampled video frames and still reference
-# images share this cap; several full-resolution stills (for example ~1536×1024)
-# make mtmd_helper_eval_chunk_single fail with media evaluation error code 1.
+# Longest side sent to Qwen-VL / mtmd.  Video frames keep a 1024 cap.
+# Full-resolution stills (for example 7×1536×1024) make
+# mtmd_helper_eval_chunk_single fail, so still references use a tighter cap.
 VIDEO_FRAME_MAX_SIDE = 1024
+STILL_IMAGE_MAX_SIDE = 512
 MIN_DIRECTOR_SEGMENT_SECONDS = 4.0
 MAX_DIRECTOR_SEGMENT_SECONDS = 15.0
 MAX_DIRECTOR_TOTAL_SECONDS = 240.0
@@ -294,8 +295,9 @@ def _array_to_data_uri(array: Any, max_side: int | None = None) -> str:
 def _image_to_data_uri(image_tensor: Any) -> str:
     """Convert a ComfyUI IMAGE tensor's first item to an in-memory PNG data URI.
 
-    Still references use the same longest-side cap as sampled video frames so
-    multi-image Qwen-VL / mtmd runs stay inside the media evaluator's budget.
+    Still references use a tighter longest-side cap than sampled video frames.
+    Several full-resolution stills in one mtmd call fail media evaluation;
+    video-frame sampling keeps ``VIDEO_FRAME_MAX_SIDE``.
     """
 
     if image_tensor is None:
@@ -308,7 +310,7 @@ def _image_to_data_uri(image_tensor: Any) -> str:
 
     if array.ndim == 4:
         array = array[0]
-    return _array_to_data_uri(array, max_side=VIDEO_FRAME_MAX_SIDE)
+    return _array_to_data_uri(array, max_side=STILL_IMAGE_MAX_SIDE)
 
 
 def _strip_reasoning(text: str) -> str:
@@ -1739,6 +1741,57 @@ def _slot_numbers(text: str) -> list[int]:
     return [int(value) for value in re.findall(r"\d+", text or "")]
 
 
+def _require_compatible_director_segment_count(returned: int, expected: int) -> None:
+    """Accept the scheduled group count, or one card of ordinary LLM drift.
+
+    A 12-group schedule sometimes comes back as 11 or 13 cards.  That gap is
+    repaired by rebuilding durations onto the requested total.  A larger gap,
+    or an empty plan, is still a failed structure pass.
+    """
+
+    if int(returned) > 0 and abs(int(returned) - int(expected)) <= 1:
+        return
+    raise PromptRefinerError(
+        f"The local model returned {returned} segments, "
+        f"but this project requires exactly {expected} groups. Run again with a simpler brief if needed."
+    )
+
+
+def _require_coherent_segment_indexes(indexes: Iterable[int], count: int) -> None:
+    """Require 1..count with no gaps or duplicates.  The count may already be ±1."""
+
+    values = [int(value) for value in indexes]
+    if sorted(values) == list(range(1, int(count) + 1)):
+        return
+    rendered = ", ".join(str(value) for value in values)
+    raise PromptRefinerError(
+        f"The local model returned segment numbers {rendered}, but this project requires groups 1–{count}."
+    )
+
+
+def _order_director_plan_segments(raw_segments: list[Any]) -> list[Any]:
+    """Sort a JSON or marked plan by segment number when those numbers are present."""
+
+    indexes: list[int] = []
+    explicit = False
+    for position, raw in enumerate(raw_segments, start=1):
+        index = position
+        if isinstance(raw, dict) and raw.get("index") is not None:
+            try:
+                index = int(raw["index"])
+            except (TypeError, ValueError) as error:
+                raise PromptRefinerError(
+                    f"Director plan segment {position} has an invalid segment number."
+                ) from error
+            explicit = True
+        indexes.append(index)
+    if not explicit:
+        return list(raw_segments)
+    _require_coherent_segment_indexes(indexes, len(raw_segments))
+    order = sorted(range(len(raw_segments)), key=lambda item: (indexes[item], item))
+    return [raw_segments[item] for item in order]
+
+
 def _segments_from_structure_cards(
     cards: list[dict[str, Any]],
     mode: str,
@@ -1752,17 +1805,9 @@ def _segments_from_structure_cards(
 
     target_schedule = tuple(schedule)
     expected = len(target_schedule)
-    if len(cards) != expected:
-        raise PromptRefinerError(
-            f"The local model returned {len(cards)} segments, "
-            f"but this project requires exactly {expected} groups. Run again with a simpler brief if needed."
-        )
+    _require_compatible_director_segment_count(len(cards), expected)
     indexes = [int(card["index"]) for card in cards]
-    if sorted(indexes) != list(range(1, expected + 1)):
-        rendered = ", ".join(str(value) for value in indexes)
-        raise PromptRefinerError(
-            f"The local model returned segment numbers {rendered}, but this project requires groups 1–{expected}."
-        )
+    _require_coherent_segment_indexes(indexes, len(cards))
     ordered = sorted(cards, key=lambda card: int(card["index"]))
     segments: list[_DirectorLongSegment] = []
     for card in ordered:
@@ -1940,7 +1985,14 @@ def _build_long_director_structure_request(
     audio_slots: Iterable[int],
     video_audio_slots: Iterable[int],
 ) -> list[dict[str, Any]]:
-    """One multimodal request that splits the story and does not write H3 prompts."""
+    """Split the story into beat cards without sending still-image bytes.
+
+    Every connected still stays a ``<Picture N>`` inventory label.  Putting all
+    of those images into this one mtmd prefill is what exhausts KV on a
+    multi-reference project.  Per-segment refine still attaches the pictures
+    that belong on each H3 prompt.  Sampled video frames stay on this call
+    because a structure card has to assign ``<Video N>`` slots.
+    """
 
     images = list(image_references)
     videos = list(director_videos)
@@ -1956,13 +2008,20 @@ def _build_long_director_structure_request(
         prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
     if reference_text.strip():
         prompt += f"\n\nAdditional reference notes:\n{reference_text.strip()}"
-    if images or videos:
+    if images:
         prompt += (
-            "\nThe attached images and sampled video frames are authoritative. Assign a video or audio reference "
+            "\nConnected stills are listed above as <Picture N> labels only. This structure pass does not "
+            "receive those image bytes. Assign picture slots from the brief and the inventory; a later refine "
+            "pass inspects the actual pictures."
+        )
+    if videos:
+        prompt += (
+            "\nThe attached sampled video frames are authoritative. Assign a video or audio reference "
             "only to segments that actually use it."
         )
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    _append_director_visual_content(content, images, videos)
+    # Stills are text-only here.  Video-frame samples are not picture refs.
+    _append_director_visual_content(content, (), videos)
     return [
         {
             "role": "system",
@@ -2566,11 +2625,10 @@ def _validate_long_director_plan(
     raw_segments = payload.get("segments")
     target_schedule = tuple(schedule)
     total_seconds = sum(target_schedule)
-    if not isinstance(raw_segments, list) or len(raw_segments) != len(target_schedule):
-        raise PromptRefinerError(
-            f"The local model returned {len(raw_segments) if isinstance(raw_segments, list) else 0} segments, "
-            f"but this project requires exactly {len(target_schedule)} groups. Run again with a simpler brief if needed."
-        )
+    if not isinstance(raw_segments, list):
+        raw_segments = []
+    _require_compatible_director_segment_count(len(raw_segments), len(target_schedule))
+    raw_segments = _order_director_plan_segments(raw_segments)
     use_dynamic_durations = bool(payload.get("_marked_dynamic_durations"))
     engine = _director_mode_engine(mode)
     segments: list[_DirectorLongSegment] = []
@@ -2579,7 +2637,16 @@ def _validate_long_director_plan(
             raise PromptRefinerError(f"Director plan segment {index} is not a JSON object.")
         raw_duration = raw.get("duration_seconds")
         if raw_duration is None and not use_dynamic_durations:
-            duration = target_schedule[index - 1]
+            if index - 1 < len(target_schedule):
+                duration = target_schedule[index - 1]
+            else:
+                # One extra card has no host slot.  Seed it inside 4–15s; the
+                # shared rebalance below then makes the whole plan sum to the total.
+                shared = total_seconds / len(raw_segments)
+                duration = round(
+                    min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, shared)),
+                    3,
+                )
         else:
             try:
                 duration = float(raw_duration)
@@ -2885,6 +2952,99 @@ def _build_handler(mmproj_path: str, handler_choice: str) -> Any:
     )
 
 
+# llama-cpp-python defaults both batch sizes to 512.  A long Director prefill
+# decodes more reliably when the logical batch is larger, but n_batch cannot
+# exceed n_ctx and n_ubatch cannot exceed n_batch.
+_LLAMA_PREFERRED_N_BATCH = 2048
+_LLAMA_PREFERRED_N_UBATCH = 1024
+_LLAMA_DEFAULT_BATCH = 512
+
+
+def _llama_explicit_parameter_names(llama_cls: Any) -> set[str]:
+    """Names this llama-cpp-python build accepts on the Llama constructor.
+
+    ``**kwargs`` is ignored.  A flag is optional only when the installed class
+    declares it, so an older build never receives an unknown keyword.
+    """
+
+    try:
+        signature = inspect.signature(llama_cls)
+    except (TypeError, ValueError):
+        return set()
+    return {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+
+
+def _llama_performance_kwargs(
+    n_ctx: int,
+    n_gpu_layers: int,
+    parameter_names: Iterable[str],
+) -> dict[str, Any]:
+    """Higher batch sizes, plus GPU flash attention and full SWA when supported.
+
+    ``flash_attn`` stays off for a CPU-only load (``n_gpu_layers == 0``).  The
+    constructor still feature-detects every name, and ``_instantiate_llama``
+    retries without a flag the installed build rejects at runtime.
+    """
+
+    names = set(parameter_names)
+    kwargs: dict[str, Any] = {}
+    context = max(1, int(n_ctx))
+    batch = min(_LLAMA_PREFERRED_N_BATCH, context)
+    if "n_batch" in names and batch > _LLAMA_DEFAULT_BATCH:
+        kwargs["n_batch"] = batch
+    ubatch_cap = int(kwargs.get("n_batch", min(_LLAMA_DEFAULT_BATCH, context)))
+    ubatch = min(_LLAMA_PREFERRED_N_UBATCH, ubatch_cap)
+    if "n_ubatch" in names and _LLAMA_DEFAULT_BATCH < ubatch <= ubatch_cap:
+        kwargs["n_ubatch"] = ubatch
+    if "flash_attn" in names and int(n_gpu_layers) != 0:
+        kwargs["flash_attn"] = True
+    if "swa_full" in names:
+        kwargs["swa_full"] = True
+    return kwargs
+
+
+def _llama_perf_kwargs_rejected(error: BaseException) -> bool:
+    if isinstance(error, TypeError):
+        return True
+    message = str(error).lower()
+    return any(
+        token in message
+        for token in ("flash", "swa", "n_batch", "n_ubatch", "not supported", "unexpected keyword")
+    )
+
+
+def _instantiate_llama(
+    llama_cls: Any,
+    base_kwargs: dict[str, Any],
+    performance_kwargs: dict[str, Any],
+) -> Any:
+    """Construct Llama, dropping optional performance flags that this build rejects."""
+
+    if not performance_kwargs:
+        return llama_cls(**base_kwargs)
+    try:
+        return llama_cls(**base_kwargs, **performance_kwargs)
+    except Exception as error:
+        if not _llama_perf_kwargs_rejected(error):
+            raise
+    batch_only = {
+        key: value
+        for key, value in performance_kwargs.items()
+        if key not in {"flash_attn", "swa_full"}
+    }
+    if batch_only:
+        try:
+            return llama_cls(**base_kwargs, **batch_only)
+        except Exception as error:
+            if not _llama_perf_kwargs_rejected(error):
+                raise
+    return llama_cls(**base_kwargs)
+
+
 @dataclass(frozen=True)
 class _RuntimeKey:
     model_path: str
@@ -2931,12 +3091,21 @@ class _RuntimeCache:
                 ) from error
 
             handler = _build_handler(key.mmproj_path, key.handler_choice) if key.mmproj_path else None
-            llm = Llama(
-                model_path=key.model_path,
-                chat_handler=handler,
-                n_ctx=key.n_ctx,
-                n_gpu_layers=key.n_gpu_layers,
-                verbose=False,
+            performance_kwargs = _llama_performance_kwargs(
+                key.n_ctx,
+                key.n_gpu_layers,
+                _llama_explicit_parameter_names(Llama),
+            )
+            llm = _instantiate_llama(
+                Llama,
+                {
+                    "model_path": key.model_path,
+                    "chat_handler": handler,
+                    "n_ctx": key.n_ctx,
+                    "n_gpu_layers": key.n_gpu_layers,
+                    "verbose": False,
+                },
+                performance_kwargs,
             )
             cls._runtime = _Runtime(llm=llm, handler=handler, key=key)
             return cls._runtime
