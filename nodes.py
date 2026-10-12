@@ -109,6 +109,9 @@ MIN_REFERENCE_MEDIA_SECONDS = 2.0
 MAX_REFERENCE_MEDIA_SECONDS = 15.0
 MAX_CONFIGURABLE_REFERENCE_MEDIA_SECONDS = 120.0
 REFERENCE_DURATION_TOLERANCE_SECONDS = 0.05
+# Longest side sent to Qwen-VL / mtmd.  Sampled video frames and still reference
+# images share this cap; several full-resolution stills (for example ~1536×1024)
+# make mtmd_helper_eval_chunk_single fail with media evaluation error code 1.
 VIDEO_FRAME_MAX_SIDE = 1024
 MIN_DIRECTOR_SEGMENT_SECONDS = 4.0
 MAX_DIRECTOR_SEGMENT_SECONDS = 15.0
@@ -289,7 +292,11 @@ def _array_to_data_uri(array: Any, max_side: int | None = None) -> str:
 
 
 def _image_to_data_uri(image_tensor: Any) -> str:
-    """Convert a ComfyUI IMAGE tensor's first item to an in-memory PNG data URI."""
+    """Convert a ComfyUI IMAGE tensor's first item to an in-memory PNG data URI.
+
+    Still references use the same longest-side cap as sampled video frames so
+    multi-image Qwen-VL / mtmd runs stay inside the media evaluator's budget.
+    """
 
     if image_tensor is None:
         raise PromptRefinerError("A supplied reference image was empty.")
@@ -301,7 +308,7 @@ def _image_to_data_uri(image_tensor: Any) -> str:
 
     if array.ndim == 4:
         array = array[0]
-    return _array_to_data_uri(array)
+    return _array_to_data_uri(array, max_side=VIDEO_FRAME_MAX_SIDE)
 
 
 def _strip_reasoning(text: str) -> str:
