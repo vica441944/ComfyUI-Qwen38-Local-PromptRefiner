@@ -1851,12 +1851,11 @@ _NEAR_EQUAL_DURATION_SECONDS = 1.0
 
 
 def _dialogue_speech_units(text: str) -> float:
-    """English-word equivalents for one structure card's DIALOGUE field.
+    """English-word equivalents for spoken text used in duration retargeting.
 
     Latin words count as one. CJK, kana, and hangul characters count as
     ``1 / _CJK_CHARS_PER_ENGLISH_WORD`` so a hanzi is not treated as a full
-    English word. Empty and punctuation-only lines are zero. Callers pass the
-    assigned DIALOGUE text only; this does not read the BEAT or invent lines.
+    English word. Empty and punctuation-only lines are zero.
     """
 
     raw = (text or "").strip()
@@ -1866,6 +1865,47 @@ def _dialogue_speech_units(text: str) -> float:
     without_cjk = _CJK_SPEECH_CHAR.sub(" ", raw)
     word_count = len(_LATIN_WORD.findall(without_cjk))
     return float(word_count) + cjk_count / _CJK_CHARS_PER_ENGLISH_WORD
+
+
+# Quoted / tagged speech that may live in BEAT or a refined H3 prompt when
+# the structure card left DIALOGUE as NONE.
+_SPEECH_SPAN_PATTERN = re.compile(
+    r"<d\b[^>]*>.*?</d>"
+    r"|「[^」]+」"
+    r"|『[^』]+』"
+    r"|“[^”]+”"
+    r"|\"[^\"\n]{2,}\""
+    r"|'[^'\n]{2,}'",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_speech_spans(text: str) -> str:
+    """Pull quoted or <d> speech out of beat/prompt text for speech-unit counts."""
+
+    spans = [match.group(0).strip() for match in _SPEECH_SPAN_PATTERN.finditer(text or "")]
+    return "\n".join(span for span in spans if span)
+
+
+def _segment_speech_text(segment: _DirectorLongSegment, *, allow_beat_fallback: bool) -> tuple[str, str]:
+    """Return (speech_text, source) for one segment.
+
+    Prefers the structure DIALOGUE field. When that is empty/NONE and
+    ``allow_beat_fallback`` is set, falls back to 「…」 / <d> / quoted spans inside
+    BEAT (and later, the refined prompt).
+    """
+
+    dialogue = _clean_structure_dialogue(str(segment.dialogue or ""))
+    if dialogue:
+        return dialogue, "dialogue"
+    if not allow_beat_fallback:
+        return "", "empty"
+    # Prefer an already-refined prompt (post-refine retarget) then the beat card.
+    for source_name, blob in (("prompt", segment.prompt), ("beat", segment.beat)):
+        spans = _extract_speech_spans(str(blob or ""))
+        if spans:
+            return spans, source_name
+    return "", "empty"
 
 
 def _ideal_durations_for_speech(units: Iterable[float]) -> list[float]:
@@ -1920,24 +1960,41 @@ def _durations_ignore_dialogue_load(durations: list[float], units: list[float]) 
 
 def _retarget_durations_to_dialogue(
     segments: list[_DirectorLongSegment],
-) -> tuple[list[_DirectorLongSegment], bool]:
+    *,
+    allow_beat_fallback: bool = True,
+) -> tuple[list[_DirectorLongSegment], bool, str]:
     """Replace a flat or dialogue-blind rhythm with speech-based 4–15s targets.
 
-    Uses only ``segment.dialogue`` from the structure card. Scaling those
-    targets so they sum to the project total is left to
+    Prefers ``segment.dialogue``. When every DIALOGUE field is empty/NONE, optionally
+    falls back to 「…」 / <d> / quoted spans in BEAT or the refined prompt. Scaling
+    those targets so they sum to the project total is left to
     ``_rebalance_director_segment_durations``.
     """
 
-    units = [_dialogue_speech_units(segment.dialogue) for segment in segments]
+    speech_rows = [
+        _segment_speech_text(segment, allow_beat_fallback=allow_beat_fallback)
+        for segment in segments
+    ]
+    units = [_dialogue_speech_units(text) for text, _source in speech_rows]
+    sources = [source for _text, source in speech_rows]
     durations = [float(segment.duration_seconds) for segment in segments]
+    source_summary = ",".join(sources)
+    unit_summary = ",".join(f"{unit:.1f}" for unit in units)
     if not _durations_ignore_dialogue_load(durations, units):
-        return segments, False
+        if max(units) - min(units) < _DIALOGUE_REDISTRIBUTE_MIN_UNITS if units else True:
+            reason = f"skipped_flat_units({unit_summary};src={source_summary})"
+        else:
+            reason = f"skipped_matched_rhythm({unit_summary};src={source_summary})"
+        return segments, False, reason
     ideals = _ideal_durations_for_speech(units)
     updated = [
         replace(segment, duration_seconds=round(ideal, 3))
         for segment, ideal in zip(segments, ideals)
     ]
-    return updated, True
+    used_fallback = any(source in {"beat", "prompt"} for source in sources)
+    tag = "applied_fallback" if used_fallback else "applied_dialogue"
+    reason = f"{tag}({unit_summary};src={source_summary})"
+    return updated, True, reason
 
 
 def _segments_from_structure_cards(
@@ -1950,7 +2007,7 @@ def _segments_from_structure_cards(
     audio_slots: Iterable[int],
     *,
     anchor_all_pictures: bool = False,
-) -> tuple[list[_DirectorLongSegment], bool]:
+) -> tuple[list[_DirectorLongSegment], bool, str]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
     target_schedule = tuple(schedule)
@@ -1995,13 +2052,13 @@ def _segments_from_structure_cards(
             )
         )
     total_seconds = sum(target_schedule)
-    segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments)
+    segments, dialogue_retargeted, dialogue_retarget = _retarget_durations_to_dialogue(segments)
     actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
     durations_rebalanced = False
     if dialogue_retargeted or abs(actual_total - total_seconds) > 0.02:
         segments = _rebalance_director_segment_durations(segments, total_seconds)
         durations_rebalanced = True
-    return segments, durations_rebalanced
+    return segments, durations_rebalanced, dialogue_retarget
 
 
 def _long_director_structure_system(
@@ -2397,7 +2454,8 @@ def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
         "per_segment_refine:",
         (
             f"- structure {structure_state} | attempts={structure_attempts} | groups={total} | "
-            f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()}"
+            f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()} | "
+            f"dialogue_retarget={record.get('dialogue_retarget') or 'n/a'}"
         ),
     ]
     for step in steps:
@@ -2464,6 +2522,7 @@ def _plan_director_with_independent_segment_refine(
             )
         ]
         durations_rebalanced = False
+        dialogue_retarget = "skipped_single_group"
     else:
         messages = _build_long_director_structure_request(
             mode,
@@ -2480,12 +2539,13 @@ def _plan_director_with_independent_segment_refine(
         title = "Untitled MiniMax H3 Director project"
         segments = []
         durations_rebalanced = False
+        dialogue_retarget = "structure_pending"
         for attempt in (1, 2):
             structure_attempts = attempt
             text = complete(messages, structure_max_tokens, completion_seed)
             try:
                 title, cards = _parse_director_structure_output(text or "")
-                segments, durations_rebalanced = _segments_from_structure_cards(
+                segments, durations_rebalanced, dialogue_retarget = _segments_from_structure_cards(
                     cards,
                     mode,
                     target_schedule,
@@ -2583,6 +2643,21 @@ def _plan_director_with_independent_segment_refine(
                 "max_tokens": refine_max_tokens,
             }
         )
+    # Job16-class gap: structure DIALOGUE was NONE, so the pre-refine retarget
+    # saw flat speech units, yet per-segment refine still wrote uneven <d> lines
+    # from the brief. Re-check against the refined prompts before packing groups.
+    if len(refined) >= 2:
+        prompt_retargeted_segments, prompt_retargeted, prompt_reason = _retarget_durations_to_dialogue(
+            refined,
+            allow_beat_fallback=True,
+        )
+        if prompt_retargeted:
+            total_seconds = round(sum(float(item) for item in target_schedule), 3)
+            refined = _rebalance_director_segment_durations(prompt_retargeted_segments, total_seconds)
+            durations_rebalanced = True
+            dialogue_retarget = f"post_refine_{prompt_reason}"
+        elif dialogue_retarget.startswith("skipped_") or dialogue_retarget == "structure_pending":
+            dialogue_retarget = f"post_refine_{prompt_reason}"
     record = {
         "mode": DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
         "structure_skipped": structure_skipped,
@@ -2590,6 +2665,7 @@ def _plan_director_with_independent_segment_refine(
         "structure_max_tokens": 0 if structure_skipped else structure_max_tokens,
         "segment_refine_max_tokens": refine_max_tokens,
         "durations_rebalanced": durations_rebalanced,
+        "dialogue_retarget": dialogue_retarget,
         "passes": passes,
     }
     return title, refined, durations_rebalanced, _format_per_segment_refine_debug(record), record
@@ -4267,6 +4343,7 @@ class Qwen38LongVideoDirectorPlanner:
                 f"context={int(context_length)} (quality_recommendation={context_note}, scope={token_scope}) | "
                 f"max_tokens={effective_max_tokens} (requested={int(max_tokens)}, scope={token_scope}) | "
                 f"brief_source={brief_source} | durations_rebalanced={durations_rebalanced} | "
+                f"dialogue_retarget={(refine_record or {}).get('dialogue_retarget') or 'n/a'} | "
                 f"anchor_all_pictures={str(bool(anchor_all_pictures)).lower()} | "
                 f"cached={keep_model_loaded}\n"
                 f"{refine_trace}"
