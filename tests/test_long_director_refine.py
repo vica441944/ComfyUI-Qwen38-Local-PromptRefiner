@@ -1421,5 +1421,142 @@ N/A
 
 
 
+def _template_block(system: str) -> str:
+    start = system.index("Exact return template")
+    end = system.index("=== END SEGMENT ===", start)
+    return system[start:end]
+
+
+def _words(count: int) -> str:
+    return " ".join(f"line{index}" for index in range(count))
+
+
+def _dialogue_plan(rows: list[tuple[float, str]]) -> str:
+    blocks = ["TITLE: Dialogue rhythm"]
+    for index, (duration, dialogue) in enumerate(rows, start=1):
+        continuity = "false" if index == 1 else "true"
+        blocks.append(
+            f"""=== SEGMENT {index} ===
+DURATION_SECONDS: {duration}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES: 1
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+BEAT_{index} starts, changes, and ends in a readable pose.
+DIALOGUE:
+{dialogue or "NONE"}
+HANDOFF:
+HANDOFF_{index} holds the ending pose.
+=== END SEGMENT ==="""
+        )
+    return "\n".join(blocks)
+
+
+class DialogueDurationTests(unittest.TestCase):
+    def test_templates_use_a_range_placeholder_instead_of_the_equal_average(self) -> None:
+        schedule = (10.0,) * 6
+        for system in (
+            nodes._long_director_structure_system(R2V, schedule),
+            nodes._long_director_system(R2V, schedule, BALANCED),
+        ):
+            template = _template_block(system)
+            self.assertIn("DURATION_SECONDS: <4-15>", template)
+            self.assertNotRegex(template, r"DURATION_SECONDS:\s*\d")
+            self.assertNotIn("10.000", template)
+            self.assertIn("near 15", system)
+            self.assertIn("near 4", system)
+            self.assertIn("make their sum exactly", system)
+            self.assertIn("60.000 seconds", system)
+            self.assertIn("only the average used to estimate that group count", system)
+
+        uneven = nodes._long_director_structure_system(R2V, (4.0, 15.0, 8.0))
+        uneven_template = _template_block(uneven)
+        self.assertIn("DURATION_SECONDS: <4-15>", uneven_template)
+        self.assertNotIn("DURATION_SECONDS: 9", uneven_template)
+        self.assertNotIn("4.000", uneven_template)
+        self.assertNotIn("15.000", uneven_template)
+
+    def test_segment_duration_tooltip_is_a_count_estimator(self) -> None:
+        tooltip = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]["segment_duration_seconds"][1][
+            "tooltip"
+        ]
+        self.assertIn("group count", tooltip)
+        self.assertIn("not the forced duration", tooltip)
+        self.assertIn("ceil(total_duration_seconds / this value)", tooltip)
+
+    def test_cjk_dialogue_is_not_counted_as_one_english_word_per_character(self) -> None:
+        english = _words(40)
+        cjk = "字" * 40
+        self.assertEqual(nodes._dialogue_speech_units(english), 40.0)
+        self.assertAlmostEqual(nodes._dialogue_speech_units(cjk), 20.0)
+        self.assertAlmostEqual(nodes._dialogue_speech_units("你好 hello"), 2.0)
+        self.assertEqual(nodes._dialogue_speech_units("NONE"), 1.0)
+        self.assertEqual(nodes._dialogue_speech_units(""), 0.0)
+
+    def test_near_equal_durations_follow_uneven_dialogue(self) -> None:
+        # Observed failure: 60s at a 10s average came back as six copies of 10.0.
+        cjk = "字" * 40
+        plan = _dialogue_plan(
+            [
+                (10.0, _words(40)),
+                (10.0, ""),
+                (10.2, "Look"),
+                (9.8, cjk),
+                (10.0, ""),
+                (10.0, _words(40)),
+            ]
+        )
+        segments, rebalanced = _segments_from_plan(plan, (10.0,) * 6)
+        durations = [segment.duration_seconds for segment in segments]
+        self.assertTrue(rebalanced)
+        self.assertEqual(len(durations), 6)
+        self.assertAlmostEqual(sum(durations), 60.0, places=3)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in durations))
+        self.assertGreater(durations[0], durations[3])
+        self.assertGreater(durations[3], durations[1])
+        self.assertGreater(durations[5], durations[2])
+        self.assertGreater(durations[0], 12.0)
+        self.assertLess(durations[1], 9.0)
+        self.assertAlmostEqual(durations[0], durations[5], delta=0.01)
+        self.assertEqual(segments[0].dialogue, _words(40))
+        self.assertEqual(segments[1].dialogue, "")
+
+    def test_matching_unequal_rhythm_is_preserved(self) -> None:
+        plan = _dialogue_plan(
+            [
+                (14.0, _words(40)),
+                (5.0, ""),
+                (11.0, _words(20)),
+            ]
+        )
+        segments, rebalanced = _segments_from_plan(plan, (10.0, 10.0, 10.0))
+        self.assertFalse(rebalanced)
+        self.assertEqual([segment.duration_seconds for segment in segments], [14.0, 5.0, 11.0])
+
+    def test_equal_durations_without_dialogue_imbalance_stay_equal(self) -> None:
+        plan = _dialogue_plan([(10.0, ""), (10.0, ""), (10.0, "")])
+        segments, rebalanced = _segments_from_plan(plan, (10.0, 10.0, 10.0))
+        self.assertFalse(rebalanced)
+        self.assertEqual([segment.duration_seconds for segment in segments], [10.0, 10.0, 10.0])
+
+    def test_inverted_durations_are_retargeted_to_dialogue(self) -> None:
+        plan = _dialogue_plan(
+            [
+                (5.0, _words(40)),
+                (14.0, ""),
+                (11.0, "Look"),
+            ]
+        )
+        segments, rebalanced = _segments_from_plan(plan, (10.0, 10.0, 10.0))
+        durations = [segment.duration_seconds for segment in segments]
+        self.assertTrue(rebalanced)
+        self.assertAlmostEqual(sum(durations), 30.0, places=3)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in durations))
+        self.assertGreater(durations[0], durations[1])
+        self.assertGreater(durations[0], durations[2])
+
+
 if __name__ == "__main__":
     unittest.main()
