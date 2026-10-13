@@ -59,14 +59,15 @@ plan.
    socket and tag that Primitive `(Input:duration)`. A connected number overrides the widget; an unconnected socket
    keeps the widget value. The socket uses the same 4–240 check, so 241 and other illegal totals raise an error
    instead of being clamped. Workflows saved before this socket existed still load, because the input is optional.
-   The segment value is a preferred beat
-   length: the planner creates `ceil(total / segment)` groups, then Qwen assigns each group a story-driven 4–15 second
-   duration while keeping the exact total. For example, 60 seconds at a 10-second target produces six groups, and
-   240 seconds at a 10-second target produces 24 groups. Qwen may still vary the rhythm: six groups can be
-   `7 / 12 / 8 / 11 / 10 / 12` seconds instead of six mechanically equal clips.
-   If Qwen makes a simple arithmetic mistake (for example, its six beats total 70 seconds for a 60-second project), the
-   node automatically rescales those beats to the exact requested total while preserving their relative rhythm and the
-   legal 4–15 second limit. It does not spend another Qwen inference merely to correct duration math.
+   **segment duration seconds** is only the target average used to estimate group count
+   (`ceil(total / segment)`). It is not the forced duration of each group. For example, 60 seconds at a
+   10-second average produces six groups, and 240 seconds at a 10-second average produces 24 groups. Each
+   group is still 4–15 seconds and the groups sum to the exact total. Dialogue-heavy beats run longer (near
+   15 seconds); short actions run shorter (near 4 seconds). Qwen may return a rhythm such as
+   `7 / 12 / 8 / 11 / 10 / 12`. If it returns near-equal durations that ignore uneven assigned dialogue, the
+   planner redistributes those beats from each card's dialogue before refining prompts.
+   If the beats do not add up to the requested total, the node rescales them while preserving their relative
+   rhythm and the legal 4–15 second limit. It does not spend another Qwen inference merely to correct duration math.
    **planning quality** controls both prompt density and the H3 production standard, without exposing a `<think>`
    process. **Balanced (recommended)** produces a director-ready 180–280-word R2V beat: concrete camera, action,
    reference retention, sound, and an ending state for the next group. **Fast (compact)** preserves the older

@@ -117,6 +117,9 @@ STILL_IMAGE_MAX_SIDE = 512
 MIN_DIRECTOR_SEGMENT_SECONDS = 4.0
 MAX_DIRECTOR_SEGMENT_SECONDS = 15.0
 MAX_DIRECTOR_TOTAL_SECONDS = 240.0
+# Return-template placeholder. Substituting the equal average here (for example
+# 10.000 on a 60s/10 plan) is what models copy onto every group.
+_DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER = "<4-15>"
 
 
 @dataclass(frozen=True)
@@ -1088,7 +1091,13 @@ def _director_mode_engine(mode: str) -> str:
 
 
 def _director_duration_schedule(total_seconds: float, target_segment_seconds: float) -> tuple[float, ...]:
-    """Choose the stable group count; Qwen assigns the individual beat durations later."""
+    """Choose the group count from the target average. That average is not each group's duration.
+
+    ``segment_duration_seconds`` is only the average passed here. Count is
+    ``ceil(total / average)``. The equal split is a starting rhythm for that
+    count (and a fallback when a legacy plan omits durations). Per-group
+    lengths still follow the beat, stay inside 4–15 seconds, and sum to the total.
+    """
 
     if not MIN_DIRECTOR_SEGMENT_SECONDS <= target_segment_seconds <= MAX_DIRECTOR_SEGMENT_SECONDS:
         raise PromptRefinerError(
@@ -1159,16 +1168,17 @@ def _long_director_system(
 This is MiniMax H3 Director long-plan mode. This instruction overrides every normal final-output format in the route
 profile. Return only the marked plan format below: no markdown fence, no explanation, no <think> block, and no JSON.
 
-The host has fixed a total project duration of {total_seconds:.3f} seconds and a target of {len(durations)} groups
-(about {target_seconds:.3f} seconds each). Produce exactly {len(durations)} segments. Choose each
-DURATION_SECONDS according to the actual dramatic beat, always within 4–15 seconds, and make their sum exactly
-{total_seconds:.3f} seconds. Do not mechanically equalize every group: use shorter clips for reactions, reveals,
-cuts, or concise dialogue; use longer clips for sustained movement, dialogue, or a developing camera move.
+The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups.
+{target_seconds:.3f} seconds is only the average used to estimate that group count. It is not the duration of any
+group and must not be copied onto every segment. Produce exactly {len(durations)} segments. Choose each
+DURATION_SECONDS from the beat's content, always within 4–15 seconds, and make their sum exactly
+{total_seconds:.3f} seconds. Do not mechanically equalize every group. Dialogue-heavy beats go longer (near 15
+seconds). Short actions, reactions, reveals, and concise dialogue go shorter (near 4 seconds).
 
 Exact return template (repeat the SEGMENT block exactly {len(durations)} times):
 TITLE: short project title
 === SEGMENT 1 ===
-DURATION_SECONDS: {target_seconds:.3f}
+DURATION_SECONDS: {_DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER}
 CONTINUITY_FROM_PREV: false
 PICTURES: 1
 VIDEOS:
@@ -1819,6 +1829,117 @@ def _order_director_plan_segments(raw_segments: list[Any]) -> list[Any]:
     return [raw_segments[item] for item in order]
 
 
+_CJK_SPEECH_CHAR = re.compile(
+    "["
+    "\u3040-\u30ff"  # hiragana, katakana
+    "\u3400-\u4dbf"  # CJK extension A
+    "\u4e00-\u9fff"  # CJK unified ideographs
+    "\uac00-\ud7af"  # hangul syllables
+    "\uf900-\ufaff"  # CJK compatibility ideographs
+    "\uff66-\uff9d"  # halfwidth katakana
+    "]"
+)
+_LATIN_WORD = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+# Same 2–2.5 words/sec pacing the structure prompt gives the model.
+_DIALOGUE_WORDS_PER_SECOND = 2.25
+# Two hanzi/kana/hangul characters ≈ one English word, so a character is not a word.
+_CJK_CHARS_PER_ENGLISH_WORD = 2.0
+# Below this gap the assigned lines are too even to override a returned rhythm.
+_DIALOGUE_REDISTRIBUTE_MIN_UNITS = 8.0
+# Returned durations inside this spread are an equal split in all but name.
+_NEAR_EQUAL_DURATION_SECONDS = 1.0
+
+
+def _dialogue_speech_units(text: str) -> float:
+    """English-word equivalents for one structure card's DIALOGUE field.
+
+    Latin words count as one. CJK, kana, and hangul characters count as
+    ``1 / _CJK_CHARS_PER_ENGLISH_WORD`` so a hanzi is not treated as a full
+    English word. Empty and punctuation-only lines are zero. Callers pass the
+    assigned DIALOGUE text only; this does not read the BEAT or invent lines.
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return 0.0
+    cjk_count = len(_CJK_SPEECH_CHAR.findall(raw))
+    without_cjk = _CJK_SPEECH_CHAR.sub(" ", raw)
+    word_count = len(_LATIN_WORD.findall(without_cjk))
+    return float(word_count) + cjk_count / _CJK_CHARS_PER_ENGLISH_WORD
+
+
+def _ideal_durations_for_speech(units: Iterable[float]) -> list[float]:
+    """Map speech load onto 4–15s. Silence stays at 4s; heavy speech reaches 15s."""
+
+    ideals: list[float] = []
+    for unit in units:
+        if unit <= 0:
+            ideals.append(MIN_DIRECTOR_SEGMENT_SECONDS)
+            continue
+        speech_seconds = float(unit) / _DIALOGUE_WORDS_PER_SECOND
+        ideals.append(
+            min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, speech_seconds))
+        )
+    return ideals
+
+
+def _pearson_correlation(left: list[float], right: list[float]) -> float:
+    if len(left) < 2 or len(left) != len(right):
+        return 0.0
+    xs = np.asarray(left, dtype=np.float64)
+    ys = np.asarray(right, dtype=np.float64)
+    x_center = xs - float(xs.mean())
+    y_center = ys - float(ys.mean())
+    denom = float(np.linalg.norm(x_center) * np.linalg.norm(y_center))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.dot(x_center, y_center) / denom)
+
+
+def _durations_ignore_dialogue_load(durations: list[float], units: list[float]) -> bool:
+    """True when beat lengths are flat or do not follow assigned dialogue."""
+
+    if len(durations) < 2 or len(durations) != len(units):
+        return False
+    if max(units) - min(units) < _DIALOGUE_REDISTRIBUTE_MIN_UNITS:
+        return False
+    ideals = _ideal_durations_for_speech(units)
+    ideal_spread = max(ideals) - min(ideals)
+    # A gap that still fits inside the 4s floor does not justify a new rhythm.
+    if ideal_spread < 2.0:
+        return False
+    duration_spread = max(durations) - min(durations)
+    if duration_spread <= _NEAR_EQUAL_DURATION_SECONDS:
+        return True
+    if _pearson_correlation(units, durations) < 0.35:
+        return True
+    if duration_spread + 0.5 < ideal_spread * 0.45:
+        return True
+    return False
+
+
+def _retarget_durations_to_dialogue(
+    segments: list[_DirectorLongSegment],
+) -> tuple[list[_DirectorLongSegment], bool]:
+    """Replace a flat or dialogue-blind rhythm with speech-based 4–15s targets.
+
+    Uses only ``segment.dialogue`` from the structure card. Scaling those
+    targets so they sum to the project total is left to
+    ``_rebalance_director_segment_durations``.
+    """
+
+    units = [_dialogue_speech_units(segment.dialogue) for segment in segments]
+    durations = [float(segment.duration_seconds) for segment in segments]
+    if not _durations_ignore_dialogue_load(durations, units):
+        return segments, False
+    ideals = _ideal_durations_for_speech(units)
+    updated = [
+        replace(segment, duration_seconds=round(ideal, 3))
+        for segment, ideal in zip(segments, ideals)
+    ]
+    return updated, True
+
+
 def _segments_from_structure_cards(
     cards: list[dict[str, Any]],
     mode: str,
@@ -1874,9 +1995,10 @@ def _segments_from_structure_cards(
             )
         )
     total_seconds = sum(target_schedule)
+    segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments)
     actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
     durations_rebalanced = False
-    if abs(actual_total - total_seconds) > 0.02:
+    if dialogue_retargeted or abs(actual_total - total_seconds) > 0.02:
         segments = _rebalance_director_segment_durations(segments, total_seconds)
         durations_rebalanced = True
     return segments, durations_rebalanced
@@ -1919,16 +2041,19 @@ This is MiniMax H3 Director long-plan STRUCTURE mode. This instruction overrides
 the route profile. Return only the marked beat-card format below: no markdown fence, no explanation, no <think> block,
 no JSON, and no H3 prompt fields.
 
-The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups
-(about {target_seconds:.3f} seconds each). Produce exactly {len(durations)} segments. Choose each DURATION_SECONDS
-from the dramatic beat, always within 4–15 seconds, and make their sum exactly {total_seconds:.3f} seconds. Do not
-mechanically equalize every group. Do not write subject_definitions, detailed_description,
-integrated_multimodal_description, or any other H3 prompt field. A later independent pass writes each group's prompt.
+The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups.
+{target_seconds:.3f} seconds is only the average used to estimate that group count. It is not the duration of any
+group and must not be copied onto every segment. Produce exactly {len(durations)} segments. Choose each
+DURATION_SECONDS from the beat's content, always within 4–15 seconds, and make their sum exactly
+{total_seconds:.3f} seconds. Do not mechanically equalize every group. Dialogue-heavy beats go longer (near 15
+seconds). Short actions, reactions, and reveals go shorter (near 4 seconds). Do not write subject_definitions,
+detailed_description, integrated_multimodal_description, or any other H3 prompt field. A later independent pass
+writes each group's prompt.
 
 Exact return template (repeat the SEGMENT block exactly {len(durations)} times):
 TITLE: short project title
 === SEGMENT 1 ===
-DURATION_SECONDS: {target_seconds:.3f}
+DURATION_SECONDS: {_DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER}
 CONTINUITY_FROM_PREV: false
 PICTURES:
 VIDEOS:
@@ -1946,8 +2071,9 @@ one sentence describing the physical ending state the next group inherits
 BEAT is only what a viewer sees and hears in THIS group: starting state, the change, and the ending state. Write
 50–90 English words. Do not summarize the rest of the film inside a card.
 DIALOGUE must quote the brief verbatim, split at natural meaning boundaries. Never drop, rewrite, or repeat a
-completed line. Use NONE when the group has no speech. Do not assign more speech than the duration can hold
-(about 2–2.5 words per second). Keep the brief's original language and wording.
+completed line. Use NONE when the group has no speech. Pace speech at about 2–2.5 words per second: a long
+DIALOGUE needs a duration near 15 seconds, and NONE or a short action can sit near 4 seconds. Keep the brief's
+original language and wording.
 HANDOFF is the concrete pose, prop state, camera heading, and audio state at the cut. Write it in English.
 Set CONTINUITY_FROM_PREV false for segment 1 and true for later segments unless a deliberate hard scene break is
 explicitly requested. Use true only when the new group continues the same action, shot, place, time, and audio state.
@@ -2500,6 +2626,7 @@ def _director_draft_cache_key(
         "brief": brief,
         "director_mode": director_mode,
         "total": float(total_duration_seconds),
+        # Count estimator only. Per-group durations are chosen later.
         "target_segment": float(segment_duration_seconds),
         "model": model_name,
         "mmproj": mmproj_name,
@@ -3742,8 +3869,10 @@ class Qwen38LongVideoDirectorPlanner:
                         "max": MAX_DIRECTOR_SEGMENT_SECONDS,
                         "step": 0.5,
                         "tooltip": (
-                            "Preferred beat length. It determines the number of Director groups; Qwen assigns "
-                            "each individual group a story-driven 4–15 second duration that exactly sums to the project."
+                            "Target average used only to estimate group count: "
+                            "ceil(total_duration_seconds / this value). It is not the forced duration of each "
+                            "group. Every group is still 4–15 seconds and the groups sum to the project total. "
+                            "Dialogue-heavy beats run longer (near 15s); short actions run shorter (near 4s)."
                         ),
                     },
                 ),
