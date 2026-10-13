@@ -958,7 +958,7 @@ HANDOFF_{index} holds the ending pose.
 
 def _segments_from_plan(text: str, schedule: tuple[float, ...]):
     _title, cards = nodes._parse_director_structure_output(text)
-    return nodes._segments_from_structure_cards(
+    segments, rebalanced, _retarget = nodes._segments_from_structure_cards(
         cards,
         R2V,
         schedule,
@@ -967,6 +967,7 @@ def _segments_from_plan(text: str, schedule: tuple[float, ...]):
         (),
         (),
     )
+    return segments, rebalanced
 
 
 class StructureSegmentCountTests(unittest.TestCase):
@@ -1556,6 +1557,91 @@ class DialogueDurationTests(unittest.TestCase):
         self.assertTrue(all(4.0 <= value <= 15.0 for value in durations))
         self.assertGreater(durations[0], durations[1])
         self.assertGreater(durations[0], durations[2])
+
+    def test_empty_dialogue_with_beat_quotes_is_retargeted(self) -> None:
+        # Structure often leaves DIALOGUE as NONE while BEAT still carries 「…」 / <d>.
+        heavy = "字" * 40
+        blocks = ["TITLE: Beat quote fallback"]
+        rows = [
+            (10.0, f"BEAT_1 speaks 「{heavy}」 then holds."),
+            (10.0, "BEAT_2 watches in silence."),
+            (10.0, f"BEAT_3 answers <d>[Chinese] {heavy}</d>."),
+        ]
+        for index, (duration, beat) in enumerate(rows, start=1):
+            continuity = "false" if index == 1 else "true"
+            blocks.append(
+                f"""=== SEGMENT {index} ===
+DURATION_SECONDS: {duration}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES: 1
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+HANDOFF_{index} holds the ending pose.
+=== END SEGMENT ==="""
+            )
+        segments, rebalanced = _segments_from_plan("\n".join(blocks), (10.0, 10.0, 10.0))
+        durations = [segment.duration_seconds for segment in segments]
+        self.assertTrue(rebalanced)
+        self.assertAlmostEqual(sum(durations), 30.0, places=3)
+        self.assertGreater(durations[0], durations[1])
+        self.assertGreater(durations[2], durations[1])
+
+    def test_post_refine_prompt_d_tags_retarget_equal_durations(self) -> None:
+        # Job16 pattern: structure DIALOGUE empty, refine wrote uneven <d>, durations were 6×10.
+        from dataclasses import replace
+
+        heavy = "字" * 40
+        segs = []
+        prompts = [
+            "summary:\nnoop\ndetailed_description:\nsilent action only.",
+            f"summary:\ntalk\ndetailed_description:\nsays <d>[Chinese] {heavy}</d> then waits.",
+            "summary:\nnoop\ndetailed_description:\nsilent reaction.",
+            f"summary:\ntalk\ndetailed_description:\n<d>[Mandarin] Hello sisters, please guide me to the committee.</d>",
+            f"summary:\ntalk\ndetailed_description:\n<d>[Chinese] {heavy}</d> and <d>[Chinese] {heavy}</d>.",
+            "summary:\nnoop\ndetailed_description:\nwalks away silently.",
+        ]
+        for index, prompt in enumerate(prompts, start=1):
+            segs.append(
+                nodes._DirectorLongSegment(
+                    index=index,
+                    duration_seconds=10.0,
+                    prompt=prompt,
+                    picture_slots=(1,),
+                    video_slots=(),
+                    video_audio_slots=(),
+                    audio_slots=(),
+                    continuity_from_prev=index > 1,
+                    beat=f"BEAT_{index} action only.",
+                    dialogue="",
+                    handoff=f"HANDOFF_{index}",
+                )
+            )
+        updated, changed, reason = nodes._retarget_durations_to_dialogue(segs, allow_beat_fallback=True)
+        self.assertTrue(changed)
+        self.assertIn("applied_fallback", reason)
+        self.assertIn("src=", reason)
+        durations = [segment.duration_seconds for segment in updated]
+        self.assertGreater(max(durations) - min(durations), 1.0)
+        self.assertGreater(durations[4], durations[0])
+        self.assertGreater(durations[1], durations[2])
+
+    def test_dialogue_retarget_reason_is_skipped_when_all_empty(self) -> None:
+        plan = _dialogue_plan([(10.0, ""), (10.0, ""), (10.0, "")])
+        _title, cards = nodes._parse_director_structure_output(plan)
+        segments, rebalanced, reason = nodes._segments_from_structure_cards(
+            cards, R2V, (10.0, 10.0, 10.0), (1,), (), (), ()
+        )
+        self.assertFalse(rebalanced)
+        self.assertTrue(reason.startswith("skipped_flat_units"))
+        self.assertEqual([segment.duration_seconds for segment in segments], [10.0, 10.0, 10.0])
+
+
 
 
 if __name__ == "__main__":
