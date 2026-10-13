@@ -1560,3 +1560,159 @@ class DialogueDurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoverageKnifeTests(unittest.TestCase):
+    """Host-side beat floor + proportional compression when budget < Σest."""
+
+    JOB18_EST = (45.0, 20.0, 30.0, 40.0, 50.0, 30.0, 45.0)
+    JOB18_BUDGET = 216.0
+    JOB18_GROUPS = 22
+
+    def _story_beats_brief(self) -> str:
+        return """
+[STORY_BEATS]
+1|45|1-8|arrive|LANDMARK_B1_INTRO
+2|20|9-12|gossip|LANDMARK_B2_DEPTH
+3|30|13-22|snake|LANDMARK_B3_SNAKE
+4|40|23-32|tease|LANDMARK_B4_TEASE
+5|50|33-45|climax|LANDMARK_B5_CLIMAX
+6|30|46-55|round2|LANDMARK_B6_SPARE
+7|45|56-60|exit|LANDMARK_B7_PITY;LANDMARK_B7_PLACE
+[/STORY_BEATS]
+Story body uses placeholders only: （露骨动作）（露骨台词）.
+""".strip()
+
+    def _cards_for_plan(self, plan: nodes._CoverageKnifePlan, *, omit_beat6_dialogue: bool = False) -> str:
+        blocks = ["TITLE: Coverage knife demo"]
+        for seg_index, beat_idx in enumerate(plan.segment_to_beat, start=1):
+            beat = plan.beats[beat_idx - 1]
+            if omit_beat6_dialogue and beat.index == 6:
+                dialogue = "NONE"
+            else:
+                # Put every landmark on the first card of the beat; later cards stay NONE.
+                first_of_beat = seg_index == 1 or plan.segment_to_beat[seg_index - 2] != beat_idx
+                if first_of_beat and beat.key_dialogue:
+                    dialogue = " / ".join(beat.key_dialogue)
+                else:
+                    dialogue = "NONE"
+            continuity = "false" if seg_index == 1 else "true"
+            # Seed an over-long early duration to prove compression keeps trailing cards.
+            duration = 15 if beat_idx <= 5 else 4
+            blocks.append(
+                f"""=== SEGMENT {seg_index} ===
+DURATION_SECONDS: {duration}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Story beat {beat.index} card {seg_index}: {beat.label}. Placeholders only （露骨动作）.
+DIALOGUE:
+{dialogue}
+HANDOFF:
+Ending state for beat {beat.index} card {seg_index}.
+=== END SEGMENT ==="""
+            )
+        return "\n".join(blocks)
+
+    def test_proportional_compression_when_budget_below_est_sum(self) -> None:
+        allocations, compressed = nodes._scale_beat_allocations(self.JOB18_EST, self.JOB18_BUDGET)
+        self.assertTrue(compressed)
+        self.assertAlmostEqual(sum(allocations), self.JOB18_BUDGET, places=3)
+        # Each beat keeps a positive share; ratios match estimates.
+        for est, alloc in zip(self.JOB18_EST, allocations):
+            self.assertAlmostEqual(alloc / est, self.JOB18_BUDGET / sum(self.JOB18_EST), places=3)
+
+    def test_seven_beats_get_at_least_one_card_including_trailing(self) -> None:
+        plan = nodes._build_coverage_knife_plan(
+            self._story_beats_brief(),
+            budget_seconds=self.JOB18_BUDGET,
+            group_count=self.JOB18_GROUPS,
+        )
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(len(plan.beats), 7)
+        self.assertTrue(plan.compressed)
+        self.assertEqual(sum(plan.card_counts), self.JOB18_GROUPS)
+        self.assertTrue(all(count >= 1 for count in plan.card_counts))
+        # Trailing beats must not be zeroed when early/climax are heavy.
+        self.assertGreaterEqual(plan.card_counts[5], 1)  # beat 6
+        self.assertGreaterEqual(plan.card_counts[6], 1)  # beat 7
+        self.assertIn(7, plan.segment_to_beat)
+        self.assertEqual(plan.segment_to_beat[-1], 7)
+
+    def test_structure_rejects_missing_landmark_dialogue(self) -> None:
+        plan = nodes._build_coverage_knife_plan(
+            self._story_beats_brief(),
+            budget_seconds=self.JOB18_BUDGET,
+            group_count=self.JOB18_GROUPS,
+        )
+        assert plan is not None
+        bad = self._cards_for_plan(plan, omit_beat6_dialogue=True)
+        _title, cards = nodes._parse_director_structure_output(bad)
+        with self.assertRaises(nodes.PromptRefinerError) as raised:
+            nodes._validate_structure_coverage(cards, plan)
+        self.assertIn("landmark missing", str(raised.exception).lower())
+        self.assertIn("beat 6", str(raised.exception).lower())
+
+    def test_structure_allocates_cards_and_keeps_trailing_duration_floor(self) -> None:
+        plan = nodes._build_coverage_knife_plan(
+            self._story_beats_brief(),
+            budget_seconds=self.JOB18_BUDGET,
+            group_count=self.JOB18_GROUPS,
+        )
+        assert plan is not None
+        good = self._cards_for_plan(plan, omit_beat6_dialogue=False)
+        _title, cards = nodes._parse_director_structure_output(good)
+        schedule = nodes._director_duration_schedule(self.JOB18_BUDGET, 10.0)
+        self.assertEqual(len(schedule), self.JOB18_GROUPS)
+        segments, rebalanced = nodes._segments_from_structure_cards(
+            cards,
+            R2V,
+            schedule,
+            (),
+            (),
+            (),
+            (),
+            coverage_plan=plan,
+        )
+        self.assertTrue(rebalanced)
+        self.assertEqual(len(segments), self.JOB18_GROUPS)
+        self.assertAlmostEqual(sum(seg.duration_seconds for seg in segments), self.JOB18_BUDGET, places=2)
+        # Every host-mapped beat range still has ≥1 card after packing.
+        for beat_idx, count in enumerate(plan.card_counts, start=1):
+            owned = [seg for seg, mapped in zip(segments, plan.segment_to_beat) if mapped == beat_idx]
+            self.assertEqual(len(owned), count)
+            self.assertGreaterEqual(len(owned), 1)
+        # Trailing beats keep a meaningful floor (not wiped by early 15s cards).
+        for beat_idx in (6, 7):
+            total = sum(
+                seg.duration_seconds
+                for seg, mapped in zip(segments, plan.segment_to_beat)
+                if mapped == beat_idx
+            )
+            self.assertGreaterEqual(total, plan.card_counts[beat_idx - 1] * nodes.MIN_DIRECTOR_SEGMENT_SECONDS - 0.05)
+            self.assertGreaterEqual(total, min(plan.allocations[beat_idx - 1], 12.0) - 1.5)
+
+    def test_header_beat_labels_are_detected_without_machine_block(self) -> None:
+        brief = """
+节拍1 (est 45s) 分镜1-8
+角色「LANDMARK_H1」
+节拍2 (est 20s) 分镜9-12
+角色「LANDMARK_H2」
+节拍3 (est 30s) 分镜13-22
+角色「LANDMARK_H3」
+""".strip()
+        beats = nodes._parse_story_beats_from_brief(brief)
+        self.assertEqual([beat.index for beat in beats], [1, 2, 3])
+        self.assertEqual(beats[0].estimated_seconds, 45.0)
+        self.assertIn("LANDMARK_H1", beats[0].key_dialogue)
+
+    def test_plain_shot_list_without_beat_labels_keeps_knife_off(self) -> None:
+        brief = "分镜1: 开场\n分镜2: 路过\n分镜3: 结束"
+        self.assertEqual(nodes._parse_story_beats_from_brief(brief), [])
+        self.assertIsNone(
+            nodes._build_coverage_knife_plan(brief, budget_seconds=60.0, group_count=6)
+        )
