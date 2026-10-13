@@ -1111,7 +1111,11 @@ def _director_duration_schedule(total_seconds: float, target_segment_seconds: fl
 
 
 def _long_director_system(
-    mode: str, schedule: Iterable[float], quality: _DirectorLongQualityProfile
+    mode: str,
+    schedule: Iterable[float],
+    quality: _DirectorLongQualityProfile,
+    *,
+    anchor_all_pictures: bool = False,
 ) -> str:
     """Prompt Qwen for a machine-readable, beat-paced timeline with H3 per-segment syntax."""
 
@@ -1125,16 +1129,31 @@ def _long_director_system(
         if engine == FULL_REFERENCE_ENGINE
         else "integrated_multimodal_description:, overall_soundscape:, non_diegetic_music:"
     )
-    mode_rules = (
-        "This is R2V. Every segment prompt must use all six full-reference fields in that exact order. "
-        "Every connected <Picture N> is an authoritative project reference: list every connected picture in "
-        "assets.pictures for every segment, name its <Picture N> label in subject_definitions and "
-        "retention_analysis, and preserve the matching identity, outfit, environment, and visible prop state. "
-        "Keep character/reference labels stable, but write the next observable beat rather than restarting the scene."
-        if engine == FULL_REFERENCE_ENGINE
-        else "This is FL2V. Every segment prompt must use exactly the three H3 fields in that exact order. "
-        "Segment 1 starts from the optional first frame; only the final segment resolves into the optional last frame."
-    )
+    if engine == FULL_REFERENCE_ENGINE:
+        if anchor_all_pictures:
+            picture_rule = (
+                "Every connected <Picture N> is an authoritative project reference: list every connected picture in "
+                "assets.pictures for every segment, name its <Picture N> label in subject_definitions and "
+                "retention_analysis, and preserve the matching identity, outfit, environment, and visible prop state. "
+            )
+        else:
+            picture_rule = (
+                "Each connected <Picture N> is authoritative when selected: list only the pictures this beat uses "
+                "(brief cues such as 分镜…使用参考 / @reference_image_N) in assets.pictures, name those "
+                "<Picture N> labels in subject_definitions and retention_analysis, and preserve the matching "
+                "identity, outfit, environment, and visible prop state. Do not list every connected picture on "
+                "every segment. "
+            )
+        mode_rules = (
+            "This is R2V. Every segment prompt must use all six full-reference fields in that exact order. "
+            + picture_rule
+            + "Keep character/reference labels stable, but write the next observable beat rather than restarting the scene."
+        )
+    else:
+        mode_rules = (
+            "This is FL2V. Every segment prompt must use exactly the three H3 fields in that exact order. "
+            "Segment 1 starts from the optional first frame; only the final segment resolves into the optional last frame."
+        )
     return f"""
 
 This is MiniMax H3 Director long-plan mode. This instruction overrides every normal final-output format in the route
@@ -1220,6 +1239,8 @@ def _build_long_director_request(
     lora_triggers: Iterable[str],
     prompt_example: _PromptExamplePreset | None,
     quality: _DirectorLongQualityProfile,
+    *,
+    anchor_all_pictures: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one multimodal request that produces a whole Director group plan."""
 
@@ -1245,7 +1266,9 @@ def _build_long_director_request(
     return [
         {
             "role": "system",
-            "content": _route_system() + "\n\n" + _long_director_system(mode, schedule, quality),
+            "content": _route_system()
+            + "\n\n"
+            + _long_director_system(mode, schedule, quality, anchor_all_pictures=anchor_all_pictures),
         },
         {"role": "user", "content": content},
     ]
@@ -1481,8 +1504,10 @@ def _select_director_segment_assets(
     video_slots: Iterable[int],
     video_audio_slots: Iterable[int],
     audio_slots: Iterable[int],
+    *,
+    anchor_all_pictures: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Validate model-selected slots.  R2V keeps every connected picture."""
+    """Validate model-selected slots.  R2V honors per-segment pictures unless full-anchor is on."""
 
     if raw_assets is None:
         raw_assets = {}
@@ -1490,13 +1515,14 @@ def _select_director_segment_assets(
         raise PromptRefinerError(f"Director plan segment {index} assets must be a JSON object.")
     if mode != DIRECTOR_LONG_R2V_MODE:
         return (), (), (), ()
-    _plan_slot_list(
+    pictures = _plan_slot_list(
         raw_assets.get("pictures"),
         image_slots,
         "pictures",
         fallback_when_empty=True,
     )
-    pictures = tuple(sorted(set(image_slots)))
+    if anchor_all_pictures:
+        pictures = tuple(sorted(set(image_slots)))
     videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
     paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
     audios = _plan_slot_list(raw_assets.get("audios"), audio_slots, "audios")
@@ -1585,10 +1611,11 @@ def _segment_visual_references(
 ) -> tuple[list[tuple[int, str]], list[_DirectorVideoFrames]]:
     """Limit a refine call to the frames that belong to this group.
 
-    R2V pictures are project-wide anchors, so every connected picture travels
-    with every group.  FL2V sends the first frame only to group 1, the last
-    frame only to the final group, and supplemental pictures 3–9 to planning.
-    Video batches are attached only when the structure pass assigned them.
+    R2V attaches only the picture slots selected for this group (or every
+    connected still when anchor-all / empty-selection fallback filled them).
+    FL2V sends the first frame only to group 1, the last frame only to the
+    final group, and supplemental pictures 3–9 to planning.  Video batches
+    are attached only when the structure pass assigned them.
     """
 
     images = list(image_references)
@@ -1800,6 +1827,8 @@ def _segments_from_structure_cards(
     video_slots: Iterable[int],
     video_audio_slots: Iterable[int],
     audio_slots: Iterable[int],
+    *,
+    anchor_all_pictures: bool = False,
 ) -> tuple[list[_DirectorLongSegment], bool]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
@@ -1827,6 +1856,7 @@ def _segments_from_structure_cards(
             video_slots,
             video_audio_slots,
             audio_slots,
+            anchor_all_pictures=anchor_all_pictures,
         )
         segments.append(
             _DirectorLongSegment(
@@ -1852,21 +1882,38 @@ def _segments_from_structure_cards(
     return segments, durations_rebalanced
 
 
-def _long_director_structure_system(mode: str, schedule: Iterable[float]) -> str:
+def _long_director_structure_system(
+    mode: str,
+    schedule: Iterable[float],
+    *,
+    anchor_all_pictures: bool = False,
+) -> str:
     """Ask for beat cards only.  H3 prompts are written later, one group at a time."""
 
     durations = tuple(schedule)
     engine = _director_mode_engine(mode)
     total_seconds = sum(durations)
     target_seconds = total_seconds / len(durations)
-    asset_rules = (
-        "This is R2V. For each segment, PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS must contain only "
-        "connected reference slot numbers that the segment actually uses; use an empty value after the colon when "
-        "none apply. Every connected picture is still a project-wide anchor and may be listed on every segment."
-        if engine == FULL_REFERENCE_ENGINE
-        else "This is FL2V. Leave PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS empty. Segment 1 starts from the "
-        "optional first frame; only the final segment resolves into the optional last frame."
-    )
+    if engine == FULL_REFERENCE_ENGINE:
+        if anchor_all_pictures:
+            picture_rule = (
+                "Every connected picture is still a project-wide anchor and may be listed on every segment."
+            )
+        else:
+            picture_rule = (
+                "Assign only the pictures this beat uses (brief cues such as 分镜…使用参考 / "
+                "@reference_image_N). Do not list every connected picture on every segment."
+            )
+        asset_rules = (
+            "This is R2V. For each segment, PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS must contain only "
+            "connected reference slot numbers that the segment actually uses; use an empty value after the colon when "
+            f"none apply. {picture_rule}"
+        )
+    else:
+        asset_rules = (
+            "This is FL2V. Leave PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS empty. Segment 1 starts from the "
+            "optional first frame; only the final segment resolves into the optional last frame."
+        )
     return f"""
 This is MiniMax H3 Director long-plan STRUCTURE mode. This instruction overrides every normal final-output format in
 the route profile. Return only the marked beat-card format below: no markdown fence, no explanation, no <think> block,
@@ -1984,6 +2031,8 @@ def _build_long_director_structure_request(
     director_videos: Iterable[_DirectorVideoFrames],
     audio_slots: Iterable[int],
     video_audio_slots: Iterable[int],
+    *,
+    anchor_all_pictures: bool = False,
 ) -> list[dict[str, Any]]:
     """Split the story into beat cards without sending still-image bytes.
 
@@ -2009,10 +2058,19 @@ def _build_long_director_structure_request(
     if reference_text.strip():
         prompt += f"\n\nAdditional reference notes:\n{reference_text.strip()}"
     if images:
+        if anchor_all_pictures:
+            assign_note = (
+                "Assign picture slots from the brief and the inventory; every connected picture may still be "
+                "listed on every segment as a project-wide anchor."
+            )
+        else:
+            assign_note = (
+                "Assign only the picture slots this beat uses (brief cues such as 分镜…使用参考 / "
+                "@reference_image_N); do not list every connected picture on every segment."
+            )
         prompt += (
             "\nConnected stills are listed above as <Picture N> labels only. This structure pass does not "
-            "receive those image bytes. Assign picture slots from the brief and the inventory; a later refine "
-            "pass inspects the actual pictures."
+            f"receive those image bytes. {assign_note} A later refine pass inspects the actual pictures."
         )
     if videos:
         prompt += (
@@ -2025,7 +2083,9 @@ def _build_long_director_structure_request(
     return [
         {
             "role": "system",
-            "content": _route_system() + "\n\n" + _long_director_structure_system(mode, schedule),
+            "content": _route_system()
+            + "\n\n"
+            + _long_director_structure_system(mode, schedule, anchor_all_pictures=anchor_all_pictures),
         },
         {"role": "user", "content": content},
     ]
@@ -2142,6 +2202,8 @@ def _single_group_structure_segment(
     video_slots: Iterable[int],
     video_audio_slots: Iterable[int],
     audio_slots: Iterable[int],
+    *,
+    anchor_all_pictures: bool = False,
 ) -> _DirectorLongSegment:
     """A one-group project has nothing to split, so refine the brief directly."""
 
@@ -2159,6 +2221,7 @@ def _single_group_structure_segment(
         video_slots,
         video_audio_slots,
         audio_slots,
+        anchor_all_pictures=anchor_all_pictures,
     )
     beat = _clip_text(
         "Dramatize the full project brief as this single group. Keep every required action, identity, and line.",
@@ -2241,6 +2304,7 @@ def _plan_director_with_independent_segment_refine(
     quality: _DirectorLongQualityProfile,
     requested_max_tokens: int,
     seed: int,
+    anchor_all_pictures: bool = False,
 ) -> tuple[str, list[_DirectorLongSegment], bool, str, dict[str, Any]]:
     """Split the timeline once, then write each Director prompt in its own completion.
 
@@ -2270,6 +2334,7 @@ def _plan_director_with_independent_segment_refine(
                 video_slots,
                 video_audio_slots,
                 audio_slots,
+                anchor_all_pictures=anchor_all_pictures,
             )
         ]
         durations_rebalanced = False
@@ -2283,6 +2348,7 @@ def _plan_director_with_independent_segment_refine(
             director_videos,
             audio_slots,
             video_audio_slots,
+            anchor_all_pictures=anchor_all_pictures,
         )
         last_error: Exception | None = None
         title = "Untitled MiniMax H3 Director project"
@@ -2301,6 +2367,7 @@ def _plan_director_with_independent_segment_refine(
                     video_slots,
                     video_audio_slots,
                     audio_slots,
+                    anchor_all_pictures=anchor_all_pictures,
                 )
                 last_error = None
                 break
@@ -2425,6 +2492,7 @@ def _director_draft_cache_key(
     reference_text: str,
     manual_lora_trigger_words: str,
     assets: dict[str, Any],
+    anchor_all_pictures: bool = False,
 ) -> str:
     """Identify a preview draft without including the release/preview control itself."""
 
@@ -2443,6 +2511,7 @@ def _director_draft_cache_key(
         "max_tokens": int(max_tokens),
         "planning_quality": planning_quality,
         "prompt_refinement": prompt_refinement,
+        "anchor_all_pictures": bool(anchor_all_pictures),
         "seed": int(seed),
         "example": example_preset,
         "lora_presets": list(lora_presets),
@@ -2617,6 +2686,8 @@ def _validate_long_director_plan(
     video_audio_slots: Iterable[int],
     audio_slots: Iterable[int],
     lora_triggers: Iterable[str],
+    *,
+    anchor_all_pictures: bool = False,
 ) -> tuple[str, list[_DirectorLongSegment], bool]:
     """Turn Qwen's marked plan into safe, beat-paced Director group data."""
 
@@ -2668,10 +2739,10 @@ def _validate_long_director_plan(
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        # Validate Qwen's routing, but carry all connected pictures into every
-        # R2V group.  They are the project's stable visual anchors; otherwise
-        # one omitted model list could turn a reference-driven group into an
-        # unreferenced generation.  FL2V ignores asset lists.
+        # Honor per-segment PICTURES by default.  Empty/missing falls back to
+        # every connected still.  anchor_all_pictures restores the old force-all
+        # behavior so every R2V group carries the full still set.  FL2V ignores
+        # asset lists.
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
             raw.get("assets", {}),
@@ -2680,6 +2751,7 @@ def _validate_long_director_plan(
             video_slots,
             video_audio_slots,
             audio_slots,
+            anchor_all_pictures=anchor_all_pictures,
         )
         prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
@@ -3635,6 +3707,18 @@ class Qwen38LongVideoDirectorPlanner:
                         ),
                     },
                 ),
+                "anchor_all_pictures": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label": "Anchor all pictures",
+                        "tooltip": (
+                            "Default off (tighten): each R2V group only carries the pictures that segment listed "
+                            "(empty selection falls back to all connected stills). Turn on (全挂锚图) to restore "
+                            "the old behavior that attaches every connected picture to every R2V group."
+                        ),
+                    },
+                ),
                 "total_duration_seconds": (
                     "FLOAT",
                     {
@@ -3810,6 +3894,7 @@ class Qwen38LongVideoDirectorPlanner:
         director_execution: str = DIRECTOR_EXECUTION_PREVIEW,
         planning_quality: str = DIRECTOR_LONG_QUALITY_BALANCED,
         prompt_refinement: str = DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+        anchor_all_pictures: bool = False,
         example_preset: str = PROMPT_EXAMPLE_PRESET_NONE,
         lora_preset_1: str = LORA_PRESET_NONE,
         lora_preset_2: str = LORA_PRESET_NONE,
@@ -3894,6 +3979,7 @@ class Qwen38LongVideoDirectorPlanner:
             reference_text=reference_text,
             manual_lora_trigger_words=manual_lora_trigger_words,
             assets=assets,
+            anchor_all_pictures=bool(anchor_all_pictures),
         )
         release_to_director = director_execution == DIRECTOR_EXECUTION_RELEASE
         run_director_now = director_execution == DIRECTOR_EXECUTION_DIRECT
@@ -3974,6 +4060,7 @@ class Qwen38LongVideoDirectorPlanner:
                         quality=quality_profile,
                         requested_max_tokens=int(max_tokens),
                         seed=int(seed),
+                        anchor_all_pictures=bool(anchor_all_pictures),
                     )
                 )
                 effective_max_tokens = int(refine_record["segment_refine_max_tokens"])
@@ -3995,6 +4082,7 @@ class Qwen38LongVideoDirectorPlanner:
                         lora_triggers,
                         prompt_example,
                         quality_profile,
+                        anchor_all_pictures=bool(anchor_all_pictures),
                     ),
                     effective_max_tokens,
                     int(seed),
@@ -4008,6 +4096,7 @@ class Qwen38LongVideoDirectorPlanner:
                     video_audio_assets,
                     audio_assets,
                     lora_triggers,
+                    anchor_all_pictures=bool(anchor_all_pictures),
                 )
                 refine_trace = (
                     f"prompt_refinement={DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT} | refine_passes=1"
@@ -4049,6 +4138,7 @@ class Qwen38LongVideoDirectorPlanner:
                 f"context={int(context_length)} (quality_recommendation={context_note}, scope={token_scope}) | "
                 f"max_tokens={effective_max_tokens} (requested={int(max_tokens)}, scope={token_scope}) | "
                 f"brief_source={brief_source} | durations_rebalanced={durations_rebalanced} | "
+                f"anchor_all_pictures={str(bool(anchor_all_pictures)).lower()} | "
                 f"cached={keep_model_loaded}\n"
                 f"{refine_trace}"
             )

@@ -196,8 +196,9 @@ class LongDirectorRefineTests(unittest.TestCase):
             [segment.continuity_from_prev for segment in segments],
             [False, True, False],
         )
-        self.assertEqual(segments[0].picture_slots, (1, 2))
-        self.assertEqual(segments[1].picture_slots, (1, 2))
+        self.assertEqual(segments[0].picture_slots, (1,))
+        self.assertEqual(segments[1].picture_slots, (1,))
+        self.assertEqual(segments[2].picture_slots, (1, 2))  # empty PICTURES → all connected
         self.assertEqual(segments[0].video_slots, (1,))
         self.assertEqual(segments[1].video_slots, (2,))
         self.assertEqual(segments[1].video_audio_slots, (2,))
@@ -217,7 +218,9 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertNotIn("uri-video-1", json.dumps(calls[2]["parts"]))
         self.assertIn("uri-video-2a", json.dumps(calls[2]["parts"]))
         self.assertIn("uri-picture-1", json.dumps(calls[2]["parts"]))
-        self.assertIn("uri-picture-2", json.dumps(calls[2]["parts"]))
+        self.assertNotIn("uri-picture-2", json.dumps(calls[2]["parts"]))
+        self.assertIn("uri-picture-1", json.dumps(calls[3]["parts"]))
+        self.assertIn("uri-picture-2", json.dumps(calls[3]["parts"]))
         self.assertNotIn("uri-video-2a", json.dumps(calls[3]["parts"]))
         self.assertIn("<Audio 1>", calls[3]["user"])
         self.assertIn("per_segment_refine:", debug)
@@ -252,7 +255,8 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertFalse(groups[0]["continuityFromPrev"])
         self.assertTrue(groups[1]["continuityFromPrev"])
         self.assertFalse(groups[2]["continuityFromPrev"])
-        self.assertEqual(set(groups[1]["ref_images"]), {0, 1})
+        self.assertEqual(set(groups[1]["ref_images"]), {0})
+        self.assertEqual(set(groups[2]["ref_images"]), {0, 1})
         self.assertEqual(set(groups[1]["ref_videos"]), {1})
         self.assertEqual(set(groups[2]["ref_videos"]), set())
         self.assertIn("UNIQUE_PROMPT_TWO", groups[1]["prompt"])
@@ -718,7 +722,8 @@ N/A
         required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
         names = list(required)
         self.assertLess(names.index("planning_quality"), names.index("prompt_refinement"))
-        self.assertLess(names.index("prompt_refinement"), names.index("total_duration_seconds"))
+        self.assertLess(names.index("prompt_refinement"), names.index("anchor_all_pictures"))
+        self.assertLess(names.index("anchor_all_pictures"), names.index("total_duration_seconds"))
         self.assertEqual(
             required["prompt_refinement"][1]["default"],
             nodes.DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
@@ -753,6 +758,55 @@ N/A
             cache_key(nodes.DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT),
             cache_key(nodes.DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT),
         )
+        tighten = nodes._director_draft_cache_key(
+            brief="story",
+            director_mode=R2V,
+            total_duration_seconds=60,
+            segment_duration_seconds=10,
+            model_name="model.gguf",
+            mmproj_name="none",
+            vision_handler="auto (Qwen3-VL)",
+            context_length=32768,
+            gpu_layers=-1,
+            temperature=0.4,
+            top_p=0.9,
+            max_tokens=4096,
+            planning_quality=BALANCED.name,
+            prompt_refinement=nodes.DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+            seed=1,
+            example_preset="None",
+            lora_presets=(),
+            video_frame_samples=3,
+            reference_text="",
+            manual_lora_trigger_words="",
+            assets={},
+            anchor_all_pictures=False,
+        )
+        full_anchor = nodes._director_draft_cache_key(
+            brief="story",
+            director_mode=R2V,
+            total_duration_seconds=60,
+            segment_duration_seconds=10,
+            model_name="model.gguf",
+            mmproj_name="none",
+            vision_handler="auto (Qwen3-VL)",
+            context_length=32768,
+            gpu_layers=-1,
+            temperature=0.4,
+            top_p=0.9,
+            max_tokens=4096,
+            planning_quality=BALANCED.name,
+            prompt_refinement=nodes.DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
+            seed=1,
+            example_preset="None",
+            lora_presets=(),
+            video_frame_samples=3,
+            reference_text="",
+            manual_lora_trigger_words="",
+            assets={},
+            anchor_all_pictures=True,
+        )
+        self.assertNotEqual(tighten, full_anchor)
         with self.assertRaises(nodes.PromptRefinerError):
             nodes._director_prompt_refinement_mode("both at once")
 
@@ -1222,6 +1276,149 @@ class LlamaPerformanceKwargTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as missing:
             nodes._instantiate_llama(MissingModel, {"model_path": "m"}, {"n_batch": 2048})
         self.assertIn("model file not found", str(missing.exception))
+
+
+class R2VPictureSelectionTests(unittest.TestCase):
+    """Tighten mode keeps per-segment stills; full-anchor restores force-all."""
+
+    def test_model_selected_pictures_are_kept(self) -> None:
+        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+            R2V,
+            {"pictures": [1, 3], "videos": [], "video_audios": [], "audios": []},
+            1,
+            (1, 2, 3),
+            (),
+            (),
+            (),
+        )
+        self.assertEqual(pictures, (1, 3))
+
+    def test_empty_picture_selection_falls_back_to_all_connected(self) -> None:
+        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+            R2V,
+            {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+            2,
+            (1, 2, 3),
+            (),
+            (),
+            (),
+        )
+        self.assertEqual(pictures, (1, 2, 3))
+        missing = nodes._select_director_segment_assets(
+            R2V,
+            {},
+            3,
+            (1, 2),
+            (),
+            (),
+            (),
+        )[0]
+        self.assertEqual(missing, (1, 2))
+
+    def test_anchor_all_pictures_forces_every_connected_still(self) -> None:
+        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+            R2V,
+            {"pictures": [1, 3], "videos": [], "video_audios": [], "audios": []},
+            1,
+            (1, 2, 3),
+            (),
+            (),
+            (),
+            anchor_all_pictures=True,
+        )
+        self.assertEqual(pictures, (1, 2, 3))
+
+    def test_structure_system_wording_follows_toggle(self) -> None:
+        tighten = nodes._long_director_structure_system(R2V, (10.0, 10.0))
+        self.assertIn("Assign only the pictures this beat uses", tighten)
+        self.assertIn("@reference_image_N", tighten)
+        self.assertNotIn("project-wide anchor and may be listed on every segment", tighten)
+        full = nodes._long_director_structure_system(
+            R2V, (10.0, 10.0), anchor_all_pictures=True
+        )
+        self.assertIn("project-wide anchor and may be listed on every segment", full)
+        self.assertNotIn("Assign only the pictures this beat uses", full)
+
+    def test_marked_plan_honors_subset_unless_anchor_all(self) -> None:
+        plan = """
+TITLE: Subset stills
+=== SEGMENT 1 ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: false
+PICTURES: 1, 3
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+PROMPT:
+subject_definitions:
+Hero.
+summary:
+Opens.
+retention_analysis:
+Keep the look.
+detailed_description:
+[Shot 1] A hand sets down a cup.
+overall_soundscape:
+Room tone.
+non_diegetic_music:
+N/A
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: true
+PICTURES: 2
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+PROMPT:
+subject_definitions:
+Hero.
+summary:
+Continues.
+retention_analysis:
+Keep the room.
+detailed_description:
+[Shot 1] The camera finds the window.
+overall_soundscape:
+Room tone.
+non_diegetic_music:
+N/A
+=== END SEGMENT ===
+""".strip()
+        _title, segments, _rebalanced = nodes._validate_long_director_plan(
+            plan,
+            R2V,
+            (10.0, 10.0),
+            image_slots=(1, 2, 3),
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            lora_triggers=(),
+        )
+        self.assertEqual(segments[0].picture_slots, (1, 3))
+        self.assertEqual(segments[1].picture_slots, (2,))
+
+        _title, anchored, _rebalanced = nodes._validate_long_director_plan(
+            plan,
+            R2V,
+            (10.0, 10.0),
+            image_slots=(1, 2, 3),
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            lora_triggers=(),
+            anchor_all_pictures=True,
+        )
+        self.assertEqual(anchored[0].picture_slots, (1, 2, 3))
+        self.assertEqual(anchored[1].picture_slots, (1, 2, 3))
+
+    def test_planner_exposes_anchor_all_pictures_widget(self) -> None:
+        required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
+        self.assertIn("anchor_all_pictures", required)
+        self.assertEqual(required["anchor_all_pictures"][0], "BOOLEAN")
+        self.assertFalse(required["anchor_all_pictures"][1]["default"])
+
+
 
 
 if __name__ == "__main__":
