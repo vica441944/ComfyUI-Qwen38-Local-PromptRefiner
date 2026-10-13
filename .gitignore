@@ -19,3 +19,4 @@ temp/
 Thumbs.db
 Desktop.ini
 *.log
+.venv
