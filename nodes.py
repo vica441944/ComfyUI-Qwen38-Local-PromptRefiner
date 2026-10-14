@@ -1940,6 +1940,599 @@ def _retarget_durations_to_dialogue(
     return updated, True
 
 
+
+@dataclass(frozen=True)
+class _StoryBeatSpec:
+    """One narrative beat extracted from the brief (or an NV-style beat block)."""
+
+    index: int
+    estimated_seconds: float
+    shot_start: int | None
+    shot_end: int | None
+    label: str
+    body: str
+    key_dialogue: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CoverageKnifePlan:
+    """Host-side floor + scale for structure cards when budget < Σbeat est."""
+
+    beats: tuple[_StoryBeatSpec, ...]
+    budget_seconds: float
+    group_count: int
+    estimated_sum: float
+    compressed: bool
+    allocations: tuple[float, ...]
+    card_counts: tuple[int, ...]
+    segment_to_beat: tuple[int, ...]
+
+
+_STORY_BEATS_BLOCK = re.compile(
+    r"\[\s*STORY_BEATS\s*\](.*?)\[\s*/\s*STORY_BEATS\s*\]",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_STORY_BEAT_LINE = re.compile(
+    r"^\s*(\d+)\s*[|:,]\s*"
+    r"(?P<est>\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds|秒)?\s*[|:,]\s*"
+    r"(?P<shots>\d+\s*[-–—~到至]\s*\d+|—|-|none)?\s*[|:,]?\s*"
+    r"(?P<label>[^|:\n]*)\s*"
+    r"(?:[|:,]\s*(?P<keys>.+))?\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_BEAT_HEADER = re.compile(
+    r"(?m)^\s*(?:#{1,3}\s*)?(?:【\s*)?(?:节拍|Beat)\s*(?P<idx>\d+)\s*(?:】)?"
+    r"(?P<head>[^\n]*)\n?",
+    flags=re.IGNORECASE,
+)
+_BEAT_EST = re.compile(
+    r"(?:est(?:imated)?(?:_duration)?(?:_seconds)?|时长|预估)\s*[=:：]?\s*"
+    r"(?P<est>\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds|秒)?",
+    flags=re.IGNORECASE,
+)
+_BEAT_SHOTS = re.compile(
+    r"(?:shots?|分镜)\s*[=:：]?\s*(?P<a>\d+)\s*[-–—~到至]\s*(?P<b>\d+)",
+    flags=re.IGNORECASE,
+)
+_DIALOGUE_QUOTE = re.compile(r"[「『""]([^」』""]{2,120})[」』""]")
+_KEY_DIALOGUE_LINE = re.compile(
+    r"(?im)^\s*(?:KEY_DIALOGUE|关键台词)\s*[=:：]\s*(.+?)\s*$"
+)
+
+
+def _normalize_dialogue_needle(text: str) -> str:
+    """Collapse punctuation/whitespace so landmark lines still match paraphrased spacing."""
+
+    collapsed = re.sub(r"\s+", "", (text or "").strip())
+    collapsed = re.sub(r"[…\.…·・，,。.!！?？:：;；、\-—_~～\"'“”‘’「」『』（）()【】\[\]]+", "", collapsed)
+    return collapsed.casefold()
+
+
+def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]:
+    """Pick distinctive spoken lines from a beat body for coverage checks."""
+
+    raw = text or ""
+    found: list[str] = []
+    for match in _KEY_DIALOGUE_LINE.finditer(raw):
+        for part in re.split(r"[;；|/／]", match.group(1)):
+            token = part.strip()
+            if len(token) >= 2:
+                found.append(token)
+    for match in _DIALOGUE_QUOTE.finditer(raw):
+        token = match.group(1).strip()
+        if len(token) >= 2:
+            found.append(token)
+    # Prefer longer, more distinctive lines; drop near-duplicates.
+    ranked = sorted(dict.fromkeys(found), key=lambda item: (-len(item), item))
+    selected: list[str] = []
+    norms: list[str] = []
+    for token in ranked:
+        if _is_placeholder_landmark(token):
+            continue
+        norm = _normalize_dialogue_needle(token)
+        if len(norm) < 2:
+            continue
+        if any(norm in prior or prior in norm for prior in norms):
+            continue
+        selected.append(token)
+        norms.append(norm)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
+def _parse_shot_range_token(raw: str | None) -> tuple[int | None, int | None]:
+    if not raw:
+        return None, None
+    token = raw.strip()
+    if not token or token in {"-", "—", "none", "None", "N/A", "n/a"}:
+        return None, None
+    match = re.search(r"(\d+)\s*[-–—~到至]\s*(\d+)", token)
+    if not match:
+        return None, None
+    start, end = int(match.group(1)), int(match.group(2))
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _story_beat_from_fields(
+    index: int,
+    estimated_seconds: float,
+    shot_start: int | None,
+    shot_end: int | None,
+    label: str,
+    body: str,
+    key_dialogue: Iterable[str] | None = None,
+) -> _StoryBeatSpec:
+    est = max(float(estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS)
+    keys = tuple(
+        item.strip()
+        for item in (key_dialogue or ())
+        if str(item).strip() and not _is_placeholder_landmark(str(item))
+    )
+    if not keys:
+        keys = _extract_dialogue_landmarks(body)
+    return _StoryBeatSpec(
+        index=int(index),
+        estimated_seconds=round(est, 3),
+        shot_start=shot_start,
+        shot_end=shot_end,
+        label=(label or f"beat {index}").strip() or f"beat {index}",
+        body=(body or "").strip(),
+        key_dialogue=keys,
+    )
+
+
+def _parse_story_beats_block(brief: str) -> list[_StoryBeatSpec]:
+    match = _STORY_BEATS_BLOCK.search(brief or "")
+    if not match:
+        return []
+    beats: list[_StoryBeatSpec] = []
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        row = _STORY_BEAT_LINE.match(line)
+        if not row:
+            continue
+        shot_start, shot_end = _parse_shot_range_token(row.group("shots"))
+        keys_raw = row.group("keys") or ""
+        keys = [part.strip() for part in re.split(r"[;；|/／]", keys_raw) if part.strip()]
+        beats.append(
+            _story_beat_from_fields(
+                int(row.group(1)),
+                float(row.group("est")),
+                shot_start,
+                shot_end,
+                (row.group("label") or "").strip(),
+                keys_raw,
+                keys,
+            )
+        )
+    return beats
+
+
+def _parse_story_beats_from_headers(brief: str) -> list[_StoryBeatSpec]:
+    text = brief or ""
+    matches = list(_BEAT_HEADER.finditer(text))
+    if len(matches) < 2:
+        return []
+    beats: list[_StoryBeatSpec] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        head = match.group("head") or ""
+        est_match = _BEAT_EST.search(head) or _BEAT_EST.search(body[:240])
+        shots_match = _BEAT_SHOTS.search(head) or _BEAT_SHOTS.search(body[:240])
+        estimated = float(est_match.group("est")) if est_match else 0.0
+        shot_start = int(shots_match.group("a")) if shots_match else None
+        shot_end = int(shots_match.group("b")) if shots_match else None
+        if estimated <= 0 and shot_start is not None and shot_end is not None:
+            # Rough fallback: ~4s per shot, still proportional across beats.
+            estimated = max(MIN_DIRECTOR_SEGMENT_SECONDS, (shot_end - shot_start + 1) * 4.0)
+        if estimated <= 0:
+            estimated = 20.0
+        label = re.sub(r"\s+", " ", head).strip(" -—|｜:") or f"beat {match.group('idx')}"
+        beats.append(
+            _story_beat_from_fields(
+                int(match.group("idx")),
+                estimated,
+                shot_start,
+                shot_end,
+                label,
+                f"{head}\n{body}",
+            )
+        )
+    beats.sort(key=lambda item: item.index)
+    return beats
+
+
+def _parse_story_beats_from_brief(brief: str) -> list[_StoryBeatSpec]:
+    """Detect story beats for the coverage knife.
+
+    Priority:
+    1. Explicit ``[STORY_BEATS]`` machine block (NV export / tests).
+    2. ``节拍N`` / ``Beat N`` headers with optional est + 分镜 range.
+    Plain ``分镜N`` lists without beat labels return empty — the knife stays
+    inactive rather than guessing boundaries.
+    """
+
+    beats = _parse_story_beats_block(brief)
+    if len(beats) >= 2:
+        return beats
+    beats = _parse_story_beats_from_headers(brief)
+    if len(beats) >= 2:
+        return beats
+    return []
+
+
+def _allocate_beat_card_counts(weights: Iterable[float], group_count: int) -> tuple[int, ...]:
+    """Give every beat ≥1 card, then largest-remainder the rest by weight."""
+
+    values = [max(0.0, float(weight)) for weight in weights]
+    beat_count = len(values)
+    if beat_count == 0:
+        return ()
+    if group_count < beat_count:
+        raise PromptRefinerError(
+            f"Coverage knife needs at least {beat_count} Director groups for {beat_count} story beats, "
+            f"but the schedule only has {group_count}. Raise total_duration_seconds or lower "
+            "segment_duration_seconds so every beat can keep one card."
+        )
+    counts = [1] * beat_count
+    remaining = int(group_count) - beat_count
+    if remaining <= 0:
+        return tuple(counts)
+    total_weight = sum(values)
+    if total_weight <= 0:
+        values = [1.0] * beat_count
+        total_weight = float(beat_count)
+    exact = [remaining * (weight / total_weight) for weight in values]
+    extras = [int(item) for item in exact]
+    leftover = remaining - sum(extras)
+    order = sorted(range(beat_count), key=lambda idx: (exact[idx] - extras[idx], values[idx], -idx), reverse=True)
+    for idx in order[:leftover]:
+        extras[idx] += 1
+    return tuple(base + extra for base, extra in zip(counts, extras))
+
+
+def _segment_to_beat_map(card_counts: Iterable[int]) -> tuple[int, ...]:
+    mapping: list[int] = []
+    for beat_index, count in enumerate(card_counts, start=1):
+        mapping.extend([beat_index] * int(count))
+    return tuple(mapping)
+
+
+def _scale_beat_allocations(
+    estimates: Iterable[float], budget_seconds: float
+) -> tuple[tuple[float, ...], bool]:
+    """Proportionally compress beat budgets when Σest exceeds the project total."""
+
+    values = [max(float(item), MIN_DIRECTOR_SEGMENT_SECONDS) for item in estimates]
+    total = sum(values)
+    budget = float(budget_seconds)
+    if total <= 0:
+        raise PromptRefinerError("Coverage knife beat estimates must be positive.")
+    if total <= budget + 1e-6:
+        return tuple(round(item, 3) for item in values), False
+    scale = budget / total
+    return tuple(round(item * scale, 3) for item in values), True
+
+
+def _build_coverage_knife_plan(
+    brief: str,
+    *,
+    budget_seconds: float,
+    group_count: int,
+) -> _CoverageKnifePlan | None:
+    beats = _parse_story_beats_from_brief(brief)
+    if len(beats) < 2:
+        return None
+    estimates = [beat.estimated_seconds for beat in beats]
+    allocations, compressed = _scale_beat_allocations(estimates, budget_seconds)
+    # Card floor uses compressed allocations so early/climax weight shrinks first
+    # when overspending, while every beat (including trailing) still gets ≥1 card.
+    card_counts = _allocate_beat_card_counts(allocations, group_count)
+    return _CoverageKnifePlan(
+        beats=tuple(beats),
+        budget_seconds=round(float(budget_seconds), 3),
+        group_count=int(group_count),
+        estimated_sum=round(sum(estimates), 3),
+        compressed=compressed,
+        allocations=allocations,
+        card_counts=card_counts,
+        segment_to_beat=_segment_to_beat_map(card_counts),
+    )
+
+
+def _coverage_knife_plan_for_card_count(
+    plan: _CoverageKnifePlan, card_count: int
+) -> _CoverageKnifePlan:
+    """Rebuild segment→beat map when the model returns ±1 card drift."""
+
+    if int(card_count) == int(plan.group_count):
+        return plan
+    card_counts = _allocate_beat_card_counts(plan.allocations, int(card_count))
+    return replace(
+        plan,
+        group_count=int(card_count),
+        card_counts=card_counts,
+        segment_to_beat=_segment_to_beat_map(card_counts),
+    )
+
+
+def _format_coverage_knife_instructions(plan: _CoverageKnifePlan) -> str:
+    lines = [
+        "COVERAGE KNIFE (host-enforced; do not drop trailing story beats):",
+        (
+            f"Story beats detected: {len(plan.beats)}. Estimated sum={plan.estimated_sum:.3f}s; "
+            f"project budget={plan.budget_seconds:.3f}s; "
+            f"{'proportionally compressed' if plan.compressed else 'fits without compression'}."
+        ),
+        "Assign structure cards by the exact segment ranges below. Every story beat must receive "
+        "at least one card. When the budget is tight, shorten early/climax beats — never omit the "
+        "final story beats.",
+    ]
+    cursor = 1
+    for beat, allocation, cards in zip(plan.beats, plan.allocations, plan.card_counts):
+        start = cursor
+        end = cursor + cards - 1
+        cursor = end + 1
+        shot = (
+            f"shots {beat.shot_start}-{beat.shot_end}"
+            if beat.shot_start is not None and beat.shot_end is not None
+            else "shots n/a"
+        )
+        keys = "; ".join(beat.key_dialogue) if beat.key_dialogue else "(no landmark dialogue)"
+        lines.append(
+            f"- Segments {start}-{end}: story beat {beat.index} ({beat.label}; {shot}; "
+            f"est {beat.estimated_seconds:.3f}s → alloc {allocation:.3f}s; {cards} card(s)). "
+            f"Landmark DIALOGUE that must appear verbatim somewhere in these cards: {keys}"
+        )
+    lines.append(
+        "If a landmark line cannot fit in one card, split it across adjacent cards in the same "
+        "story beat, but never skip it."
+    )
+    return "\n".join(lines)
+
+
+def _cards_dialogue_blob(cards: Iterable[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for card in cards:
+        dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
+        if dialogue:
+            parts.append(dialogue)
+    return "\n".join(parts)
+
+
+def _cards_coverage_blob(cards: Iterable[dict[str, Any]]) -> str:
+    """Normalize search space for landmarks: BEAT + DIALOGUE + HANDOFF."""
+
+    parts: list[str] = []
+    for card in cards:
+        beat = str(card.get("beat") or "").strip()
+        if beat:
+            parts.append(beat)
+        dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
+        if dialogue:
+            parts.append(dialogue)
+        handoff = str(card.get("handoff") or "").strip()
+        if handoff:
+            parts.append(handoff)
+    return "\n".join(parts)
+
+
+def _is_placeholder_landmark(landmark: str) -> bool:
+    """Skip NV-style placeholders such as （露骨台词） / (explicit ...) / empty."""
+
+    raw = (landmark or "").strip()
+    if not raw:
+        return True
+    if "（露骨" in raw or "(explicit" in raw.casefold():
+        return True
+    return len(_normalize_dialogue_needle(raw)) < 2
+
+
+def _format_coverage_landmark_miss(misses: Iterable[str], *, limit: int = 180) -> str:
+    tokens = [str(item).strip() for item in misses if str(item).strip()]
+    if not tokens:
+        return ""
+    joined = ";".join(tokens)
+    if len(joined) > limit:
+        joined = joined[: max(0, limit - 1)].rstrip() + "…"
+    return f"coverage_landmark_miss={joined}"
+
+
+def _validate_structure_coverage(
+    cards: list[dict[str, Any]], plan: _CoverageKnifePlan
+) -> list[str]:
+    """Hard-fail card floor / empty BEAT; return soft landmark misses (no raise)."""
+
+    active = _coverage_knife_plan_for_card_count(plan, len(cards))
+    ordered = sorted(cards, key=lambda card: int(card["index"]))
+    if len(ordered) != len(active.segment_to_beat):
+        raise PromptRefinerError(
+            f"Coverage knife expected {len(active.segment_to_beat)} structure cards after count repair, "
+            f"got {len(ordered)}."
+        )
+    # Per-beat card floor (by host map).
+    for beat, count in zip(active.beats, active.card_counts):
+        if count < 1:
+            raise PromptRefinerError(
+                f"Coverage knife dropped story beat {beat.index}; every beat needs ≥1 structure card."
+            )
+    hard_missing: list[str] = []
+    soft_misses: list[str] = []
+    for beat_index, beat in enumerate(active.beats, start=1):
+        beat_cards = [
+            card
+            for card, mapped in zip(ordered, active.segment_to_beat)
+            if int(mapped) == beat_index
+        ]
+        if not beat_cards:
+            hard_missing.append(f"beat {beat.index} has zero cards")
+            continue
+        if not any(str(card.get("beat") or "").strip() for card in beat_cards):
+            hard_missing.append(f"beat {beat.index} cards have empty BEAT")
+            continue
+        blob = _normalize_dialogue_needle(_cards_coverage_blob(beat_cards))
+        # Also accept landmarks placed on any card (mis-slice) so the miss list
+        # only records lines that are absent from the whole plan.
+        global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
+        for landmark in beat.key_dialogue:
+            if _is_placeholder_landmark(landmark):
+                continue
+            needle = _normalize_dialogue_needle(landmark)
+            if len(needle) < 2:
+                continue
+            if needle in blob or needle in global_blob:
+                continue
+            # Soft match: require a long distinctive core (≥4 chars) as substring.
+            core = needle[: max(4, min(12, len(needle)))]
+            if core and (core in blob or core in global_blob):
+                continue
+            soft_misses.append(f"beat{beat.index}:{landmark}")
+    if hard_missing:
+        raise PromptRefinerError(
+            "Coverage knife rejected the structure plan (beat / card coverage). "
+            + " | ".join(hard_missing[:8])
+        )
+    return soft_misses
+
+
+def _beat_compress_priority(plan: _CoverageKnifePlan) -> tuple[int, ...]:
+    """Lower score = compress first. Trailing beat is last; climax/early go first."""
+
+    beat_count = len(plan.beats)
+    if beat_count == 0:
+        return ()
+    est = [beat.estimated_seconds for beat in plan.beats]
+    climax_idx = max(range(beat_count), key=lambda idx: (est[idx], idx))
+    scores: list[int] = []
+    for idx in range(beat_count):
+        if idx == beat_count - 1:
+            scores.append(10_000)  # never prefer cutting the trailing beat
+        elif idx == climax_idx:
+            scores.append(0)
+        elif idx == 0:
+            scores.append(1)
+        else:
+            scores.append(10 + idx)
+    return tuple(scores)
+
+
+def _enforce_coverage_duration_allocations(
+    segments: list[_DirectorLongSegment],
+    plan: _CoverageKnifePlan,
+) -> list[_DirectorLongSegment]:
+    """Seed/repair per-beat totals after dialogue retarget without dropping trailing beats.
+
+    When speech-based ideals overspend early/climax groups, steal duration from those
+    groups first so the final story beat keeps its compressed allocation floor.
+    """
+
+    if not segments or not plan.beats:
+        return segments
+    active = _coverage_knife_plan_for_card_count(plan, len(segments))
+    ordered = sorted(segments, key=lambda item: item.index)
+    values = [float(item.duration_seconds) for item in ordered]
+    budget = float(active.budget_seconds)
+    # Floor each beat at min(allocation, cards*MAX) but never below cards*MIN.
+    floors: list[float] = []
+    for allocation, cards in zip(active.allocations, active.card_counts):
+        min_total = cards * MIN_DIRECTOR_SEGMENT_SECONDS
+        max_total = cards * MAX_DIRECTOR_SEGMENT_SECONDS
+        floors.append(min(max(float(allocation), min_total), max_total))
+    # If floors exceed budget (extreme compression), scale floors down but keep
+    # trailing beat at least one MIN card.
+    floor_sum = sum(floors)
+    if floor_sum > budget + 1e-6:
+        scale = budget / floor_sum
+        floors = [max(active.card_counts[idx] * MIN_DIRECTOR_SEGMENT_SECONDS, floors[idx] * scale) for idx in range(len(floors))]
+        # Fix residue onto non-trailing beats by shrinking them further if needed.
+        residue = sum(floors) - budget
+        if residue > 1e-6:
+            order = sorted(range(len(floors) - 1), key=lambda idx: _beat_compress_priority(active)[idx])
+            for idx in order:
+                reducible = floors[idx] - active.card_counts[idx] * MIN_DIRECTOR_SEGMENT_SECONDS
+                if reducible <= 0:
+                    continue
+                take = min(reducible, residue)
+                floors[idx] -= take
+                residue -= take
+                if residue <= 1e-6:
+                    break
+    # Current per-beat totals.
+    beat_totals = [0.0] * len(active.beats)
+    members: list[list[int]] = [[] for _ in active.beats]
+    for seg_idx, beat_idx in enumerate(active.segment_to_beat):
+        b = int(beat_idx) - 1
+        beat_totals[b] += values[seg_idx]
+        members[b].append(seg_idx)
+    # Restore beats below floor by taking from compressible beats (early/climax).
+    for beat_idx, floor in enumerate(floors):
+        deficit = floor - beat_totals[beat_idx]
+        if deficit <= 0.02:
+            continue
+        donors = sorted(
+            (idx for idx in range(len(floors)) if idx != beat_idx),
+            key=lambda idx: _beat_compress_priority(active)[idx],
+        )
+        for donor in donors:
+            surplus = beat_totals[donor] - floors[donor]
+            if surplus <= 0.02:
+                continue
+            take = min(surplus, deficit)
+            # Move duration proportionally across member cards.
+            if not members[donor] or not members[beat_idx]:
+                continue
+            donor_share = take / len(members[donor])
+            recv_share = take / len(members[beat_idx])
+            for seg_idx in members[donor]:
+                values[seg_idx] = max(MIN_DIRECTOR_SEGMENT_SECONDS, values[seg_idx] - donor_share)
+            for seg_idx in members[beat_idx]:
+                values[seg_idx] = min(MAX_DIRECTOR_SEGMENT_SECONDS, values[seg_idx] + recv_share)
+            beat_totals[donor] -= take
+            beat_totals[beat_idx] += take
+            deficit -= take
+            if deficit <= 0.02:
+                break
+    # Clamp + final rebalance to exact budget while preferring compressible beats.
+    values = [
+        min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, value))
+        for value in values
+    ]
+    repaired = [
+        replace(segment, duration_seconds=round(value, 3))
+        for segment, value in zip(ordered, values)
+    ]
+    return _rebalance_director_segment_durations(repaired, budget)
+
+
+def _coverage_knife_debug_summary(
+    plan: _CoverageKnifePlan | None,
+    landmark_misses: Iterable[str] | None = None,
+) -> str:
+    if plan is None:
+        return "coverage_knife=off"
+    parts = [
+        f"coverage_knife=on",
+        f"beats={len(plan.beats)}",
+        f"est_sum={plan.estimated_sum:.3f}",
+        f"budget={plan.budget_seconds:.3f}",
+        f"compressed={str(plan.compressed).lower()}",
+        f"cards={','.join(str(item) for item in plan.card_counts)}",
+        f"alloc={','.join(f'{item:.1f}' for item in plan.allocations)}",
+    ]
+    miss_token = _format_coverage_landmark_miss(landmark_misses or ())
+    if miss_token:
+        parts.append(miss_token)
+    return " ".join(parts)
+
+
+
 def _segments_from_structure_cards(
     cards: list[dict[str, Any]],
     mode: str,
@@ -1950,7 +2543,8 @@ def _segments_from_structure_cards(
     audio_slots: Iterable[int],
     *,
     anchor_all_pictures: bool = False,
-) -> tuple[list[_DirectorLongSegment], bool]:
+    coverage_plan: _CoverageKnifePlan | None = None,
+) -> tuple[list[_DirectorLongSegment], bool, list[str]]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
     target_schedule = tuple(schedule)
@@ -1958,6 +2552,9 @@ def _segments_from_structure_cards(
     _require_compatible_director_segment_count(len(cards), expected)
     indexes = [int(card["index"]) for card in cards]
     _require_coherent_segment_indexes(indexes, len(cards))
+    landmark_misses: list[str] = []
+    if coverage_plan is not None:
+        landmark_misses = _validate_structure_coverage(cards, coverage_plan)
     ordered = sorted(cards, key=lambda card: int(card["index"]))
     segments: list[_DirectorLongSegment] = []
     for card in ordered:
@@ -1995,13 +2592,30 @@ def _segments_from_structure_cards(
             )
         )
     total_seconds = sum(target_schedule)
+    # Seed durations from compressed beat budgets before speech retarget so
+    # early/climax overspend cannot starve trailing beats for card count alone.
+    if coverage_plan is not None:
+        active = _coverage_knife_plan_for_card_count(coverage_plan, len(segments))
+        seeded: list[_DirectorLongSegment] = []
+        for segment, beat_idx in zip(
+            sorted(segments, key=lambda item: item.index), active.segment_to_beat
+        ):
+            beat_pos = int(beat_idx) - 1
+            cards_in_beat = active.card_counts[beat_pos]
+            share = active.allocations[beat_pos] / max(1, cards_in_beat)
+            share = min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, share))
+            seeded.append(replace(segment, duration_seconds=round(share, 3)))
+        segments = seeded
     segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments)
     actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
     durations_rebalanced = False
-    if dialogue_retargeted or abs(actual_total - total_seconds) > 0.02:
+    if dialogue_retargeted or abs(actual_total - total_seconds) > 0.02 or coverage_plan is not None:
         segments = _rebalance_director_segment_durations(segments, total_seconds)
         durations_rebalanced = True
-    return segments, durations_rebalanced
+    if coverage_plan is not None:
+        segments = _enforce_coverage_duration_allocations(segments, coverage_plan)
+        durations_rebalanced = True
+    return segments, durations_rebalanced, landmark_misses
 
 
 def _long_director_structure_system(
@@ -2009,6 +2623,7 @@ def _long_director_structure_system(
     schedule: Iterable[float],
     *,
     anchor_all_pictures: bool = False,
+    coverage_plan: _CoverageKnifePlan | None = None,
 ) -> str:
     """Ask for beat cards only.  H3 prompts are written later, one group at a time."""
 
@@ -2036,7 +2651,13 @@ def _long_director_structure_system(
             "This is FL2V. Leave PICTURES, VIDEOS, VIDEO_AUDIOS, and AUDIOS empty. Segment 1 starts from the "
             "optional first frame; only the final segment resolves into the optional last frame."
         )
-    return f"""
+    coverage_addon = (
+        "\n" + _format_coverage_knife_instructions(coverage_plan)
+        if coverage_plan is not None
+        else ""
+    )
+    return (
+        f"""
 This is MiniMax H3 Director long-plan STRUCTURE mode. This instruction overrides every normal final-output format in
 the route profile. Return only the marked beat-card format below: no markdown fence, no explanation, no <think> block,
 no JSON, and no H3 prompt fields.
@@ -2082,6 +2703,8 @@ wording such as "hard cut", "cut to", "镜头切到", "硬切", "转场", or "�
 same character appears again.
 Keep speaker IDs stable, such as (S1) and (S2), inside BEAT and DIALOGUE.
 """.strip()
+        + coverage_addon
+    )
 
 
 def _long_director_segment_system(mode: str, quality: _DirectorLongQualityProfile) -> str:
@@ -2159,6 +2782,7 @@ def _build_long_director_structure_request(
     video_audio_slots: Iterable[int],
     *,
     anchor_all_pictures: bool = False,
+    coverage_plan: _CoverageKnifePlan | None = None,
 ) -> list[dict[str, Any]]:
     """Split the story into beat cards without sending still-image bytes.
 
@@ -2178,6 +2802,8 @@ def _build_long_director_structure_request(
         "Return beat cards only. A later pass writes each Director prompt independently, so every card needs its "
         "own story slice, verbatim dialogue, asset slots, continuity flag, and ending handoff."
     )
+    if coverage_plan is not None:
+        prompt += "\n\n" + _format_coverage_knife_instructions(coverage_plan)
     inventory = _director_long_inventory_lines(images, videos, audio_slots, video_audio_slots)
     if inventory:
         prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
@@ -2211,7 +2837,12 @@ def _build_long_director_structure_request(
             "role": "system",
             "content": _route_system()
             + "\n\n"
-            + _long_director_structure_system(mode, schedule, anchor_all_pictures=anchor_all_pictures),
+            + _long_director_structure_system(
+                mode,
+                schedule,
+                anchor_all_pictures=anchor_all_pictures,
+                coverage_plan=coverage_plan,
+            ),
         },
         {"role": "user", "content": content},
     ]
@@ -2397,7 +3028,8 @@ def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
         "per_segment_refine:",
         (
             f"- structure {structure_state} | attempts={structure_attempts} | groups={total} | "
-            f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()}"
+            f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()} | "
+            f"{record.get('coverage_knife') or 'coverage_knife=off'}"
         ),
     ]
     for step in steps:
@@ -2448,6 +3080,12 @@ def _plan_director_with_independent_segment_refine(
     completion_seed = int(seed)
     structure_attempts = 0
     structure_skipped = len(target_schedule) == 1
+    coverage_plan = _build_coverage_knife_plan(
+        brief,
+        budget_seconds=sum(target_schedule),
+        group_count=len(target_schedule),
+    )
+    coverage_landmark_misses: list[str] = []
     if structure_skipped:
         first_line = next((line.strip() for line in brief.splitlines() if line.strip()), "")
         title = _clip_text(first_line, 80) or "Untitled MiniMax H3 Director project"
@@ -2475,6 +3113,7 @@ def _plan_director_with_independent_segment_refine(
             audio_slots,
             video_audio_slots,
             anchor_all_pictures=anchor_all_pictures,
+            coverage_plan=coverage_plan,
         )
         last_error: Exception | None = None
         title = "Untitled MiniMax H3 Director project"
@@ -2485,7 +3124,7 @@ def _plan_director_with_independent_segment_refine(
             text = complete(messages, structure_max_tokens, completion_seed)
             try:
                 title, cards = _parse_director_structure_output(text or "")
-                segments, durations_rebalanced = _segments_from_structure_cards(
+                segments, durations_rebalanced, coverage_landmark_misses = _segments_from_structure_cards(
                     cards,
                     mode,
                     target_schedule,
@@ -2494,6 +3133,7 @@ def _plan_director_with_independent_segment_refine(
                     video_audio_slots,
                     audio_slots,
                     anchor_all_pictures=anchor_all_pictures,
+                    coverage_plan=coverage_plan,
                 )
                 last_error = None
                 break
@@ -2508,7 +3148,9 @@ def _plan_director_with_independent_segment_refine(
                             f"The structure plan was rejected: {error}\n"
                             "Return only the marked SEGMENT beat cards. Do not write an H3 prompt. "
                             "Each block needs DURATION_SECONDS, CONTINUITY_FROM_PREV, PICTURES, VIDEOS, "
-                            "VIDEO_AUDIOS, AUDIOS, BEAT, DIALOGUE, and HANDOFF."
+                            "VIDEO_AUDIOS, AUDIOS, BEAT, DIALOGUE, and HANDOFF. "
+                            "Honor the COVERAGE KNIFE segment ranges: every story beat needs ≥1 card, "
+                            "landmark DIALOGUE lines must appear, and trailing beats must not be omitted."
                         ),
                     },
                 ]
@@ -2590,6 +3232,9 @@ def _plan_director_with_independent_segment_refine(
         "structure_max_tokens": 0 if structure_skipped else structure_max_tokens,
         "segment_refine_max_tokens": refine_max_tokens,
         "durations_rebalanced": durations_rebalanced,
+        "coverage_knife": _coverage_knife_debug_summary(
+            coverage_plan, landmark_misses=coverage_landmark_misses
+        ),
         "passes": passes,
     }
     return title, refined, durations_rebalanced, _format_per_segment_refine_debug(record), record
