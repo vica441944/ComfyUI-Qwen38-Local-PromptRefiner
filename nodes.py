@@ -2027,6 +2027,8 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     selected: list[str] = []
     norms: list[str] = []
     for token in ranked:
+        if _is_placeholder_landmark(token):
+            continue
         norm = _normalize_dialogue_needle(token)
         if len(norm) < 2:
             continue
@@ -2064,7 +2066,11 @@ def _story_beat_from_fields(
     key_dialogue: Iterable[str] | None = None,
 ) -> _StoryBeatSpec:
     est = max(float(estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS)
-    keys = tuple(item.strip() for item in (key_dialogue or ()) if str(item).strip())
+    keys = tuple(
+        item.strip()
+        for item in (key_dialogue or ())
+        if str(item).strip() and not _is_placeholder_landmark(str(item))
+    )
     if not keys:
         keys = _extract_dialogue_landmarks(body)
     return _StoryBeatSpec(
@@ -2301,10 +2307,48 @@ def _cards_dialogue_blob(cards: Iterable[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _cards_coverage_blob(cards: Iterable[dict[str, Any]]) -> str:
+    """Normalize search space for landmarks: BEAT + DIALOGUE + HANDOFF."""
+
+    parts: list[str] = []
+    for card in cards:
+        beat = str(card.get("beat") or "").strip()
+        if beat:
+            parts.append(beat)
+        dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
+        if dialogue:
+            parts.append(dialogue)
+        handoff = str(card.get("handoff") or "").strip()
+        if handoff:
+            parts.append(handoff)
+    return "\n".join(parts)
+
+
+def _is_placeholder_landmark(landmark: str) -> bool:
+    """Skip NV-style placeholders such as （露骨台词） / (explicit ...) / empty."""
+
+    raw = (landmark or "").strip()
+    if not raw:
+        return True
+    if "（露骨" in raw or "(explicit" in raw.casefold():
+        return True
+    return len(_normalize_dialogue_needle(raw)) < 2
+
+
+def _format_coverage_landmark_miss(misses: Iterable[str], *, limit: int = 180) -> str:
+    tokens = [str(item).strip() for item in misses if str(item).strip()]
+    if not tokens:
+        return ""
+    joined = ";".join(tokens)
+    if len(joined) > limit:
+        joined = joined[: max(0, limit - 1)].rstrip() + "…"
+    return f"coverage_landmark_miss={joined}"
+
+
 def _validate_structure_coverage(
     cards: list[dict[str, Any]], plan: _CoverageKnifePlan
-) -> None:
-    """Fail the structure pass when a story beat or landmark line was omitted."""
+) -> list[str]:
+    """Hard-fail card floor / empty BEAT; return soft landmark misses (no raise)."""
 
     active = _coverage_knife_plan_for_card_count(plan, len(cards))
     ordered = sorted(cards, key=lambda card: int(card["index"]))
@@ -2319,8 +2363,8 @@ def _validate_structure_coverage(
             raise PromptRefinerError(
                 f"Coverage knife dropped story beat {beat.index}; every beat needs ≥1 structure card."
             )
-    # Content + key-dialogue coverage.
-    missing: list[str] = []
+    hard_missing: list[str] = []
+    soft_misses: list[str] = []
     for beat_index, beat in enumerate(active.beats, start=1):
         beat_cards = [
             card
@@ -2328,15 +2372,18 @@ def _validate_structure_coverage(
             if int(mapped) == beat_index
         ]
         if not beat_cards:
-            missing.append(f"beat {beat.index} has zero cards")
+            hard_missing.append(f"beat {beat.index} has zero cards")
             continue
         if not any(str(card.get("beat") or "").strip() for card in beat_cards):
-            missing.append(f"beat {beat.index} cards have empty BEAT")
-        blob = _normalize_dialogue_needle(_cards_dialogue_blob(beat_cards))
-        # Also accept landmarks placed on any card (mis-slice) so retry text can
-        # say which line is missing entirely.
-        global_blob = _normalize_dialogue_needle(_cards_dialogue_blob(ordered))
+            hard_missing.append(f"beat {beat.index} cards have empty BEAT")
+            continue
+        blob = _normalize_dialogue_needle(_cards_coverage_blob(beat_cards))
+        # Also accept landmarks placed on any card (mis-slice) so the miss list
+        # only records lines that are absent from the whole plan.
+        global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
+            if _is_placeholder_landmark(landmark):
+                continue
             needle = _normalize_dialogue_needle(landmark)
             if len(needle) < 2:
                 continue
@@ -2346,12 +2393,13 @@ def _validate_structure_coverage(
             core = needle[: max(4, min(12, len(needle)))]
             if core and (core in blob or core in global_blob):
                 continue
-            missing.append(f"beat {beat.index} landmark missing from DIALOGUE: {landmark}")
-    if missing:
+            soft_misses.append(f"beat{beat.index}:{landmark}")
+    if hard_missing:
         raise PromptRefinerError(
-            "Coverage knife rejected the structure plan (key-dialogue / beat coverage). "
-            + " | ".join(missing[:8])
+            "Coverage knife rejected the structure plan (beat / card coverage). "
+            + " | ".join(hard_missing[:8])
         )
+    return soft_misses
 
 
 def _beat_compress_priority(plan: _CoverageKnifePlan) -> tuple[int, ...]:
@@ -2463,7 +2511,10 @@ def _enforce_coverage_duration_allocations(
     return _rebalance_director_segment_durations(repaired, budget)
 
 
-def _coverage_knife_debug_summary(plan: _CoverageKnifePlan | None) -> str:
+def _coverage_knife_debug_summary(
+    plan: _CoverageKnifePlan | None,
+    landmark_misses: Iterable[str] | None = None,
+) -> str:
     if plan is None:
         return "coverage_knife=off"
     parts = [
@@ -2475,6 +2526,9 @@ def _coverage_knife_debug_summary(plan: _CoverageKnifePlan | None) -> str:
         f"cards={','.join(str(item) for item in plan.card_counts)}",
         f"alloc={','.join(f'{item:.1f}' for item in plan.allocations)}",
     ]
+    miss_token = _format_coverage_landmark_miss(landmark_misses or ())
+    if miss_token:
+        parts.append(miss_token)
     return " ".join(parts)
 
 
@@ -2490,7 +2544,7 @@ def _segments_from_structure_cards(
     *,
     anchor_all_pictures: bool = False,
     coverage_plan: _CoverageKnifePlan | None = None,
-) -> tuple[list[_DirectorLongSegment], bool]:
+) -> tuple[list[_DirectorLongSegment], bool, list[str]]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
     target_schedule = tuple(schedule)
@@ -2498,8 +2552,9 @@ def _segments_from_structure_cards(
     _require_compatible_director_segment_count(len(cards), expected)
     indexes = [int(card["index"]) for card in cards]
     _require_coherent_segment_indexes(indexes, len(cards))
+    landmark_misses: list[str] = []
     if coverage_plan is not None:
-        _validate_structure_coverage(cards, coverage_plan)
+        landmark_misses = _validate_structure_coverage(cards, coverage_plan)
     ordered = sorted(cards, key=lambda card: int(card["index"]))
     segments: list[_DirectorLongSegment] = []
     for card in ordered:
@@ -2560,7 +2615,7 @@ def _segments_from_structure_cards(
     if coverage_plan is not None:
         segments = _enforce_coverage_duration_allocations(segments, coverage_plan)
         durations_rebalanced = True
-    return segments, durations_rebalanced
+    return segments, durations_rebalanced, landmark_misses
 
 
 def _long_director_structure_system(
@@ -3030,6 +3085,7 @@ def _plan_director_with_independent_segment_refine(
         budget_seconds=sum(target_schedule),
         group_count=len(target_schedule),
     )
+    coverage_landmark_misses: list[str] = []
     if structure_skipped:
         first_line = next((line.strip() for line in brief.splitlines() if line.strip()), "")
         title = _clip_text(first_line, 80) or "Untitled MiniMax H3 Director project"
@@ -3068,7 +3124,7 @@ def _plan_director_with_independent_segment_refine(
             text = complete(messages, structure_max_tokens, completion_seed)
             try:
                 title, cards = _parse_director_structure_output(text or "")
-                segments, durations_rebalanced = _segments_from_structure_cards(
+                segments, durations_rebalanced, coverage_landmark_misses = _segments_from_structure_cards(
                     cards,
                     mode,
                     target_schedule,
@@ -3176,7 +3232,9 @@ def _plan_director_with_independent_segment_refine(
         "structure_max_tokens": 0 if structure_skipped else structure_max_tokens,
         "segment_refine_max_tokens": refine_max_tokens,
         "durations_rebalanced": durations_rebalanced,
-        "coverage_knife": _coverage_knife_debug_summary(coverage_plan),
+        "coverage_knife": _coverage_knife_debug_summary(
+            coverage_plan, landmark_misses=coverage_landmark_misses
+        ),
         "passes": passes,
     }
     return title, refined, durations_rebalanced, _format_per_segment_refine_debug(record), record

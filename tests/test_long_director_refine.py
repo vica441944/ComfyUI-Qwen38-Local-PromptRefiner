@@ -958,7 +958,7 @@ HANDOFF_{index} holds the ending pose.
 
 def _segments_from_plan(text: str, schedule: tuple[float, ...]):
     _title, cards = nodes._parse_director_structure_output(text)
-    return nodes._segments_from_structure_cards(
+    segments, rebalanced, _misses = nodes._segments_from_structure_cards(
         cards,
         R2V,
         schedule,
@@ -967,6 +967,7 @@ def _segments_from_plan(text: str, schedule: tuple[float, ...]):
         (),
         (),
     )
+    return segments, rebalanced
 
 
 class StructureSegmentCountTests(unittest.TestCase):
@@ -1643,7 +1644,7 @@ Ending state for beat {beat.index} card {seg_index}.
         self.assertIn(7, plan.segment_to_beat)
         self.assertEqual(plan.segment_to_beat[-1], 7)
 
-    def test_structure_rejects_missing_landmark_dialogue(self) -> None:
+    def test_structure_soft_misses_missing_landmark_dialogue(self) -> None:
         plan = nodes._build_coverage_knife_plan(
             self._story_beats_brief(),
             budget_seconds=self.JOB18_BUDGET,
@@ -1652,10 +1653,86 @@ Ending state for beat {beat.index} card {seg_index}.
         assert plan is not None
         bad = self._cards_for_plan(plan, omit_beat6_dialogue=True)
         _title, cards = nodes._parse_director_structure_output(bad)
-        with self.assertRaises(nodes.PromptRefinerError) as raised:
-            nodes._validate_structure_coverage(cards, plan)
-        self.assertIn("landmark missing", str(raised.exception).lower())
-        self.assertIn("beat 6", str(raised.exception).lower())
+        misses = nodes._validate_structure_coverage(cards, plan)
+        self.assertTrue(any(item.startswith("beat6:") for item in misses))
+        debug = nodes._coverage_knife_debug_summary(plan, landmark_misses=misses)
+        self.assertIn("coverage_landmark_miss=", debug)
+        self.assertIn("beat6:", debug)
+
+    def test_landmark_in_beat_field_only_passes(self) -> None:
+        plan = nodes._build_coverage_knife_plan(
+            self._story_beats_brief(),
+            budget_seconds=self.JOB18_BUDGET,
+            group_count=self.JOB18_GROUPS,
+        )
+        assert plan is not None
+        blocks = ["TITLE: Landmark in BEAT only"]
+        for seg_index, beat_idx in enumerate(plan.segment_to_beat, start=1):
+            beat = plan.beats[beat_idx - 1]
+            first_of_beat = seg_index == 1 or plan.segment_to_beat[seg_index - 2] != beat_idx
+            landmark_text = " / ".join(beat.key_dialogue) if first_of_beat and beat.key_dialogue else ""
+            continuity = "false" if seg_index == 1 else "true"
+            beat_body = f"Story beat {beat.index} card {seg_index}: {beat.label}."
+            if landmark_text:
+                beat_body = f"{beat_body} Includes {landmark_text}"
+            blocks.append(
+                f"""=== SEGMENT {seg_index} ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat_body}
+DIALOGUE:
+NONE
+HANDOFF:
+Ending state for beat {beat.index} card {seg_index}.
+=== END SEGMENT ==="""
+            )
+        _title, cards = nodes._parse_director_structure_output("\n".join(blocks))
+        misses = nodes._validate_structure_coverage(cards, plan)
+        self.assertEqual(misses, [])
+
+    def test_placeholder_landmark_is_ignored(self) -> None:
+        brief = """
+[STORY_BEATS]
+1|20|1-4|a|REAL_LANDMARK_A
+2|20|5-8|b|（露骨台词）
+[/STORY_BEATS]
+""".strip()
+        plan = nodes._build_coverage_knife_plan(brief, budget_seconds=40.0, group_count=4)
+        assert plan is not None
+        self.assertIn("REAL_LANDMARK_A", plan.beats[0].key_dialogue)
+        self.assertEqual(plan.beats[1].key_dialogue, ())
+        self.assertTrue(nodes._is_placeholder_landmark("（露骨台词）"))
+        self.assertTrue(nodes._is_placeholder_landmark("(explicit dialogue)"))
+        blocks = ["TITLE: Placeholder landmark"]
+        for seg_index, beat_idx in enumerate(plan.segment_to_beat, start=1):
+            beat = plan.beats[beat_idx - 1]
+            first_of_beat = seg_index == 1 or plan.segment_to_beat[seg_index - 2] != beat_idx
+            dialogue = "REAL_LANDMARK_A" if beat.index == 1 and first_of_beat else "NONE"
+            continuity = "false" if seg_index == 1 else "true"
+            blocks.append(
+                f"""=== SEGMENT {seg_index} ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Story beat {beat.index} card {seg_index}.
+DIALOGUE:
+{dialogue}
+HANDOFF:
+Handoff {seg_index}.
+=== END SEGMENT ==="""
+            )
+        _title, cards = nodes._parse_director_structure_output("\n".join(blocks))
+        misses = nodes._validate_structure_coverage(cards, plan)
+        self.assertEqual(misses, [])
 
     def test_structure_allocates_cards_and_keeps_trailing_duration_floor(self) -> None:
         plan = nodes._build_coverage_knife_plan(
@@ -1668,7 +1745,7 @@ Ending state for beat {beat.index} card {seg_index}.
         _title, cards = nodes._parse_director_structure_output(good)
         schedule = nodes._director_duration_schedule(self.JOB18_BUDGET, 10.0)
         self.assertEqual(len(schedule), self.JOB18_GROUPS)
-        segments, rebalanced = nodes._segments_from_structure_cards(
+        segments, rebalanced, misses = nodes._segments_from_structure_cards(
             cards,
             R2V,
             schedule,
@@ -1678,6 +1755,7 @@ Ending state for beat {beat.index} card {seg_index}.
             (),
             coverage_plan=plan,
         )
+        self.assertEqual(misses, [])
         self.assertTrue(rebalanced)
         self.assertEqual(len(segments), self.JOB18_GROUPS)
         self.assertAlmostEqual(sum(seg.duration_seconds for seg in segments), self.JOB18_BUDGET, places=2)
