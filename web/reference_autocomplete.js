@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 
 const NODE_NAMES = new Set(["Qwen38LocalPromptRefiner", "Qwen38LongVideoDirectorPlanner"]);
+const GROUP_RE_REFINER_NODE = "Qwen38DirectorGroupReRefiner";
 const WIDGET_NAME = "brief";
 const EXTERNAL_BRIEF_INPUT = "external_brief";
 const ASSET_TYPES = [
@@ -387,7 +388,9 @@ const DIRECTOR_NODE_TYPES = new Set(["MiniMaxH3Director", "ComfyMiniMaxH3Directo
 const DIRECTOR_R2V_GROUP_TYPE = "MiniMaxH3DirectorGroupReferenceToVideo";
 const DIRECTOR_I2V_GROUP_TYPE = "MiniMaxH3DirectorGroupImageToVideo";
 const DIRECTOR_COMBINE_TYPE = "MiniMaxH3DirectorGroupsCombine";
+const DIRECTOR_GROUP_TYPES = new Set([DIRECTOR_R2V_GROUP_TYPE, DIRECTOR_I2V_GROUP_TYPE]);
 const MATERIALIZED_BY_PROPERTY = "qwen38DirectorMaterializedBy";
+let qwen38LastDirectorGroup = null;
 
 function qwen38Graph() {
   return app.graph ?? app.canvas?.graph ?? null;
@@ -457,6 +460,121 @@ function qwen38SetNodeWidget(node, name, value) {
   const widget = (node?.widgets ?? []).find((candidate) => candidate?.name === name);
   if (!widget) throw new Error(`原生 Director Group 缺少 ${name} 控件。请更新导演台插件后重试。`);
   setWidgetValue(widget, value);
+}
+
+function qwen38NodeWidgetValue(node, name, fallback = "") {
+  return (node?.widgets ?? []).find((candidate) => candidate?.name === name)?.value ?? fallback;
+}
+
+function qwen38RememberDirectorGroup(node) {
+  if (DIRECTOR_GROUP_TYPES.has(qwen38NodeClass(node))) qwen38LastDirectorGroup = node;
+}
+
+function qwen38ResolveRecentDirectorGroup(graph) {
+  const selected = Object.values(app.canvas?.selected_nodes ?? {}).find(
+    (node) => DIRECTOR_GROUP_TYPES.has(qwen38NodeClass(node)),
+  );
+  if (selected) qwen38LastDirectorGroup = selected;
+  if (qwen38LastDirectorGroup && graph?.getNodeById?.(qwen38LastDirectorGroup.id)) {
+    return qwen38LastDirectorGroup;
+  }
+  return null;
+}
+
+function qwen38AdjacentGroupPrompts(graph, group) {
+  const owner = String(group?.properties?.[MATERIALIZED_BY_PROPERTY] ?? "");
+  const index = Number(group?.properties?.qwen38DirectorSegmentIndex);
+  if (!owner || !Number.isFinite(index)) return { previous: "", next: "" };
+  const siblings = (graph?._nodes ?? graph?.nodes ?? [])
+    .filter((node) => DIRECTOR_GROUP_TYPES.has(qwen38NodeClass(node)))
+    .filter((node) => String(node?.properties?.[MATERIALIZED_BY_PROPERTY] ?? "") === owner)
+    .sort((a, b) => Number(a?.properties?.qwen38DirectorSegmentIndex) - Number(b?.properties?.qwen38DirectorSegmentIndex));
+  const position = siblings.findIndex((node) => String(node.id) === String(group.id));
+  const prompt = (node) => String(qwen38NodeWidgetValue(node, "prompt", ""));
+  return {
+    previous: position > 0 ? prompt(siblings[position - 1]) : "",
+    next: position >= 0 && position + 1 < siblings.length ? prompt(siblings[position + 1]) : "",
+  };
+}
+
+function qwen38ReadDirectorGroupIntoRefiner(refiner, explicitGroup = null) {
+  const graph = qwen38Graph();
+  const group = explicitGroup ?? qwen38ResolveRecentDirectorGroup(graph);
+  if (!group) {
+    throw new Error("请先在画布上点选一个原生 MiniMax H3 Director Group，再点击读取按钮。");
+  }
+  const prompt = String(qwen38NodeWidgetValue(group, "prompt", "")).trim();
+  if (!prompt) throw new Error("所选 Director Group 的 prompt 为空。");
+  const adjacent = qwen38AdjacentGroupPrompts(graph, group);
+  qwen38SetNodeWidget(refiner, "current_prompt", prompt);
+  qwen38SetNodeWidget(refiner, "target_group_id", String(group.id));
+  qwen38SetNodeWidget(refiner, "duration_seconds", Number(qwen38NodeWidgetValue(group, "duration_sec", 10)) || 10);
+  qwen38SetNodeWidget(refiner, "previous_group_context", adjacent.previous);
+  qwen38SetNodeWidget(refiner, "next_group_context", adjacent.next);
+  refiner.properties ??= {};
+  refiner.properties.qwen38GroupRevisionSource = {
+    id: String(group.id),
+    title: String(group.title ?? "Director Group"),
+    prompt,
+  };
+  refiner._qwen38RevisedPrompt = "";
+  // Reading a target arms exactly one local-Qwen execution. onExecuted returns
+  // the node to Never so later Director queues cannot accidentally run it.
+  refiner.mode = globalThis.LiteGraph?.ALWAYS ?? 0;
+  refiner.setDirtyCanvas?.(true, true);
+  graph?.setDirtyCanvas?.(true, true);
+}
+
+function qwen38ApplyRevisionToDirectorGroup(refiner) {
+  const graph = qwen38Graph();
+  const targetId = String(qwen38NodeWidgetValue(refiner, "target_group_id", ""));
+  const group = (graph?._nodes ?? graph?.nodes ?? []).find((node) => String(node.id) === targetId);
+  if (!group || !DIRECTOR_GROUP_TYPES.has(qwen38NodeClass(group))) {
+    throw new Error("目标 Director Group 已不存在。请重新选择 Group 并读取。");
+  }
+  const revised = String(refiner?._qwen38RevisedPrompt ?? "").trim();
+  if (!revised) throw new Error("尚无返修结果。请先运行此返修节点，确认输出后再写回。");
+  const current = String(qwen38NodeWidgetValue(group, "prompt", ""));
+  const captured = String(refiner?.properties?.qwen38GroupRevisionSource?.prompt ?? "");
+  if (captured && current !== captured) {
+    const proceed = globalThis.confirm?.(
+      "目标 Group 在读取后又被修改过。继续会用本次 Qwen 返修结果覆盖当前文本；素材连线和时长不会改变。\n\n仍要写回吗？",
+    );
+    if (proceed === false) return;
+  }
+  const approved = globalThis.confirm?.(
+    `将返修提示词写回 ${group.title ?? `Director Group ${group.id}`}？\n\n只替换 prompt，时长与所有素材连线保持不变。`,
+  );
+  if (approved === false) return;
+  group.properties ??= {};
+  group.properties.qwen38PromptBackup = current;
+  qwen38SetNodeWidget(group, "prompt", revised);
+  refiner.properties.qwen38GroupRevisionSource.prompt = revised;
+  qwen38LastDirectorGroup = group;
+  group.setDirtyCanvas?.(true, true);
+  graph?.setDirtyCanvas?.(true, true);
+  queueMicrotask(refreshDirectorGroupPreviews);
+}
+
+function qwen38AddGroupReRefinerControls(refiner) {
+  if (refiner?._qwen38GroupReRefinerControlsAdded) return;
+  refiner._qwen38GroupReRefinerControlsAdded = true;
+  const read = () => {
+    try {
+      qwen38ReadDirectorGroupIntoRefiner(refiner);
+    } catch (error) {
+      globalThis.alert?.(`无法读取 Director Group：${error?.message ?? error}`);
+    }
+  };
+  const apply = () => {
+    try {
+      qwen38ApplyRevisionToDirectorGroup(refiner);
+    } catch (error) {
+      globalThis.alert?.(`无法写回 Director Group：${error?.message ?? error}`);
+    }
+  };
+  refiner.addWidget?.("button", "读取最近选中的 Director Group", null, read, { serialize: false });
+  refiner.addWidget?.("button", "将返修提示词写回 Group", null, apply, { serialize: false });
 }
 
 function qwen38FindOrAddInput(node, preferredName, type) {
@@ -709,6 +827,58 @@ function qwen38AddMaterializeControls(planner) {
 app.registerExtension({
   name: "Qwen38LocalPromptRefiner.ReferenceAutocomplete",
   beforeRegisterNodeDef(nodeType, nodeData) {
+    if (DIRECTOR_GROUP_TYPES.has(nodeData.name)) {
+      const originalOnSelected = nodeType.prototype.onSelected;
+      nodeType.prototype.onSelected = function (...args) {
+        qwen38RememberDirectorGroup(this);
+        return originalOnSelected?.apply(this, args);
+      };
+      const originalMouseDown = nodeType.prototype.onMouseDown;
+      nodeType.prototype.onMouseDown = function (...args) {
+        qwen38RememberDirectorGroup(this);
+        return originalMouseDown?.apply(this, args);
+      };
+      return;
+    }
+    if (nodeData.name === GROUP_RE_REFINER_NODE) {
+      const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function (...args) {
+        const result = originalOnNodeCreated?.apply(this, args);
+        this.properties ??= {};
+        if (!this.properties.qwen38GroupRevisionInitialized) {
+          this.mode = globalThis.LiteGraph?.NEVER ?? 2;
+          this.properties.qwen38GroupRevisionInitialized = true;
+        }
+        qwen38AddGroupReRefinerControls(this);
+        const originalOnExecuted = this.onExecuted;
+        this.onExecuted = function (message) {
+          const executedResult = originalOnExecuted?.apply(this, arguments);
+          const payload = Array.isArray(message?.qwen38_group_revision)
+            ? message.qwen38_group_revision[0]
+            : message?.qwen38_group_revision;
+          if (payload?.prompt) {
+            this._qwen38RevisedPrompt = String(payload.prompt);
+            this.properties ??= {};
+            this.properties.qwen38LastRevision = {
+              prompt: this._qwen38RevisedPrompt,
+              target_group_id: String(payload.target_group_id ?? ""),
+            };
+            this.mode = globalThis.LiteGraph?.NEVER ?? 2;
+            this.setDirtyCanvas?.(true, true);
+          }
+          return executedResult;
+        };
+        return result;
+      };
+      const originalOnConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (...args) {
+        const result = originalOnConfigure?.apply(this, args);
+        this._qwen38RevisedPrompt = String(this.properties?.qwen38LastRevision?.prompt ?? "");
+        qwen38AddGroupReRefinerControls(this);
+        return result;
+      };
+      return;
+    }
     if (!NODE_NAMES.has(nodeData.name)) return;
     const originalOnConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (workflowNode) {

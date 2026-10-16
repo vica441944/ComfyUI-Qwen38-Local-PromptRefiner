@@ -14,6 +14,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -191,7 +192,7 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertTrue(all(call["seed"] == 7 for call in calls))
         self.assertEqual(calls[0]["max_tokens"], max(512 + 3 * 480, 4096))
         self.assertTrue(all(call["max_tokens"] == 4096 for call in calls[1:]))
-        self.assertEqual([segment.duration_seconds for segment in segments], [8.0, 12.0, 10.0])
+        self.assertEqual([segment.duration_seconds for segment in segments], [10.0, 10.0, 10.0])
         self.assertEqual(
             [segment.continuity_from_prev for segment in segments],
             [False, True, False],
@@ -298,12 +299,12 @@ class LongDirectorRefineTests(unittest.TestCase):
             requested_max_tokens=4096,
             seed=1,
         )
-        self.assertTrue(rebalanced)
+        self.assertFalse(rebalanced)  # The host schedule was already legal before inference.
         self.assertAlmostEqual(sum(segment.duration_seconds for segment in segments), 30.0, places=3)
         self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in segments))
         self.assertIn("BEAT_TWO", segments[1].beat)
         self.assertTrue(all(item.startswith("10.000") for item in seen_durations))
-        self.assertIn("durations_rebalanced=true", debug)
+        self.assertIn("durations_rebalanced=false", debug)
 
     def test_missing_fields_retry_once_then_accept(self) -> None:
         segment_two_calls = 0
@@ -1458,10 +1459,7 @@ HANDOFF_{index} holds the ending pose.
 class DialogueDurationTests(unittest.TestCase):
     def test_templates_use_a_range_placeholder_instead_of_the_equal_average(self) -> None:
         schedule = (10.0,) * 6
-        for system in (
-            nodes._long_director_structure_system(R2V, schedule),
-            nodes._long_director_system(R2V, schedule, BALANCED),
-        ):
+        for system in (nodes._long_director_system(R2V, schedule, BALANCED),):
             template = _template_block(system)
             self.assertIn("DURATION_SECONDS: <4-15>", template)
             self.assertNotRegex(template, r"DURATION_SECONDS:\s*\d")
@@ -1474,18 +1472,28 @@ class DialogueDurationTests(unittest.TestCase):
 
         uneven = nodes._long_director_structure_system(R2V, (4.0, 15.0, 8.0))
         uneven_template = _template_block(uneven)
-        self.assertIn("DURATION_SECONDS: <4-15>", uneven_template)
+        self.assertIn("DURATION_SECONDS: 4.000", uneven_template)
         self.assertNotIn("DURATION_SECONDS: 9", uneven_template)
-        self.assertNotIn("4.000", uneven_template)
+        self.assertIn("LOCKED DURATION SCHEDULE", uneven)
+        self.assertIn("[4.0, 15.0, 8.0]", uneven)
         self.assertNotIn("15.000", uneven_template)
 
-    def test_segment_duration_tooltip_is_a_count_estimator(self) -> None:
+    def test_segment_duration_tooltip_describes_a_hard_ceiling(self) -> None:
         tooltip = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]["segment_duration_seconds"][1][
             "tooltip"
         ]
-        self.assertIn("group count", tooltip)
-        self.assertIn("not the forced duration", tooltip)
-        self.assertIn("ceil(total_duration_seconds / this value)", tooltip)
+        self.assertIn("Maximum duration", tooltip)
+        self.assertIn("choose the group count", tooltip)
+        self.assertIn("not a target or forced duration", tooltip)
+
+    def test_duration_overrun_is_a_visible_required_widget(self) -> None:
+        inputs = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()
+        self.assertIn("allow_duration_overrun", inputs["required"])
+        self.assertNotIn("allow_duration_overrun", inputs["optional"])
+        self.assertEqual(
+            inputs["required"]["allow_duration_overrun"][1]["label"],
+            "Prioritize story completeness (allow duration overrun)",
+        )
 
     def test_cjk_dialogue_is_not_counted_as_one_english_word_per_character(self) -> None:
         english = _words(40)
@@ -1794,3 +1802,96 @@ Handoff {seg_index}.
         self.assertIsNone(
             nodes._build_coverage_knife_plan(brief, budget_seconds=60.0, group_count=6)
         )
+
+
+class DirectorGroupReRefinerTests(unittest.TestCase):
+    def test_node_is_registered_and_detects_both_prompt_contracts(self) -> None:
+        self.assertIs(
+            nodes.NODE_CLASS_MAPPINGS["Qwen38DirectorGroupReRefiner"],
+            nodes.Qwen38DirectorGroupReRefiner,
+        )
+        self.assertEqual(nodes._director_group_engine(r2v_prompt("R2V")), nodes.FULL_REFERENCE_ENGINE)
+        self.assertEqual(nodes._director_group_engine(fl2v_prompt("FL2V")), nodes.FIRST_LAST_FRAME_ENGINE)
+
+    def test_revision_preserves_duration_context_and_reference_label(self) -> None:
+        revised = r2v_prompt("Revised wardrobe")
+
+        class FakeLlama:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"choices": [{"message": {"content": revised}}]}
+
+        fake_llama = FakeLlama()
+        fake_runtime = types.SimpleNamespace(llm=fake_llama)
+        node = nodes.Qwen38DirectorGroupReRefiner()
+        with (
+            patch.object(nodes, "_resolve_model_file", return_value="model.gguf"),
+            patch.object(nodes._RuntimeCache, "get", return_value=fake_runtime),
+            patch.object(nodes._RuntimeCache, "unload"),
+        ):
+            result = node.refine_group(
+                current_prompt=r2v_prompt("Original wardrobe"),
+                revision_request="Change only the jacket color.",
+                target_group_id="42",
+                duration_seconds=13.3,
+                previous_group_context=r2v_prompt("Previous action"),
+                next_group_context=r2v_prompt("Next action"),
+                model_name="model.gguf",
+                context_length=16384,
+                gpu_layers=-1,
+                temperature=0.35,
+                top_p=0.9,
+                max_tokens=4096,
+                seed=0,
+                keep_model_loaded=False,
+            )
+
+        self.assertEqual(result["result"][0], revised)
+        self.assertEqual(result["ui"]["qwen38_group_revision"][0]["target_group_id"], "42")
+        request = fake_llama.calls[0]["messages"][1]["content"]
+        self.assertIn("13.300s", request)
+        self.assertIn("Previous action", request)
+        self.assertIn("Next action", request)
+
+    def test_revision_retries_when_reference_label_is_dropped(self) -> None:
+        outputs = [r2v_prompt("Missing picture", picture=False), r2v_prompt("Corrected")]
+
+        class FakeLlama:
+            def create_chat_completion(self, **_kwargs):
+                return {"choices": [{"message": {"content": outputs.pop(0)}}]}
+
+        node = nodes.Qwen38DirectorGroupReRefiner()
+        with (
+            patch.object(nodes, "_resolve_model_file", return_value="model.gguf"),
+            patch.object(nodes._RuntimeCache, "get", return_value=types.SimpleNamespace(llm=FakeLlama())),
+            patch.object(nodes._RuntimeCache, "unload"),
+        ):
+            result = node.refine_group(
+                current_prompt=r2v_prompt("Original"),
+                revision_request="Change the camera angle.",
+                target_group_id="9",
+                duration_seconds=10.0,
+                previous_group_context="",
+                next_group_context="",
+                model_name="model.gguf",
+                context_length=16384,
+                gpu_layers=-1,
+                temperature=0.35,
+                top_p=0.9,
+                max_tokens=4096,
+                seed=0,
+                keep_model_loaded=False,
+            )
+        self.assertIn("<Picture 1>", result["result"][0])
+        self.assertIn("attempts=2", result["result"][1])
+
+    def test_final_field_block_wins_over_reasoning_draft(self) -> None:
+        draft = r2v_prompt("Reasoning draft")
+        final = r2v_prompt("Final answer")
+        raw = f"I should reason through this first.\n{draft}\nNow the final answer:\n{final}"
+        extracted = nodes._extract_director_segment_prompt(raw, nodes.FULL_REFERENCE_ENGINE)
+        self.assertNotIn("Reasoning draft", extracted)
+        self.assertIn("Final answer", extracted)

@@ -150,6 +150,28 @@ created after Qwen finishes cannot execute during that same queue. It lets you i
 cards, source-media wiring, durations, selection, and continuity before sampling. It is also robust to future Director
 updates because this plugin creates Director's published native nodes instead of modifying Director files.
 
+### Re-refine one native Director Group
+
+Add **LLM / Prompt Refiner → Qwen3.8 Director Group Re-Refiner** anywhere in the same workflow when only one rendered
+segment needs a substantial prompt rewrite. It is an independent editing branch; do not insert it between the native
+Group/Combine nodes and Director.
+
+1. Click the native R2V or FL2V Group that needs correction, then click **读取最近选中的 Director Group** on the
+   re-refiner. The node copies that Group's prompt and duration plus the immediately previous and next generated Group
+   prompts as read-only continuity context. Reading also changes the re-refiner from **Never** to **Always**.
+2. Write the requested correction in **revision request**, then queue only the re-refiner node. The local Qwen model
+   rewrites this one prompt while preserving its H3 field contract and protected `<Picture N>`, `<Video N>`, and
+   `<Audio N>` labels. It does not re-plan or regenerate the other groups.
+3. Inspect the **revised prompt** output. When it is correct, click **将返修提示词写回 Group** and confirm. Only the
+   target Group's `prompt` widget is replaced; its duration, image/video/audio connections, position, and Combine
+   connection are untouched. The previous prompt is saved in the Group's `qwen38PromptBackup` property.
+
+The re-refiner is an output node and returns itself to **Never** immediately after a successful run. It therefore runs
+without requiring a text-preview sink, and later Director queues do not accidentally invoke Qwen again.
+
+If the target Group was manually edited after it was read, the frontend warns before overwriting it. After writing the
+revision back, use Director's existing single-group selection and segmented export workflow to render only that group.
+
 ### FL2V long projects
 
 - `reference_image_1` is the optional project first frame and is sent only to group 1.
@@ -259,6 +281,29 @@ Use up to three saved presets at once.  For a one-off LoRA, paste comma- or newl
 verbatim, and for MiniMax H3 full-reference output it inserts any missing terms inside `detailed_description` only.
 
 ## Compatibility notes
+
+### Director structure duration contract
+
+In **Per segment (recommended)** mode, the host now locks legal group durations before the structure call.
+`segment_duration_seconds` estimates the group count; detected `[STORY_BEATS]` / beat headers can allocate
+different durations before inference. Without those beat estimates, the initial allocation is even.
+The model assigns story content to that schedule and cannot replace its times. Every group stays within
+4–15 seconds and the project total is conserved to millisecond precision; totals over 240 seconds are rejected.
+
+If a card still reports more than 15 seconds, or its assigned dialogue exceeds its speech budget, the host
+attempts a local repair. Only the overflowing card is split. Its complete action and dialogue text must survive
+as ordered, verbatim slices, references are retained, internal parts continue each other, and the original final
+handoff is preserved. A 21-second card can become 10.5 + 10.5 seconds, with remaining group times redistributed
+inside the project budget. This can increase the number of groups. Other cards' story text is not regenerated.
+If the remaining groups or dialogue cannot fit, the planner reports the original segment, required duration,
+and reason rather than truncating content. A model that cannot return safe slices also produces a diagnostic.
+
+Rejected raw structure output and local-repair responses are saved to a local temporary file named
+`qwen38-director-structure-*.json`; its path appears in the error or `structure_diagnostic` debug field.
+These files contain the original model output and can be removed after troubleshooting. Normal plans need
+no extra model call. **Single shot (legacy)** keeps its existing planning behavior. Re-run Preview after updating.
+
+See [the audit and regression report](docs/director-duration-contract.md) for scope and limitations.
 
 The node requires a current `llama-cpp-python` build with the generic `MTMDChatHandler` or the `Qwen25VLChatHandler` and a matching projector. Start with **auto (MTMD)**. If the selected build does not expose that handler, update `llama-cpp-python`; the node reports a clear error instead of silently falling back to text-only inference.
 
