@@ -2199,7 +2199,7 @@ def _parse_story_beats_block(brief: str) -> list[_StoryBeatSpec]:
 def _parse_story_beats_from_headers(brief: str) -> list[_StoryBeatSpec]:
     text = brief or ""
     matches = list(_BEAT_HEADER.finditer(text))
-    if len(matches) < 2:
+    if not matches:
         return []
     beats: list[_StoryBeatSpec] = []
     for index, match in enumerate(matches):
@@ -2243,10 +2243,10 @@ def _parse_story_beats_from_brief(brief: str) -> list[_StoryBeatSpec]:
     """
 
     beats = _parse_story_beats_block(brief)
-    if len(beats) >= 2:
+    if beats:
         return beats
     beats = _parse_story_beats_from_headers(brief)
-    if len(beats) >= 2:
+    if beats:
         return beats
     return []
 
@@ -2318,7 +2318,7 @@ def _build_coverage_knife_plan(
     group_count: int,
 ) -> _CoverageKnifePlan | None:
     beats = _parse_story_beats_from_brief(brief)
-    if len(beats) < 2:
+    if not beats:
         return None
     estimates = [beat.estimated_seconds for beat in beats]
     allocations, compressed = _scale_beat_allocations(estimates, budget_seconds)
@@ -2347,11 +2347,16 @@ def _story_duration_schedule(
     requested_budget = float(budget_seconds)
     if allow_duration_overrun and beats:
         required = sum(max(float(beat.estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS) for beat in beats)
-        budget_seconds = max(requested_budget, required)
+        shot_floor = sum(
+            (beat.shot_end - beat.shot_start + 1) * max_segment_seconds
+            for beat in beats
+            if beat.shot_start is not None and beat.shot_end is not None
+        )
+        budget_seconds = max(requested_budget, required, shot_floor)
         if budget_seconds > MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:
             raise PromptRefinerError(
                 f"Story-complete duration {budget_seconds:.3f}s exceeds the safety ceiling "
-                f"of {MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Reduce STORY_BEATS estimates."
+                f"of {MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Reduce STORY_BEATS estimates or shot ranges."
             )
     fallback = _director_duration_schedule(
         budget_seconds,
@@ -2361,7 +2366,7 @@ def _story_duration_schedule(
             else MAX_DIRECTOR_TOTAL_SECONDS
         ),
     )
-    if len(beats) < 2:
+    if not beats:
         return fallback, None
     allocations, compressed = _scale_beat_allocations(
         (beat.estimated_seconds for beat in beats), budget_seconds

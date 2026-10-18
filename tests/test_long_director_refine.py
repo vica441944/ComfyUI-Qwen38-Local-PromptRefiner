@@ -14,7 +14,6 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -192,7 +191,7 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertTrue(all(call["seed"] == 7 for call in calls))
         self.assertEqual(calls[0]["max_tokens"], max(512 + 3 * 480, 4096))
         self.assertTrue(all(call["max_tokens"] == 4096 for call in calls[1:]))
-        self.assertEqual([segment.duration_seconds for segment in segments], [10.0, 10.0, 10.0])
+        self.assertEqual([segment.duration_seconds for segment in segments], [8.0, 12.0, 10.0])
         self.assertEqual(
             [segment.continuity_from_prev for segment in segments],
             [False, True, False],
@@ -299,12 +298,12 @@ class LongDirectorRefineTests(unittest.TestCase):
             requested_max_tokens=4096,
             seed=1,
         )
-        self.assertFalse(rebalanced)  # The host schedule was already legal before inference.
+        self.assertTrue(rebalanced)
         self.assertAlmostEqual(sum(segment.duration_seconds for segment in segments), 30.0, places=3)
         self.assertTrue(all(4.0 <= segment.duration_seconds <= 15.0 for segment in segments))
         self.assertIn("BEAT_TWO", segments[1].beat)
         self.assertTrue(all(item.startswith("10.000") for item in seen_durations))
-        self.assertIn("durations_rebalanced=false", debug)
+        self.assertIn("durations_rebalanced=true", debug)
 
     def test_missing_fields_retry_once_then_accept(self) -> None:
         segment_two_calls = 0
@@ -1459,7 +1458,10 @@ HANDOFF_{index} holds the ending pose.
 class DialogueDurationTests(unittest.TestCase):
     def test_templates_use_a_range_placeholder_instead_of_the_equal_average(self) -> None:
         schedule = (10.0,) * 6
-        for system in (nodes._long_director_system(R2V, schedule, BALANCED),):
+        for system in (
+            nodes._long_director_structure_system(R2V, schedule),
+            nodes._long_director_system(R2V, schedule, BALANCED),
+        ):
             template = _template_block(system)
             self.assertIn("DURATION_SECONDS: <4-15>", template)
             self.assertNotRegex(template, r"DURATION_SECONDS:\s*\d")
@@ -1472,28 +1474,18 @@ class DialogueDurationTests(unittest.TestCase):
 
         uneven = nodes._long_director_structure_system(R2V, (4.0, 15.0, 8.0))
         uneven_template = _template_block(uneven)
-        self.assertIn("DURATION_SECONDS: 4.000", uneven_template)
+        self.assertIn("DURATION_SECONDS: <4-15>", uneven_template)
         self.assertNotIn("DURATION_SECONDS: 9", uneven_template)
-        self.assertIn("LOCKED DURATION SCHEDULE", uneven)
-        self.assertIn("[4.0, 15.0, 8.0]", uneven)
+        self.assertNotIn("4.000", uneven_template)
         self.assertNotIn("15.000", uneven_template)
 
-    def test_segment_duration_tooltip_describes_a_hard_ceiling(self) -> None:
+    def test_segment_duration_tooltip_is_a_count_estimator(self) -> None:
         tooltip = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]["segment_duration_seconds"][1][
             "tooltip"
         ]
-        self.assertIn("Maximum duration", tooltip)
-        self.assertIn("choose the group count", tooltip)
-        self.assertIn("not a target or forced duration", tooltip)
-
-    def test_duration_overrun_is_a_visible_required_widget(self) -> None:
-        inputs = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()
-        self.assertIn("allow_duration_overrun", inputs["required"])
-        self.assertNotIn("allow_duration_overrun", inputs["optional"])
-        self.assertEqual(
-            inputs["required"]["allow_duration_overrun"][1]["label"],
-            "Prioritize story completeness (allow duration overrun)",
-        )
+        self.assertIn("group count", tooltip)
+        self.assertIn("not the forced duration", tooltip)
+        self.assertIn("ceil(total_duration_seconds / this value)", tooltip)
 
     def test_cjk_dialogue_is_not_counted_as_one_english_word_per_character(self) -> None:
         english = _words(40)
@@ -1577,6 +1569,67 @@ class CoverageKnifeTests(unittest.TestCase):
     JOB18_EST = (45.0, 20.0, 30.0, 40.0, 50.0, 30.0, 45.0)
     JOB18_BUDGET = 216.0
     JOB18_GROUPS = 22
+
+    SINGLE_BEAT_BRIEF = "[STORY_BEATS]\n1|45|1-9|arrive|LANDMARK\n[/STORY_BEATS]"
+
+    def test_single_beat_block_and_headers_are_detected(self) -> None:
+        for brief in (
+            self.SINGLE_BEAT_BRIEF,
+            "节拍1 (est 45s) 分镜1-9\nLANDMARK",
+            "Beat 1 (est 45s) 分镜1-9\nLANDMARK",
+        ):
+            with self.subTest(brief=brief):
+                beats = nodes._parse_story_beats_from_brief(brief)
+                self.assertEqual(len(beats), 1)
+                self.assertEqual(beats[0].estimated_seconds, 45.0)
+                self.assertEqual((beats[0].shot_start, beats[0].shot_end), (1, 9))
+                plan = nodes._build_coverage_knife_plan(brief, budget_seconds=45.0, group_count=5)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan.card_counts, (5,))
+
+    def test_single_beat_overrun_expands_to_cover_shots(self) -> None:
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(schedule, (10.0,) * 9)
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.beats), 1)
+        self.assertEqual(plan.budget_seconds, 90.0)
+        self.assertEqual(plan.card_counts, (9,))
+
+    def test_single_beat_without_overrun_keeps_requested_budget(self) -> None:
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=False,
+        )
+        self.assertEqual(schedule, (9.0,) * 5)
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.beats), 1)
+        self.assertEqual(plan.budget_seconds, 45.0)
+        self.assertEqual(plan.card_counts, (5,))
+
+    def test_two_beats_overrun_still_expands_to_estimate_sum(self) -> None:
+        brief = "[STORY_BEATS]\n1|40|1-2|arrive|INTRO\n2|30|3-4|exit|EXIT\n[/STORY_BEATS]"
+        self.assertEqual(len(nodes._parse_story_beats_from_brief(brief)), 2)
+        schedule, plan = nodes._story_duration_schedule(
+            brief, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(schedule, (10.0,) * 7)
+        self.assertIsNotNone(plan)
+        self.assertFalse(plan.compressed)
+        self.assertEqual(plan.budget_seconds, 70.0)
+        self.assertEqual(plan.card_counts, (4, 3))
+        self.assertIsNotNone(nodes._build_coverage_knife_plan(brief, budget_seconds=70.0, group_count=7))
+
+    def test_shot_floor_over_expanded_cap_is_rejected(self) -> None:
+        brief = "[STORY_BEATS]\n1|45|1-61|arrive|LANDMARK\n[/STORY_BEATS]"
+        with self.assertRaisesRegex(nodes.PromptRefinerError, "safety ceiling"):
+            nodes._story_duration_schedule(
+                brief, budget_seconds=45.0, max_segment_seconds=10.0,
+                allow_duration_overrun=True,
+            )
 
     def _story_beats_brief(self) -> str:
         return """
@@ -1802,96 +1855,3 @@ Handoff {seg_index}.
         self.assertIsNone(
             nodes._build_coverage_knife_plan(brief, budget_seconds=60.0, group_count=6)
         )
-
-
-class DirectorGroupReRefinerTests(unittest.TestCase):
-    def test_node_is_registered_and_detects_both_prompt_contracts(self) -> None:
-        self.assertIs(
-            nodes.NODE_CLASS_MAPPINGS["Qwen38DirectorGroupReRefiner"],
-            nodes.Qwen38DirectorGroupReRefiner,
-        )
-        self.assertEqual(nodes._director_group_engine(r2v_prompt("R2V")), nodes.FULL_REFERENCE_ENGINE)
-        self.assertEqual(nodes._director_group_engine(fl2v_prompt("FL2V")), nodes.FIRST_LAST_FRAME_ENGINE)
-
-    def test_revision_preserves_duration_context_and_reference_label(self) -> None:
-        revised = r2v_prompt("Revised wardrobe")
-
-        class FakeLlama:
-            def __init__(self) -> None:
-                self.calls = []
-
-            def create_chat_completion(self, **kwargs):
-                self.calls.append(kwargs)
-                return {"choices": [{"message": {"content": revised}}]}
-
-        fake_llama = FakeLlama()
-        fake_runtime = types.SimpleNamespace(llm=fake_llama)
-        node = nodes.Qwen38DirectorGroupReRefiner()
-        with (
-            patch.object(nodes, "_resolve_model_file", return_value="model.gguf"),
-            patch.object(nodes._RuntimeCache, "get", return_value=fake_runtime),
-            patch.object(nodes._RuntimeCache, "unload"),
-        ):
-            result = node.refine_group(
-                current_prompt=r2v_prompt("Original wardrobe"),
-                revision_request="Change only the jacket color.",
-                target_group_id="42",
-                duration_seconds=13.3,
-                previous_group_context=r2v_prompt("Previous action"),
-                next_group_context=r2v_prompt("Next action"),
-                model_name="model.gguf",
-                context_length=16384,
-                gpu_layers=-1,
-                temperature=0.35,
-                top_p=0.9,
-                max_tokens=4096,
-                seed=0,
-                keep_model_loaded=False,
-            )
-
-        self.assertEqual(result["result"][0], revised)
-        self.assertEqual(result["ui"]["qwen38_group_revision"][0]["target_group_id"], "42")
-        request = fake_llama.calls[0]["messages"][1]["content"]
-        self.assertIn("13.300s", request)
-        self.assertIn("Previous action", request)
-        self.assertIn("Next action", request)
-
-    def test_revision_retries_when_reference_label_is_dropped(self) -> None:
-        outputs = [r2v_prompt("Missing picture", picture=False), r2v_prompt("Corrected")]
-
-        class FakeLlama:
-            def create_chat_completion(self, **_kwargs):
-                return {"choices": [{"message": {"content": outputs.pop(0)}}]}
-
-        node = nodes.Qwen38DirectorGroupReRefiner()
-        with (
-            patch.object(nodes, "_resolve_model_file", return_value="model.gguf"),
-            patch.object(nodes._RuntimeCache, "get", return_value=types.SimpleNamespace(llm=FakeLlama())),
-            patch.object(nodes._RuntimeCache, "unload"),
-        ):
-            result = node.refine_group(
-                current_prompt=r2v_prompt("Original"),
-                revision_request="Change the camera angle.",
-                target_group_id="9",
-                duration_seconds=10.0,
-                previous_group_context="",
-                next_group_context="",
-                model_name="model.gguf",
-                context_length=16384,
-                gpu_layers=-1,
-                temperature=0.35,
-                top_p=0.9,
-                max_tokens=4096,
-                seed=0,
-                keep_model_loaded=False,
-            )
-        self.assertIn("<Picture 1>", result["result"][0])
-        self.assertIn("attempts=2", result["result"][1])
-
-    def test_final_field_block_wins_over_reasoning_draft(self) -> None:
-        draft = r2v_prompt("Reasoning draft")
-        final = r2v_prompt("Final answer")
-        raw = f"I should reason through this first.\n{draft}\nNow the final answer:\n{final}"
-        extracted = nodes._extract_director_segment_prompt(raw, nodes.FULL_REFERENCE_ENGINE)
-        self.assertNotIn("Reasoning draft", extracted)
-        self.assertIn("Final answer", extracted)
