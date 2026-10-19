@@ -186,7 +186,8 @@ class LongDirectorRefineTests(unittest.TestCase):
         )
 
         self.assertEqual(title, "Night office")
-        self.assertFalse(rebalanced)
+        # Unlock keeps structure DURATION_SECONDS (8/12/10) vs equal host seed → rebalanced.
+        self.assertTrue(rebalanced)
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(call["seed"] == 7 for call in calls))
         self.assertEqual(calls[0]["max_tokens"], max(512 + 3 * 480, 4096))
@@ -1484,8 +1485,8 @@ class DialogueDurationTests(unittest.TestCase):
             "tooltip"
         ]
         self.assertIn("group count", tooltip)
-        self.assertIn("not the forced duration", tooltip)
-        self.assertIn("ceil(total_duration_seconds / this value)", tooltip)
+        self.assertIn("not a target or forced duration", tooltip)
+        self.assertIn("STORY_BEATS", tooltip)
 
     def test_cjk_dialogue_is_not_counted_as_one_english_word_per_character(self) -> None:
         english = _words(40)
@@ -1597,6 +1598,90 @@ class CoverageKnifeTests(unittest.TestCase):
         self.assertEqual(len(plan.beats), 1)
         self.assertEqual(plan.budget_seconds, 90.0)
         self.assertEqual(plan.card_counts, (9,))
+
+    def test_single_beat_unlocked_durations_follow_dialogue(self) -> None:
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        assert plan is not None
+        _title, cards = nodes._parse_director_structure_output(self._cards_for_plan(plan))
+        cards[0]["dialogue"] += " " + _words(40)
+        cards[3]["dialogue"] = "字" * 40
+        cards[5]["dialogue"] = _words(40)
+        segments, rebalanced, misses = nodes._segments_from_structure_cards(
+            cards, R2V, schedule, (), (), (), (),
+            coverage_plan=plan, locked_durations=False,
+        )
+        durations = [seg.duration_seconds for seg in segments]
+        self.assertEqual(misses, [])
+        self.assertTrue(rebalanced)
+        self.assertEqual(len(segments), plan.card_counts[0])
+        self.assertAlmostEqual(sum(durations), 90.0, places=2)
+        self.assertGreater(durations[0], durations[1])
+        self.assertGreater(durations[3], durations[1])
+        self.assertGreater(durations[5], durations[1])
+
+        locked, rebalanced, misses = nodes._segments_from_structure_cards(
+            cards, R2V, schedule, (), (), (), (),
+            coverage_plan=plan, locked_durations=True,
+        )
+        self.assertEqual([seg.duration_seconds for seg in locked], list(schedule))
+        self.assertFalse(rebalanced)
+        self.assertEqual(misses, [])
+
+    def test_single_beat_unlocked_keeps_llm_durations_when_dialogue_flat(self) -> None:
+        """Coverage equal-seed must not flatten a single beat when unlock is on.
+
+        Job29-style: overrun → 9×10 host schedule, mild dialogue (spread < 8 units),
+        but structure cards already chose an uneven rhythm. Retarget correctly stays
+        off; unlocked path should still keep DURATION_SECONDS instead of N×(budget/N).
+        """
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        assert plan is not None
+        self.assertEqual(schedule, (10.0,) * 9)
+        llm_durations = (12.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 8.0)
+        blocks = ["TITLE: Flat dialogue single beat"]
+        for index, duration in enumerate(llm_durations, start=1):
+            continuity = "false" if index == 1 else "true"
+            dialogue = "LANDMARK" if index == 1 else "NONE"
+            blocks.append(
+                f"""=== SEGMENT {index} ===
+DURATION_SECONDS: {duration:g}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Story card {index}.
+DIALOGUE:
+{dialogue}
+HANDOFF:
+Handoff {index}.
+=== END SEGMENT ==="""
+            )
+        _title, cards = nodes._parse_director_structure_output("\n".join(blocks))
+        units = [
+            nodes._dialogue_speech_units(card.get("dialogue") or "")
+            for card in sorted(cards, key=lambda item: int(item["index"]))
+        ]
+        self.assertLess(max(units) - min(units), nodes._DIALOGUE_REDISTRIBUTE_MIN_UNITS)
+        segments, rebalanced, misses = nodes._segments_from_structure_cards(
+            cards, R2V, schedule, (), (), (), (),
+            coverage_plan=plan, locked_durations=False,
+        )
+        durations = [seg.duration_seconds for seg in segments]
+        self.assertEqual(misses, [])
+        self.assertEqual(len(durations), 9)
+        self.assertAlmostEqual(sum(durations), 90.0, places=2)
+        self.assertNotEqual(durations, list(schedule))
+        self.assertGreater(durations[0], durations[-1])
+        self.assertAlmostEqual(durations[0], 12.0, places=2)
+        self.assertAlmostEqual(durations[-1], 8.0, places=2)
 
     def test_single_beat_without_overrun_keeps_requested_budget(self) -> None:
         schedule, plan = nodes._story_duration_schedule(
@@ -1804,6 +1889,7 @@ Handoff {seg_index}.
         assert plan is not None
         good = self._cards_for_plan(plan, omit_beat6_dialogue=False)
         _title, cards = nodes._parse_director_structure_output(good)
+        cards[0]["dialogue"] += " " + _words(40)
         schedule = nodes._director_duration_schedule(self.JOB18_BUDGET, 10.0)
         self.assertEqual(len(schedule), self.JOB18_GROUPS)
         segments, rebalanced, misses = nodes._segments_from_structure_cards(
@@ -1815,10 +1901,12 @@ Handoff {seg_index}.
             (),
             (),
             coverage_plan=plan,
+            locked_durations=False,
         )
         self.assertEqual(misses, [])
         self.assertTrue(rebalanced)
         self.assertEqual(len(segments), self.JOB18_GROUPS)
+        self.assertGreater(segments[0].duration_seconds, segments[1].duration_seconds)
         self.assertAlmostEqual(sum(seg.duration_seconds for seg in segments), self.JOB18_BUDGET, places=2)
         # Every host-mapped beat range still has ≥1 card after packing.
         for beat_idx, count in enumerate(plan.card_counts, start=1):
@@ -1834,6 +1922,108 @@ Handoff {seg_index}.
             )
             self.assertGreaterEqual(total, plan.card_counts[beat_idx - 1] * nodes.MIN_DIRECTOR_SEGMENT_SECONDS - 0.05)
             self.assertGreaterEqual(total, min(plan.allocations[beat_idx - 1], 12.0) - 1.5)
+
+
+    def test_structure_prompt_does_not_lock_equal_host_seconds(self) -> None:
+        """STORY_BEATS overrun still seeds N x 10s, but the structure prompt must not force copy."""
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(schedule, (10.0,) * 9)
+        assert plan is not None
+        system = nodes._long_director_structure_system(R2V, schedule, coverage_plan=plan)
+        self.assertNotIn("LOCKED DURATION SCHEDULE", system)
+        self.assertNotIn("Copy the corresponding host duration exactly", system)
+        template = _template_block(system)
+        self.assertIn("DURATION_SECONDS: <4-15>", template)
+        self.assertNotRegex(template, r"DURATION_SECONDS:\s*\d")
+        self.assertNotIn("10.000", template)
+        self.assertIn("DURATION_SECONDS: <4-15>", system)
+        self.assertIn("only the average used to estimate that group count", system)
+        self.assertIn("make their sum exactly", system)
+        self.assertIn("near 15", system)
+        self.assertIn("near 4", system)
+        self.assertIn("90.000 seconds", system)
+
+    def test_repair_keeps_variable_llm_durations_against_equal_host_seed(self) -> None:
+        """Speech that fits a long card must not overflow just because the host seed is 10s."""
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        assert plan is not None
+        self.assertEqual(schedule, (10.0,) * 9)
+        llm_durations = (14.0, 8.0, 10.0, 12.0, 8.0, 10.0, 10.0, 10.0, 8.0)
+        self.assertAlmostEqual(sum(llm_durations), 90.0, places=3)
+        blocks = ["TITLE: Variable LLM rhythm"]
+        heavy = _words(28)  # ~12.4s of speech at 2.25 wps; fits 14s, exceeds equal 10s seed
+        for index, duration in enumerate(llm_durations, start=1):
+            continuity = "false" if index == 1 else "true"
+            dialogue = heavy if index == 1 else ("LANDMARK" if index == 2 else "NONE")
+            blocks.append(
+                f"""=== SEGMENT {index} ===
+DURATION_SECONDS: {duration:g}
+CONTINUITY_FROM_PREV: {continuity}
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Story card {index}.
+DIALOGUE:
+{dialogue}
+HANDOFF:
+Handoff {index}.
+=== END SEGMENT ==="""
+            )
+        _title, cards = nodes._parse_director_structure_output("\n".join(blocks))
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+
+        def _complete(*_args, **_kwargs):
+            raise AssertionError("repair must not call complete when cards already fit")
+
+        repaired, resolved, out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, plan, _complete, 1024, 0, audit,
+        )
+        self.assertEqual(out_plan, plan)
+        self.assertEqual(audit["repairs"], [])
+        self.assertEqual(list(resolved), list(llm_durations))
+        self.assertEqual(
+            [float(card["duration_raw"]) for card in repaired],
+            list(llm_durations),
+        )
+
+    def test_modest_dialogue_imbalance_retargets_flat_equal_split(self) -> None:
+        """Backup: lowered MIN_UNITS should retarget when LLM echoes host equals."""
+        schedule, plan = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        assert plan is not None
+        _title, cards = nodes._parse_director_structure_output(self._cards_for_plan(plan))
+        # Backup for lowered MIN_UNITS: spread in [5, 8) with ideal_spread >= 2.
+        # Empty-vs-light cannot clear the ideal_spread gate below ~14 units, so use
+        # two non-empty loads (18 vs 12 words) and force equal host-echo durations.
+        for card in cards:
+            card["duration_raw"] = "10"
+            card["dialogue"] = " ".join(f"pad{i}" for i in range(12))
+        cards[0]["dialogue"] = "LANDMARK " + " ".join(f"w{i}" for i in range(18))
+        units = [
+            nodes._dialogue_speech_units(card.get("dialogue") or "")
+            for card in sorted(cards, key=lambda item: int(item["index"]))
+        ]
+        self.assertGreaterEqual(max(units) - min(units), nodes._DIALOGUE_REDISTRIBUTE_MIN_UNITS)
+        self.assertLess(max(units) - min(units), 8.0)
+        segments, rebalanced, misses = nodes._segments_from_structure_cards(
+            cards, R2V, schedule, (), (), (), (),
+            coverage_plan=plan, locked_durations=False,
+        )
+        durations = [seg.duration_seconds for seg in segments]
+        self.assertEqual(misses, [])
+        self.assertTrue(rebalanced)
+        self.assertAlmostEqual(sum(durations), 90.0, places=2)
+        self.assertGreater(durations[0], durations[1])
 
     def test_header_beat_labels_are_detected_without_machine_block(self) -> None:
         brief = """

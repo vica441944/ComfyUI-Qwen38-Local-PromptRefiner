@@ -1917,7 +1917,7 @@ _DIALOGUE_WORDS_PER_SECOND = 2.25
 # Two hanzi/kana/hangul characters ≈ one English word, so a character is not a word.
 _CJK_CHARS_PER_ENGLISH_WORD = 2.0
 # Below this gap the assigned lines are too even to override a returned rhythm.
-_DIALOGUE_REDISTRIBUTE_MIN_UNITS = 8.0
+_DIALOGUE_REDISTRIBUTE_MIN_UNITS = 5.0
 # Returned durations inside this spread are an equal split in all but name.
 _NEAR_EQUAL_DURATION_SECONDS = 1.0
 
@@ -2893,20 +2893,24 @@ def _segments_from_structure_cards(
     if locked_durations:
         # Content must be written for the host contract, not retimed afterwards.
         return segments, False, landmark_misses
-    # Seed durations from compressed beat budgets before speech retarget so
+    # Multi-beat only: seed equal shares within each beat before speech retarget so
     # early/climax overspend cannot starve trailing beats for card count alone.
+    # Single-beat plans keep structure-card DURATION_SECONDS (unlocked path); equal
+    # seeding would force N×(budget/N) and discard LLM rhythm when dialogue spread
+    # is below _DIALOGUE_REDISTRIBUTE_MIN_UNITS.
     if coverage_plan is not None:
         active = _coverage_knife_plan_for_card_count(coverage_plan, len(segments))
-        seeded: list[_DirectorLongSegment] = []
-        for segment, beat_idx in zip(
-            sorted(segments, key=lambda item: item.index), active.segment_to_beat
-        ):
-            beat_pos = int(beat_idx) - 1
-            cards_in_beat = active.card_counts[beat_pos]
-            share = active.allocations[beat_pos] / max(1, cards_in_beat)
-            share = min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, share))
-            seeded.append(replace(segment, duration_seconds=round(share, 3)))
-        segments = seeded
+        if len(active.beats) > 1:
+            seeded: list[_DirectorLongSegment] = []
+            for segment, beat_idx in zip(
+                sorted(segments, key=lambda item: item.index), active.segment_to_beat
+            ):
+                beat_pos = int(beat_idx) - 1
+                cards_in_beat = active.card_counts[beat_pos]
+                share = active.allocations[beat_pos] / max(1, cards_in_beat)
+                share = min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, share))
+                seeded.append(replace(segment, duration_seconds=round(share, 3)))
+            segments = seeded
     segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments)
     actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
     durations_rebalanced = False
@@ -2931,6 +2935,7 @@ def _long_director_structure_system(
     durations = tuple(schedule)
     engine = _director_mode_engine(mode)
     total_seconds = sum(durations)
+    target_seconds = total_seconds / len(durations)
     if engine == FULL_REFERENCE_ENGINE:
         if anchor_all_pictures:
             picture_rule = (
@@ -2963,10 +2968,13 @@ the route profile. Return only the marked beat-card format below: no markdown fe
 no JSON, and no H3 prompt fields.
 
 The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups.
-LOCKED DURATION SCHEDULE (seconds, in segment order): {json.dumps(durations)}
-Copy the corresponding host duration exactly; your output cannot override it. Produce exactly {len(durations)}
-segments. Fit each story slice into its assigned time. Split long actions, dialogue, and emotional turns across
-adjacent cards at natural boundaries; never truncate, omit, duplicate, or reorder story content.
+{target_seconds:.3f} seconds is only the average used to estimate that group count. It is not the duration of any
+group and must not be copied onto every segment. Produce exactly {len(durations)} segments. Choose each
+DURATION_SECONDS from the beat's content, always within 4–15 seconds, and make their sum exactly
+{total_seconds:.3f} seconds. Do not mechanically equalize every group. Dialogue-heavy beats go longer (near 15
+seconds). Short actions, reactions, reveals, and concise dialogue go shorter (near 4 seconds).
+Split long actions, dialogue, and emotional turns across adjacent cards at natural boundaries; never truncate,
+omit, duplicate, or reorder story content.
 Do not write subject_definitions,
 detailed_description, integrated_multimodal_description, or any other H3 prompt field. A later independent pass
 writes each group's prompt.
@@ -2974,7 +2982,7 @@ writes each group's prompt.
 Exact return template (repeat the SEGMENT block exactly {len(durations)} times):
 TITLE: short project title
 === SEGMENT 1 ===
-DURATION_SECONDS: {durations[0]:.3f}
+DURATION_SECONDS: {_DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER}
 CONTINUITY_FROM_PREV: false
 PICTURES:
 VIDEOS:
@@ -2993,7 +3001,7 @@ BEAT is only what a viewer sees and hears in THIS group: starting state, the cha
 50–90 English words. Do not summarize the rest of the film inside a card.
 DIALOGUE must quote the brief verbatim, split at natural meaning boundaries. Never drop, rewrite, or repeat a
 completed line. Use NONE when the group has no speech. Pace speech at about 2–2.5 words per second: a long
-DIALOGUE must be split across adjacent cards if it exceeds their locked budget. Keep the brief's
+DIALOGUE must be split across adjacent cards if it exceeds their chosen DURATION_SECONDS. Keep the brief's
 original language and wording.
 HANDOFF is the concrete pose, prop state, camera heading, and audio state at the cut. Write it in English.
 Set CONTINUITY_FROM_PREV false for segment 1 and true for later segments unless a deliberate hard scene break is
@@ -3361,7 +3369,12 @@ def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
 def _locked_structure_schedule(
     schedule: Iterable[float], coverage_plan: _CoverageKnifePlan | None,
 ) -> tuple[float, ...]:
-    """Allocate before inference; coverage beat estimates may give a nonuniform rhythm."""
+    """Host count/total seed before inference; not a locked equal per-card schedule.
+
+    Coverage beat estimates may give a nonuniform *beat*-level rhythm. Within a beat
+    the seed may still be even; structure prompts must ask the model for variable
+    DURATION_SECONDS, and unlocked repair keeps those card times.
+    """
     values = tuple(schedule)
     _director_duration_schedule(
         sum(values), MAX_DIRECTOR_SEGMENT_SECONDS,
@@ -3449,14 +3462,33 @@ def _repair_structure_duration_cards(
             raise PromptRefinerError(f"Director structure segment {pos + 1}: invalid duration {raw!r}.")
         duration = float(match.group(1))
         # Assigned speech is another observable overflow, even if the duration token is legal.
+        # Compare against the card's own claim and the 4-15 hard caps — not the equal host
+        # seed schedule — so variable DURATION_SECONDS chosen by the structure pass survive.
         dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
         speech_seconds = _dialogue_speech_units(dialogue) / _DIALOGUE_WORDS_PER_SECOND
-        needed = max(duration if duration > MAX_DIRECTOR_SEGMENT_SECONDS else 0.0, speech_seconds)
-        if duration > MAX_DIRECTOR_SEGMENT_SECONDS or needed > schedule[pos] + 0.02:
-            overflows[pos] = round(needed, 3)
-        elif duration < MIN_DIRECTOR_SEGMENT_SECONDS:
+        if duration < MIN_DIRECTOR_SEGMENT_SECONDS:
             raise PromptRefinerError(f"Director structure segment {pos + 1}: duration {duration:.3f}s is below 4s.")
+        if duration > MAX_DIRECTOR_SEGMENT_SECONDS:
+            overflows[pos] = round(max(duration, speech_seconds), 3)
+        elif speech_seconds > MAX_DIRECTOR_SEGMENT_SECONDS:
+            overflows[pos] = round(speech_seconds, 3)
+        elif speech_seconds > duration + 0.02:
+            overflows[pos] = round(speech_seconds, 3)
     if not overflows:
+        card_times = []
+        for card in ordered:
+            raw = str(card.get("duration_raw") or "")
+            match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:s|seconds?)?\s*", raw, re.IGNORECASE)
+            card_times.append(float(match.group(1)) if match else 0.0)
+        if (
+            len(card_times) == len(schedule)
+            and abs(sum(card_times) - sum(schedule)) <= 0.02
+            and all(
+                MIN_DIRECTOR_SEGMENT_SECONDS <= value <= MAX_DIRECTOR_SEGMENT_SECONDS
+                for value in card_times
+            )
+        ):
+            return ordered, tuple(round(value, 3) for value in card_times), coverage_plan
         return ordered, schedule, coverage_plan
     details = "; ".join(f"segment {p + 1}: {d:.3f}s" for p, d in overflows.items())
     total = sum(schedule)
@@ -3675,9 +3707,10 @@ def _plan_director_with_independent_segment_refine(
                     audio_slots,
                     anchor_all_pictures=anchor_all_pictures,
                     coverage_plan=coverage_plan,
-                    locked_durations=True,
+                    # Allow dialogue retargeting while coverage allocations remain enforced.
+                    locked_durations=False,
                 )
-                durations_rebalanced = resolved_schedule != target_schedule
+                durations_rebalanced = durations_rebalanced or (resolved_schedule != target_schedule)
                 if structure_audit["repairs"]:
                     diagnostic_path = _save_structure_diagnostic(structure_audit)
                 last_error = None
