@@ -971,6 +971,78 @@ def _segments_from_plan(text: str, schedule: tuple[float, ...]):
     return segments, rebalanced
 
 
+
+class SegmentCapAndSoftBudgetTests(unittest.TestCase):
+    def test_rebalance_respects_widget_segment_cap(self) -> None:
+        from dataclasses import replace as dc_replace
+
+        segments, _ = _segments_from_plan(_beat_plan(list(range(1, 6)), 10), (9.0,) * 5)
+        heavy = [dc_replace(seg, duration_seconds=14.0) for seg in segments]
+        out = nodes._rebalance_director_segment_durations(heavy, 45.0, max_segment_seconds=10.0)
+        self.assertAlmostEqual(sum(seg.duration_seconds for seg in out), 45.0, places=3)
+        self.assertTrue(all(4.0 <= seg.duration_seconds <= 10.0 for seg in out))
+
+    def test_shots_1_to_9_with_seg15_do_not_make_135(self) -> None:
+        brief = "[STORY_BEATS]\n1|45|1-9|arrive|LANDMARK\n[/STORY_BEATS]"
+        schedule, plan = nodes._story_duration_schedule(
+            brief, budget_seconds=45.0, max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertIsNotNone(plan)
+        self.assertAlmostEqual(sum(schedule), 45.0, places=3)
+        self.assertEqual(plan.budget_seconds, 45.0)
+        self.assertLess(len(schedule), 9)
+
+
+class TruncatedStructureTests(unittest.TestCase):
+    def test_trailing_segment_without_end_preserves_fields(self) -> None:
+        plan = _beat_plan(list(range(1, 10)), 15).rsplit("=== END SEGMENT ===", 1)[0]
+        self.assertEqual(plan.count("=== END SEGMENT ==="), 8)
+        _title, cards = nodes._parse_director_structure_output(plan)
+        self.assertEqual(len(cards), 9)
+        self.assertEqual(cards[-1]["index"], 9)
+        self.assertEqual(cards[-1]["duration_raw"], "15")
+        self.assertIn("BEAT_9", cards[-1]["beat"])
+        self.assertEqual(cards[-1]["dialogue"], "NONE")
+        self.assertIn("HANDOFF_9", cards[-1]["handoff"])
+
+    def test_trailing_junk_without_beat_is_ignored(self) -> None:
+        plan = _beat_plan([1, 2], 10)
+        expected = nodes._parse_director_structure_output(plan)
+        for junk in ("Unfinished text", "=== SEGMENT 3 ===\nDURATION_SECONDS: 10\nBEAT:\nDIALOGUE: NONE"):
+            with self.subTest(junk=junk):
+                self.assertEqual(nodes._parse_director_structure_output(plan + "\n" + junk), expected)
+
+    def test_only_last_open_segment_is_recovered(self) -> None:
+        plan = _beat_plan([1], 10)
+        plan += "\n=== SEGMENT 2 ===\nBEAT: Middle placeholder."
+        plan += "\n=== SEGMENT 3 ===\nBEAT: Final placeholder."
+        _title, cards = nodes._parse_director_structure_output(plan)
+        self.assertEqual([card["index"] for card in cards], [1, 3])
+        self.assertEqual(cards[-1]["beat"], "Final placeholder.")
+        self.assertEqual(cards[-1]["dialogue"], "")
+        self.assertEqual(cards[-1]["handoff"], "")
+        self.assertEqual(cards[-1]["duration_raw"], "")
+
+    def test_open_segment_accepts_prompt_fallback(self) -> None:
+        _title, cards = nodes._parse_director_structure_output(
+            "=== SEGMENT 1 ===\nPROMPT: A placeholder crosses the room."
+        )
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["beat"], "A placeholder crosses the room.")
+
+    def test_impossible_rebalance_reports_count_and_totals(self) -> None:
+        segments, _rebalanced = _segments_from_plan(_beat_plan(list(range(1, 9)), 10), (10.0,) * 8)
+        for total in (135, 31):
+            with self.subTest(total=total):
+                with self.assertRaises(nodes.PromptRefinerError) as error:
+                    nodes._rebalance_director_segment_durations(segments, total)
+                message = str(error.exception)
+                self.assertIn("8 Director groups", message)
+                self.assertIn("32 to 120 seconds", message)
+                self.assertIn(f"requested total is {total} seconds", message)
+
+
 class StructureSegmentCountTests(unittest.TestCase):
     def test_off_by_one_cards_are_accepted_and_rebalanced(self) -> None:
         schedule = (10.0,) * 12
@@ -1278,6 +1350,99 @@ class LlamaPerformanceKwargTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as missing:
             nodes._instantiate_llama(MissingModel, {"model_path": "m"}, {"n_batch": 2048})
         self.assertIn("model file not found", str(missing.exception))
+
+
+
+
+class R2VAudioSelectionTests(unittest.TestCase):
+    """Standalone audio must survive empty AUDIOS the same way pictures do."""
+
+    def test_empty_audio_selection_falls_back_to_all_connected(self) -> None:
+        _pictures, _videos, _paired, audios = nodes._select_director_segment_assets(
+            R2V,
+            {"pictures": [1], "videos": [], "video_audios": [], "audios": []},
+            1,
+            (1,),
+            (),
+            (),
+            (1, 2),
+        )
+        self.assertEqual(audios, (1, 2))
+
+    def test_explicit_audio_selection_is_kept(self) -> None:
+        _pictures, _videos, _paired, audios = nodes._select_director_segment_assets(
+            R2V,
+            {"pictures": [], "videos": [], "video_audios": [], "audios": [2]},
+            1,
+            (),
+            (),
+            (),
+            (1, 2),
+        )
+        self.assertEqual(audios, (2,))
+
+
+class StoryShotAudioBindingTests(unittest.TestCase):
+    """NV Global @reference_audio_N (no voice-line) must still populate card audios."""
+
+    def _plan_one_shot(self):
+        beat = nodes._StoryBeatSpec(
+            index=1,
+            estimated_seconds=8.0,
+            shot_start=1,
+            shot_end=1,
+            label="b1",
+            body="",
+            key_dialogue=(),
+        )
+        return nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=8.0,
+            group_count=1,
+            estimated_sum=8.0,
+            compressed=False,
+            allocations=(8.0,),
+            card_counts=(1,),
+            segment_to_beat=(1,),
+        )
+
+    def _card(self):
+        return {
+            "index": 1,
+            "duration_raw": "8",
+            "continuity_raw": "false",
+            "beat": "placeholder",
+            "dialogue": "",
+            "handoff": "end",
+            "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+        }
+
+    def test_global_at_reference_audio_fills_empty_shot_audios(self) -> None:
+        brief = (
+            "Global\n"
+            "@reference_audio_1 hero_voice.wav\n"
+            "@reference_image_1 hero.png\n"
+            "\n"
+            "分镜1使用参考: <Picture 1>\n"
+            "角色说「你好」\n"
+        )
+        out = nodes._apply_story_shot_contract([self._card()], brief, self._plan_one_shot())
+        self.assertEqual(out[0]["assets"]["audios"], [1])
+        self.assertIn(1, out[0]["assets"]["pictures"])
+
+    def test_shot_at_reference_audio_is_collected(self) -> None:
+        brief = (
+            "Global\n"
+            "@reference_audio_1 a.wav\n"
+            "@reference_audio_2 b.wav\n"
+            "\n"
+            "分镜1使用参考: @reference_audio_2 b.wav\n"
+            "台词「开始」\n"
+        )
+        out = nodes._apply_story_shot_contract([self._card()], brief, self._plan_one_shot())
+        # Shot-local @reference_audio_2 wins over empty; global is not merged on top
+        # when the shot already named an audio tag.
+        self.assertEqual(out[0]["assets"]["audios"], [2])
 
 
 class R2VPictureSelectionTests(unittest.TestCase):
@@ -1588,16 +1753,24 @@ class CoverageKnifeTests(unittest.TestCase):
                 self.assertIsNotNone(plan)
                 self.assertEqual(plan.card_counts, (5,))
 
-    def test_single_beat_overrun_expands_to_cover_shots(self) -> None:
+    def test_overrun_follows_beat_est_not_shot_range(self) -> None:
+        """Shots 1-9 are coverage only; overrun uses beat estimated_seconds (45), not 9*segment."""
         schedule, plan = nodes._story_duration_schedule(
             self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
             allow_duration_overrun=True,
         )
-        self.assertEqual(schedule, (10.0,) * 9)
         self.assertIsNotNone(plan)
         self.assertEqual(len(plan.beats), 1)
-        self.assertEqual(plan.budget_seconds, 90.0)
-        self.assertEqual(plan.card_counts, (9,))
+        self.assertAlmostEqual(sum(schedule), 45.0, places=3)
+        self.assertEqual(plan.budget_seconds, 45.0)
+        self.assertEqual(plan.card_counts, (5,))
+        schedule15, plan15 = nodes._story_duration_schedule(
+            self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertAlmostEqual(sum(schedule15), 45.0, places=3)
+        self.assertEqual(plan15.budget_seconds, 45.0)
+        self.assertLess(sum(schedule15), 135.0)
 
     def test_single_beat_unlocked_durations_follow_dialogue(self) -> None:
         schedule, plan = nodes._story_duration_schedule(
@@ -1605,26 +1778,34 @@ class CoverageKnifeTests(unittest.TestCase):
             allow_duration_overrun=True,
         )
         assert plan is not None
+        self.assertEqual(plan.card_counts, (5,))
         _title, cards = nodes._parse_director_structure_output(self._cards_for_plan(plan))
-        cards[0]["dialogue"] += " " + _words(40)
-        cards[3]["dialogue"] = "字" * 40
-        cards[5]["dialogue"] = _words(40)
+        for card in cards:
+            card["dialogue"] = "NONE"
+        cards[0]["dialogue"] = "LANDMARK " + _words(40)
+        cards[2]["dialogue"] = _words(36)
+        cards[4]["dialogue"] = _words(36)
+        cards[1]["dialogue"] = "ok"
+        cards[3]["dialogue"] = "ok"
         segments, rebalanced, misses = nodes._segments_from_structure_cards(
             cards, R2V, schedule, (), (), (), (),
             coverage_plan=plan, locked_durations=False,
+            max_segment_seconds=10.0,
         )
         durations = [seg.duration_seconds for seg in segments]
         self.assertEqual(misses, [])
         self.assertTrue(rebalanced)
         self.assertEqual(len(segments), plan.card_counts[0])
-        self.assertAlmostEqual(sum(durations), 90.0, places=2)
-        self.assertGreater(durations[0], durations[1])
-        self.assertGreater(durations[3], durations[1])
-        self.assertGreater(durations[5], durations[1])
+        self.assertAlmostEqual(sum(durations), 45.0, places=2)
+        self.assertTrue(all(4.0 <= value <= 10.0 for value in durations))
+        heavy = (durations[0] + durations[2] + durations[4]) / 3
+        light = (durations[1] + durations[3]) / 2
+        self.assertGreater(heavy, light)
 
         locked, rebalanced, misses = nodes._segments_from_structure_cards(
             cards, R2V, schedule, (), (), (), (),
             coverage_plan=plan, locked_durations=True,
+            max_segment_seconds=10.0,
         )
         self.assertEqual([seg.duration_seconds for seg in locked], list(schedule))
         self.assertFalse(rebalanced)
@@ -1633,7 +1814,7 @@ class CoverageKnifeTests(unittest.TestCase):
     def test_single_beat_unlocked_keeps_llm_durations_when_dialogue_flat(self) -> None:
         """Coverage equal-seed must not flatten a single beat when unlock is on.
 
-        Job29-style: overrun → 9×10 host schedule, mild dialogue (spread < 8 units),
+        Overrun follows beat est (45s → 5 cards). Mild dialogue (spread < 8 units),
         but structure cards already chose an uneven rhythm. Retarget correctly stays
         off; unlocked path should still keep DURATION_SECONDS instead of N×(budget/N).
         """
@@ -1642,8 +1823,9 @@ class CoverageKnifeTests(unittest.TestCase):
             allow_duration_overrun=True,
         )
         assert plan is not None
-        self.assertEqual(schedule, (10.0,) * 9)
-        llm_durations = (12.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 8.0)
+        self.assertEqual(len(schedule), 5)
+        self.assertAlmostEqual(sum(schedule), 45.0, places=3)
+        llm_durations = (10.0, 10.0, 9.0, 8.0, 8.0)
         blocks = ["TITLE: Flat dialogue single beat"]
         for index, duration in enumerate(llm_durations, start=1):
             continuity = "false" if index == 1 else "true"
@@ -1673,15 +1855,28 @@ Handoff {index}.
         segments, rebalanced, misses = nodes._segments_from_structure_cards(
             cards, R2V, schedule, (), (), (), (),
             coverage_plan=plan, locked_durations=False,
+            max_segment_seconds=10.0,
         )
         durations = [seg.duration_seconds for seg in segments]
         self.assertEqual(misses, [])
-        self.assertEqual(len(durations), 9)
-        self.assertAlmostEqual(sum(durations), 90.0, places=2)
+        self.assertEqual(len(durations), 5)
+        self.assertAlmostEqual(sum(durations), 45.0, places=2)
+        self.assertTrue(all(4.0 <= value <= 10.0 for value in durations))
         self.assertNotEqual(durations, list(schedule))
-        self.assertGreater(durations[0], durations[-1])
-        self.assertAlmostEqual(durations[0], 12.0, places=2)
+        self.assertGreaterEqual(durations[0], durations[-1])
+        self.assertTrue(all(4.0 <= value <= 10.0 for value in durations))
+        self.assertAlmostEqual(durations[0], 10.0, places=2)
         self.assertAlmostEqual(durations[-1], 8.0, places=2)
+
+    def test_overrun_may_shrink_below_widget_via_beat_est(self) -> None:
+        brief = "[STORY_BEATS]\n1|30|1-9|arrive|LANDMARK\n[/STORY_BEATS]"
+        schedule, plan = nodes._story_duration_schedule(
+            brief, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.budget_seconds, 30.0)
+        self.assertAlmostEqual(sum(schedule), 30.0, places=3)
 
     def test_single_beat_without_overrun_keeps_requested_budget(self) -> None:
         schedule, plan = nodes._story_duration_schedule(
@@ -1708,11 +1903,20 @@ Handoff {index}.
         self.assertEqual(plan.card_counts, (4, 3))
         self.assertIsNotNone(nodes._build_coverage_knife_plan(brief, budget_seconds=70.0, group_count=7))
 
-    def test_shot_floor_over_expanded_cap_is_rejected(self) -> None:
+    def test_huge_shot_range_does_not_inflate_or_trip_ceiling(self) -> None:
+        """Shot 1-61 must not create a shot_floor; only huge beat est hits the ceiling."""
         brief = "[STORY_BEATS]\n1|45|1-61|arrive|LANDMARK\n[/STORY_BEATS]"
+        schedule, plan = nodes._story_duration_schedule(
+            brief, budget_seconds=45.0, max_segment_seconds=10.0,
+            allow_duration_overrun=True,
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.budget_seconds, 45.0)
+        self.assertAlmostEqual(sum(schedule), 45.0, places=3)
+        huge = "[STORY_BEATS]\n1|700|1-2|arrive|LANDMARK\n[/STORY_BEATS]"
         with self.assertRaisesRegex(nodes.PromptRefinerError, "safety ceiling"):
             nodes._story_duration_schedule(
-                brief, budget_seconds=45.0, max_segment_seconds=10.0,
+                huge, budget_seconds=45.0, max_segment_seconds=10.0,
                 allow_duration_overrun=True,
             )
 
@@ -1745,7 +1949,7 @@ Story body uses placeholders only: （露骨动作）（露骨台词）.
                     dialogue = "NONE"
             continuity = "false" if seg_index == 1 else "true"
             # Seed an over-long early duration to prove compression keeps trailing cards.
-            duration = 15 if beat_idx <= 5 else 4
+            duration = 10 if beat_idx <= 5 else 4
             blocks.append(
                 f"""=== SEGMENT {seg_index} ===
 DURATION_SECONDS: {duration}
@@ -1925,42 +2129,44 @@ Handoff {seg_index}.
 
 
     def test_structure_prompt_does_not_lock_equal_host_seconds(self) -> None:
-        """STORY_BEATS overrun still seeds N x 10s, but the structure prompt must not force copy."""
+        """STORY_BEATS overrun seeds from beat est, but the structure prompt must not force copy."""
         schedule, plan = nodes._story_duration_schedule(
             self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
             allow_duration_overrun=True,
         )
-        self.assertEqual(schedule, (10.0,) * 9)
+        self.assertEqual(len(schedule), 5)
+        self.assertAlmostEqual(sum(schedule), 45.0, places=3)
         assert plan is not None
-        system = nodes._long_director_structure_system(R2V, schedule, coverage_plan=plan)
+        system = nodes._long_director_structure_system(
+            R2V, schedule, coverage_plan=plan, max_segment_seconds=10.0
+        )
         self.assertNotIn("LOCKED DURATION SCHEDULE", system)
         self.assertNotIn("Copy the corresponding host duration exactly", system)
         template = _template_block(system)
-        self.assertIn("DURATION_SECONDS: <4-15>", template)
+        self.assertIn("DURATION_SECONDS: <4-10>", template)
         self.assertNotRegex(template, r"DURATION_SECONDS:\s*\d")
         self.assertNotIn("10.000", template)
-        self.assertIn("DURATION_SECONDS: <4-15>", system)
+        self.assertIn("DURATION_SECONDS: <4-10>", system)
         self.assertIn("only the average used to estimate that group count", system)
         self.assertIn("make their sum exactly", system)
-        self.assertIn("near 15", system)
+        self.assertIn("near 10", system)
         self.assertIn("near 4", system)
-        self.assertIn("90.000 seconds", system)
+        self.assertIn("45.000 seconds", system)
 
     def test_repair_keeps_variable_llm_durations_against_equal_host_seed(self) -> None:
-        """Speech that fits a long card must not overflow just because the host seed is 10s."""
+        """Unlocked repair keeps variable card times under the widget segment ceiling."""
         schedule, plan = nodes._story_duration_schedule(
             self.SINGLE_BEAT_BRIEF, budget_seconds=45.0, max_segment_seconds=10.0,
             allow_duration_overrun=True,
         )
         assert plan is not None
-        self.assertEqual(schedule, (10.0,) * 9)
-        llm_durations = (14.0, 8.0, 10.0, 12.0, 8.0, 10.0, 10.0, 10.0, 8.0)
-        self.assertAlmostEqual(sum(llm_durations), 90.0, places=3)
+        self.assertEqual(len(schedule), 5)
+        llm_durations = (10.0, 8.0, 10.0, 9.0, 8.0)
+        self.assertAlmostEqual(sum(llm_durations), 45.0, places=3)
         blocks = ["TITLE: Variable LLM rhythm"]
-        heavy = _words(28)  # ~12.4s of speech at 2.25 wps; fits 14s, exceeds equal 10s seed
         for index, duration in enumerate(llm_durations, start=1):
             continuity = "false" if index == 1 else "true"
-            dialogue = heavy if index == 1 else ("LANDMARK" if index == 2 else "NONE")
+            dialogue = "LANDMARK" if index == 1 else "NONE"
             blocks.append(
                 f"""=== SEGMENT {index} ===
 DURATION_SECONDS: {duration:g}
@@ -1993,6 +2199,946 @@ Handoff {index}.
             [float(card["duration_raw"]) for card in repaired],
             list(llm_durations),
         )
+        self.assertTrue(all(4.0 <= value <= 10.0 for value in resolved))
+
+    def test_repair_accepts_extra_natural_parts_for_overflow(self) -> None:
+        """18s overflow with max=15 may return 3 natural parts; accept and rebalance."""
+        schedule = (18.0,)
+        # Nonempty DIALOGUE so empty-dialogue clamp does not apply; split-repair runs.
+        structure = """TITLE: Overflow three beats
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+First beat action. Second beat action. Third beat action.
+DIALOGUE:
+LINE_A hello. LINE_B there. LINE_C friend.
+HANDOFF:
+Final handoff state.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(len(cards), 1)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        expected_prompt_count = len(nodes._director_duration_schedule(18.0, 15.0))
+        self.assertEqual(expected_prompt_count, 2)
+
+        def _complete(messages, _max_tokens, _seed):
+            user = messages[-1]["content"]
+            # Three natural parts with verbatim dialogue slices.
+            payload = {
+                "parts": [
+                    {
+                        "beat": "First beat action.",
+                        "dialogue": "LINE_A hello.",
+                        "handoff": "At first beat end.",
+                    },
+                    {
+                        "beat": "Second beat action.",
+                        "dialogue": "LINE_B there.",
+                        "handoff": "At second beat end.",
+                    },
+                    {
+                        "beat": "Third beat action.",
+                        "dialogue": "LINE_C friend.",
+                        "handoff": "Final handoff state.",
+                    },
+                ]
+            }
+            # Confirm the repair prompt asked for the schedule part count.
+            joined = " ".join(
+                str(m.get("content") or "") for m in messages if m.get("role") == "system"
+            )
+            self.assertIn(f"exactly {expected_prompt_count} parts", joined)
+            self.assertIn("exactly 2 parts", user)
+            return json.dumps(payload)
+
+        repaired, resolved, out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertIsNone(out_plan)
+        self.assertEqual(len(repaired), 3)
+        self.assertEqual(len(resolved), 3)
+        self.assertAlmostEqual(sum(resolved), 18.0, places=3)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+        self.assertEqual(audit["repairs"][0].get("accepted_part_count"), 3)
+        self.assertAlmostEqual(sum(audit["repairs"][0]["rebuilt_durations"]), 18.0, places=3)
+
+    def test_repair_exact_schedule_part_count_still_works(self) -> None:
+        """Matching the schedule part count keeps the original split_times."""
+        schedule = (18.0,)
+        structure = """TITLE: Overflow two beats
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+First beat action. Second beat action.
+DIALOGUE:
+LINE_A hello. LINE_B there.
+HANDOFF:
+Final handoff state.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        split = nodes._director_duration_schedule(18.0, 15.0)
+        self.assertEqual(len(split), 2)
+
+        def _complete(messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": "First beat action.",
+                        "dialogue": "LINE_A hello.",
+                        "handoff": "Mid handoff.",
+                    },
+                    {
+                        "beat": "Second beat action.",
+                        "dialogue": "LINE_B there.",
+                        "handoff": "Final handoff state.",
+                    },
+                ]
+            })
+
+        repaired, resolved, _out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(list(resolved), list(split))
+        self.assertNotIn("accepted_part_count", audit["repairs"][0])
+
+    def test_repair_clamps_empty_everything_duration_over_max(self) -> None:
+        """18s card with empty DIALOGUE and no BEAT quotes clamps; no LLM repair."""
+        schedule = (15.0,)
+        structure = """TITLE: Clamp empty everything
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Wide shot of the square. A visitor approaches the guide near the gate, then they walk on.
+DIALOGUE:
+NONE
+HANDOFF:
+Both figures continue down the path.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(nodes._clean_structure_dialogue(cards[0].get("dialogue") or ""), "")
+        self.assertEqual(nodes._beat_quoted_speech_text(cards[0]["beat"]), "")
+        self.assertEqual(nodes._structure_card_speech_seconds("", cards[0]["beat"]), 0.0)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        calls: list = []
+
+        def _complete(messages, _max_tokens, _seed):
+            calls.append(messages)
+            raise AssertionError("empty-everything clamp must not call complete")
+
+        repaired, resolved, out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertIsNone(out_plan)
+        self.assertEqual(calls, [])
+        self.assertEqual(audit["repairs"], [])
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(float(repaired[0]["duration_raw"]), 15.0)
+        self.assertIn("visitor approaches", repaired[0]["beat"])
+        self.assertEqual(nodes._clean_structure_dialogue(repaired[0].get("dialogue") or ""), "")
+        self.assertEqual(list(resolved), [15.0])
+
+    def test_repair_skips_dialogue_verbatim_when_original_empty(self) -> None:
+        """Empty original DIALOGUE skips verbatim check when split-repair still runs."""
+        schedule = (18.0,)
+        # BEAT-embedded quotes make speech countable → split (not clamp); field stays empty.
+        structure = """TITLE: Empty dialogue skip path
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+First action beat. Hero says "Please show me the quiet path to the gate today." Second action beat. Guide answers "Follow me along this road and stay close now."
+DIALOGUE:
+NONE
+HANDOFF:
+Final handoff state.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(nodes._clean_structure_dialogue(cards[0].get("dialogue") or ""), "")
+        self.assertGreater(nodes._structure_card_speech_seconds("", cards[0]["beat"]), 0.0)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+
+        def _complete(messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": 'First action beat. Hero says "Please show me the quiet path to the gate today."',
+                        "dialogue": "invented from beat quotes",
+                        "handoff": "Mid state.",
+                    },
+                    {
+                        "beat": 'Second action beat. Guide answers "Follow me along this road and stay close now."',
+                        "dialogue": "",
+                        "handoff": "Final handoff state.",
+                    },
+                ]
+            })
+
+        repaired, resolved, _out = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertEqual(len(audit["repairs"]), 1)
+        self.assertNotIn("changed or skipped dialogue", audit["repairs"][0].get("error", ""))
+        self.assertEqual(len(repaired), 2)
+        self.assertAlmostEqual(sum(resolved), 18.0, places=3)
+        # Empty-origin: host replaces model lifts with BEAT quotes in DIALOGUE.
+        joined = "\n".join(
+            nodes._clean_structure_dialogue(card.get("dialogue") or "") for card in repaired
+        )
+        self.assertIn("Please show me the quiet path to the gate today.", joined)
+        self.assertIn("Follow me along this road and stay close now.", joined)
+        self.assertNotEqual(joined.strip(), "")
+        self.assertNotIn("invented from beat quotes", joined)
+
+    def test_repair_splits_beat_embedded_quotes_with_empty_dialogue(self) -> None:
+        """Empty DIALOGUE but quoted speech in BEAT must overflow-split, not clamp."""
+        schedule = (18.0,)
+        structure = """TITLE: Beat quotes split
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Open on the square. Hero says "Please show me the quiet path to the village gate today now." Guide answers "Follow me along this road and stay close beside me please." They walk on together.
+DIALOGUE:
+NONE
+HANDOFF:
+Both continue down the path.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(nodes._clean_structure_dialogue(cards[0].get("dialogue") or ""), "")
+        beat_speech = nodes._structure_card_speech_seconds("", cards[0]["beat"])
+        self.assertGreater(beat_speech, 0.0)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        calls: list = []
+
+        def _complete(messages, _max_tokens, _seed):
+            calls.append(messages)
+            beat = cards[0]["beat"]
+            # Split beat into two contiguous verbatim slices at a natural boundary.
+            mid = beat.index("Guide answers")
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": beat[:mid].rstrip(),
+                        "dialogue": "",
+                        "handoff": "Hero has just spoken.",
+                    },
+                    {
+                        "beat": beat[mid:].lstrip(),
+                        "dialogue": "",
+                        "handoff": "Both continue down the path.",
+                    },
+                ]
+            })
+
+        repaired, resolved, out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertIsNone(out_plan)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(audit["repairs"]), 1)
+        self.assertEqual(len(repaired), 2)
+        self.assertAlmostEqual(sum(resolved), 18.0, places=3)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+        # Spoken lines lift into DIALOGUE; BEAT keeps narrative without quote duplication.
+        joined_dialogue = "\n".join(
+            nodes._clean_structure_dialogue(card.get("dialogue") or "") for card in repaired
+        )
+        self.assertIn("Please show me", joined_dialogue)
+        self.assertIn("Follow me along", joined_dialogue)
+        self.assertTrue(any(nodes._clean_structure_dialogue(c.get("dialogue") or "") for c in repaired))
+        joined_beat = " ".join(card["beat"] for card in repaired)
+        self.assertIn("Open on the square", joined_beat)
+        self.assertIn("They walk on together", joined_beat)
+        # Quotes stripped from BEAT so refine does not double-speak.
+        self.assertNotIn("Please show me", joined_beat)
+        self.assertNotIn("Follow me along", joined_beat)
+
+    def test_repair_expands_soft_target_when_speech_overflows_exceed_schedule(self) -> None:
+        """Overrun ON: speech overflows beyond 45s expand soft target and split without truncating."""
+        schedule = (15.0, 15.0, 15.0)
+        # 63 Latin words / 2.25 wps = 28.000s; 50 words = 22.222s (mirrors 27.8+22 diagnostic).
+        heavy_a = " ".join(f"alpha{i:02d}" for i in range(62))
+        heavy_b = " ".join(f"bravo{i:02d}" for i in range(50))
+        self.assertAlmostEqual(
+            nodes._dialogue_speech_units(heavy_a) / nodes._DIALOGUE_WORDS_PER_SECOND,
+            62 / nodes._DIALOGUE_WORDS_PER_SECOND,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            nodes._dialogue_speech_units(heavy_b) / nodes._DIALOGUE_WORDS_PER_SECOND,
+            50 / nodes._DIALOGUE_WORDS_PER_SECOND,
+            places=3,
+        )
+        structure = f"""TITLE: Soft overrun overflow budget
+=== SEGMENT 1 ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Wide establishing shot of the quiet square at dusk.
+DIALOGUE:
+NONE
+HANDOFF:
+Camera settles on the approaching visitor.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Visitor greets the guides near the gate and offers a friendly introduction.
+DIALOGUE:
+{heavy_a}
+HANDOFF:
+Visitor stands facing the guides with luggage at their feet.
+=== END SEGMENT ===
+=== SEGMENT 3 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+A guide welcomes the visitor and walks them toward the village path.
+DIALOGUE:
+{heavy_b}
+HANDOFF:
+Both walk away down the path as the others watch.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(len(cards), 3)
+        speech_a = nodes._structure_card_speech_seconds(cards[1].get("dialogue") or "", cards[1]["beat"])
+        speech_b = nodes._structure_card_speech_seconds(cards[2].get("dialogue") or "", cards[2]["beat"])
+        self.assertAlmostEqual(speech_a, 62 / nodes._DIALOGUE_WORDS_PER_SECOND, places=3)
+        self.assertAlmostEqual(speech_b, 50 / nodes._DIALOGUE_WORDS_PER_SECOND, places=3)
+        overflow_sum = speech_a + speech_b
+        self.assertGreater(overflow_sum, sum(schedule))
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+
+        def _complete(messages, _max_tokens, _seed):
+            user = json.loads(messages[-1]["content"])
+            beat = str(user["beat"])
+            dialogue = str(user["dialogue"])
+            durations = list(user["durations"])
+            part_count = int(user["part_count"])
+            self.assertEqual(part_count, len(durations))
+            if part_count != 2:
+                raise AssertionError(f"fixture expects 2-way split, got {part_count}")
+            # Split on whole words so each half's speech fits the assigned duration.
+            words = dialogue.split()
+            mid_words = len(words) // 2
+            dialogue_a = " ".join(words[:mid_words])
+            dialogue_b = " ".join(words[mid_words:])
+            mid_beat = max(1, len(beat) // 2)
+            beat_cut = beat.rfind(" ", 0, mid_beat)
+            if beat_cut <= 0:
+                beat_cut = mid_beat
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": beat[:beat_cut].rstrip() or beat[:mid_beat],
+                        "dialogue": dialogue_a,
+                        "handoff": "Mid handoff state.",
+                    },
+                    {
+                        "beat": beat[beat_cut:].lstrip() or beat[mid_beat:],
+                        "dialogue": dialogue_b,
+                        "handoff": str(user.get("handoff") or "Final handoff."),
+                    },
+                ]
+            })
+
+        repaired, resolved, out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertIsNone(out_plan)
+        self.assertTrue(audit.get("overflow_budget_expand"))
+        preferred = overflow_sum + 15.0  # one ordinary card at effective max
+        self.assertAlmostEqual(audit["expanded_total_seconds"], preferred, places=3)
+        self.assertAlmostEqual(sum(resolved), preferred, places=3)
+        self.assertGreater(sum(resolved), sum(schedule))
+        self.assertGreaterEqual(len(repaired), 4)  # ordinary + split overflows
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+        joined = " ".join(
+            nodes._clean_structure_dialogue(card.get("dialogue") or "")
+            for card in repaired
+        )
+        for token in heavy_a.split():
+            self.assertIn(token, joined)
+        for token in heavy_b.split():
+            self.assertIn(token, joined)
+        self.assertEqual(len(audit["repairs"]), 2)
+
+
+    def test_repair_beat_coverage_split_keeps_embedded_quotes_when_lift_overruns(self) -> None:
+        """27.778s-style empty DIALOGUE: BEAT cut across parts; quotes lifted to DIALOGUE.
+
+        Mirrors diagnostic seg2: speech lives in BEAT quotes (~28s), one lifted block
+        alone exceeds a half-slot. Coverage check must accept the BEAT split (not
+        whole-card equality). Host partitions all quotes into part DIALOGUE — no silent drop.
+        """
+        # Short tokens keep each quoted span <=120 chars (beat-quote scanner limit).
+        # 25 + 19 + 19 = 63 Latin words @ 2.25 wps = 28.000s (over 15 -> split).
+        line_a = " ".join(f"a{i:02d}" for i in range(25))
+        line_b1 = " ".join(f"b{i:02d}" for i in range(19))
+        line_b2 = " ".join(f"c{i:02d}" for i in range(19))
+        line_b = f"{line_b1} {line_b2}"
+        self.assertLessEqual(len(line_a), 120)
+        self.assertLessEqual(len(line_b1), 120)
+        self.assertLessEqual(len(line_b2), 120)
+        beat = (
+            f'Visitor greets the guides. Hero says "{line_a}" '
+            f'Then the guide steps forward. Guide answers "{line_b1}" '
+            f'Guide continues "{line_b2}" They hold still under the tree.'
+        )
+        schedule = (15.0,)
+        structure = f"""TITLE: Beat coverage empty dialogue
+=== SEGMENT 1 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+Visitor stands facing the guides.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(nodes._clean_structure_dialogue(cards[0].get("dialogue") or ""), "")
+        speech = nodes._structure_card_speech_seconds("", cards[0]["beat"])
+        self.assertAlmostEqual(speech, 63 / nodes._DIALOGUE_WORDS_PER_SECOND, places=3)
+        self.assertGreater(speech, 15.0)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        source_beat = cards[0]["beat"]
+        mid = source_beat.index("Then the guide")
+
+        def _complete(messages, _max_tokens, _seed):
+            # Attempt-1 diagnostic shape: contiguous BEAT slices keep quotes;
+            # dialogue lift puts the long block alone in part 2 (over half-slot).
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": source_beat[:mid].rstrip(),
+                        "dialogue": line_a,
+                        "handoff": "Hero has just spoken.",
+                    },
+                    {
+                        "beat": source_beat[mid:].lstrip(),
+                        "dialogue": line_b,
+                        "handoff": "Visitor stands facing the guides.",
+                    },
+                ]
+            })
+
+        repaired, resolved, _out = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(len(audit["repairs"]), 1)
+        self.assertIsNone(audit["repairs"][0].get("error"))
+        self.assertEqual(len(repaired), 2)
+        self.assertAlmostEqual(sum(resolved), speech, places=2)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+        # All countable quote words land in DIALOGUE across parts — no silent drop.
+        joined_dialogue = " ".join(
+            nodes._clean_structure_dialogue(card.get("dialogue") or "") for card in repaired
+        )
+        for token in line_a.split():
+            self.assertIn(token, joined_dialogue)
+        for token in line_b1.split():
+            self.assertIn(token, joined_dialogue)
+        for token in line_b2.split():
+            self.assertIn(token, joined_dialogue)
+        self.assertTrue(all(
+            nodes._dialogue_speech_units(nodes._clean_structure_dialogue(c.get("dialogue") or ""))
+            / nodes._DIALOGUE_WORDS_PER_SECOND
+            <= value + 0.02
+            for c, value in zip(repaired, resolved)
+        ))
+        # BEAT narrative coverage preserved; spoken quote bodies stripped from BEAT.
+        joined_beat = " ".join(card["beat"] for card in repaired)
+        self.assertIn("Visitor greets the guides", joined_beat)
+        self.assertIn("They hold still under the tree", joined_beat)
+        self.assertNotIn("a00", joined_beat)
+        self.assertNotIn("b00", joined_beat)
+        self.assertNotIn("c00", joined_beat)
+
+    def test_repair_empty_dialogue_beat_quotes_fill_part_dialogues(self) -> None:
+        """Empty DIALOGUE + BEAT quotes: after overflow repair every quote reaches DIALOGUE."""
+        schedule = (18.0,)
+        line_a = "Please show me the quiet path to the village gate today now."
+        line_b = "Follow me along this road and stay close beside me please."
+        beat = (
+            f'Open on the square. Hero says "{line_a}" '
+            f'Guide answers "{line_b}" They walk on together.'
+        )
+        structure = f"""TITLE: Empty dialogue quote lift
+=== SEGMENT 1 ===
+DURATION_SECONDS: 18
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+Both continue down the path.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(nodes._clean_structure_dialogue(cards[0].get("dialogue") or ""), "")
+        units = nodes._beat_quoted_speech_units(cards[0]["beat"])
+        self.assertEqual(units, [line_a, line_b])
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        source_beat = cards[0]["beat"]
+        mid = source_beat.index("Guide answers")
+
+        def _complete(messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": source_beat[:mid].rstrip(),
+                        "dialogue": "",
+                        "handoff": "Hero has just spoken.",
+                    },
+                    {
+                        "beat": source_beat[mid:].lstrip(),
+                        "dialogue": "",
+                        "handoff": "Both continue down the path.",
+                    },
+                ]
+            })
+
+        repaired, resolved, _out = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+        )
+        self.assertEqual(len(repaired), 2)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+        dialogues = [
+            nodes._clean_structure_dialogue(card.get("dialogue") or "") for card in repaired
+        ]
+        self.assertTrue(all(dialogues))
+        joined = "\n".join(dialogues)
+        self.assertIn(line_a, joined)
+        self.assertIn(line_b, joined)
+        # Narrative BEAT coverage across parts; quote bodies not left only-in-BEAT.
+        joined_beat = " ".join(card["beat"] for card in repaired)
+        self.assertIn("Open on the square", joined_beat)
+        self.assertIn("They walk on together", joined_beat)
+        self.assertNotIn(line_a, joined_beat)
+        self.assertNotIn(line_b, joined_beat)
+
+
+    def test_partition_long_cjk_quote_is_contiguous_prefix_remainder(self) -> None:
+        """One long BEAT quote split across parts must be prefix|suffix with no restart.
+
+        Regression: adjacent Director groups duplicated the opening phrase when a
+        single quote exceeded one duration slot — part B restarted the whole line
+        instead of continuing only the leftover remainder.
+        """
+        quote = (
+            "哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。"
+            "这条路虽远，但风景正好，你跟紧姐姐，莫要掉队。"
+        )
+        # Two unequal slots so part1 takes a mid-utterance prefix of the one unit.
+        assigned = nodes._partition_quote_units_by_duration(
+            [quote], [3.0, 6.0], ceiling=6.0,
+        )
+        self.assertEqual(len(assigned), 2)
+        part_a, part_b = assigned
+        self.assertTrue(part_a.strip())
+        self.assertTrue(part_b.strip())
+        norm_a = part_a.replace(" ", "")
+        norm_b = part_b.replace(" ", "")
+        norm_q = quote.replace(" ", "")
+        # Contiguous coverage of the original line.
+        self.assertEqual(norm_a + norm_b, norm_q)
+        # No restart: part B must not begin with part A's spoken prefix.
+        self.assertFalse(norm_b.startswith(norm_a))
+        # Opening phrase lands only in part A when the cut falls after it.
+        opening = "哎呦，姐姐最喜欢这嘴甜的弟弟"
+        if opening in norm_a:
+            self.assertNotIn(opening, norm_b)
+
+    
+    def test_split_speech_prefers_chinese_punct_at_or_before_budget(self) -> None:
+        """Mid-unit cut lands on 。！？；， nearest the budget when marks exist."""
+        quote = (
+            "哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。"
+            "这条路虽远，但风景正好，你跟紧姐姐，莫要掉队。"
+        )
+        # Budget just past the first period: cut after 。 not mid-phrase before 了。
+        head, tail = nodes._split_speech_text_at_seconds(quote, 3.2)
+        self.assertTrue(head.endswith("。"))
+        self.assertEqual(head + tail, quote)
+        self.assertFalse(tail.startswith(head))
+        self.assertTrue(tail.startswith("既然"))
+
+        # Budget near a clause comma: prefer ， nearest budget over a coarser token cut.
+        head2, tail2 = nodes._split_speech_text_at_seconds(quote, 5.0)
+        self.assertTrue(head2.endswith("，") or head2.endswith("。"))
+        self.assertEqual(head2 + tail2, quote)
+        self.assertFalse(tail2.replace(" ", "").startswith(head2.replace(" ", "")))
+        # Nearest preferred mark at/before 5.0s is the clause comma after 说了.
+        self.assertTrue(head2.endswith("说了，"))
+
+    def test_partition_long_cjk_quote_prefers_punct_boundaries(self) -> None:
+        """Duration partition mid-splits end on punct when the slot budget allows."""
+        quote = (
+            "哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。"
+            "这条路虽远，但风景正好，你跟紧姐姐，莫要掉队。"
+        )
+        assigned = nodes._partition_quote_units_by_duration(
+            [quote], [3.2, 8.0], ceiling=8.0,
+        )
+        self.assertEqual(len(assigned), 2)
+        part_a, part_b = assigned
+        norm_a = part_a.replace(" ", "")
+        norm_b = part_b.replace(" ", "")
+        self.assertEqual(norm_a + norm_b, quote.replace(" ", ""))
+        self.assertFalse(norm_b.startswith(norm_a))
+        self.assertTrue(part_a.endswith("。"))
+        self.assertTrue(part_b.startswith("既然"))
+        # Final part keeps the leftover speech untruncated.
+        self.assertTrue(part_b.endswith("队。"))
+
+
+    def test_force_assigned_dialogue_replaces_brief_restart_in_refine_prompt(self) -> None:
+        """Refine must not keep a full-line <d> when structure assigned only a slice."""
+        assigned = "既然你都这么说了，姐姐我自然要亲自领你去了。"
+        prompt = (
+            "detailed_description:\\n"
+            "[Shot 1] She smiles and says: "
+            "<d>[Chinese] 哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。</d>\\n\\n"
+            "overall_soundscape:\\n"
+            "Courtyard tone.\\n"
+        )
+        out = nodes._force_assigned_dialogue_in_prompt(prompt, assigned)
+        self.assertIn(assigned, out)
+        self.assertNotIn("哎呦，姐姐最喜欢这嘴甜的弟弟了", out)
+        self.assertIn("<d>[Chinese]", out)
+
+    def test_repair_empty_origin_long_quote_parts_have_no_dialogue_prefix_overlap(self) -> None:
+        """Empty-origin overflow: host partition keeps adjacent DIALOGUE non-overlapping."""
+        quote = (
+            "哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。"
+            "这条路虽远，但风景正好，你跟紧姐姐，莫要掉队，走到尽头便是那座小院啊。"
+            "那里还有新鲜瓜果和清茶，咱们慢慢走也不迟。"
+        )
+        self.assertLessEqual(len(quote), 120)
+        self.assertGreater(
+            nodes._speech_seconds_of_text(quote),
+            nodes.MAX_DIRECTOR_SEGMENT_SECONDS,
+        )
+        beat = f"堂内。姐姐笑着说「{quote}」然后起身带路。"
+        structure = f"""TITLE: Long CJK quote partition
+=== SEGMENT 1 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+两人离开堂内。
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        schedule = (15.0,)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        source = cards[0]["beat"]
+        mid = source.index("然后起身")
+
+        def _complete(messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {"beat": source[:mid].rstrip(), "dialogue": "", "handoff": "姐姐刚说完。"},
+                    {"beat": source[mid:].lstrip(), "dialogue": "", "handoff": "两人离开堂内。"},
+                ]
+            }, ensure_ascii=False)
+
+        repaired, resolved, _out = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertGreaterEqual(len(repaired), 2)
+        dialogues = [
+            nodes._clean_structure_dialogue(card.get("dialogue") or "")
+            for card in repaired
+        ]
+        self.assertTrue(all(dialogues))
+        norms = [text.replace(" ", "") for text in dialogues]
+        self.assertEqual("".join(norms), quote.replace(" ", ""))
+        for left, right in zip(norms, norms[1:]):
+            self.assertFalse(right.startswith(left))
+            # Shared opening phrase must not appear in both adjacent parts.
+            opening = "哎呦，姐姐最喜欢这嘴甜的弟弟"
+            if opening in left:
+                self.assertNotIn(opening, right)
+
+
+
+    def test_repair_punct_cut_over_max_tail_splits_into_more_parts(self) -> None:
+        """Punct-preferring partition leaving a >max tail must add parts, not abort.
+
+        Mirrors diagnostic seg2: empty DIALOGUE, two long CJK BEAT quotes (~27.8s),
+        2-way host schedule. Punct cut parks most of quote2 in part2 (>15s). Ensure-fit
+        raises durations to speech and re-splits over-max parts at punctuation.
+        """
+        q1 = (
+            "各位漂亮姐姐好，我是新来这里上任的，大家叫我小程就可以。"
+            "不知道村部怎么走，还望哪位神仙姐姐行个方便，给我指条路。"
+        )
+        q2 = (
+            "哎呦，姐姐最喜欢这嘴甜的弟弟了。既然你都这么说了，姐姐我自然要亲自领你去了。"
+            "记住，以后叫姐姐柳二姐。都是一个村里住着的，咱们又这么投缘，"
+            "以后有啥事和姐姐说，姐姐一定帮你。"
+        )
+        self.assertLessEqual(len(q1), 120)
+        self.assertLessEqual(len(q2), 120)
+        speech_total = nodes._speech_seconds_of_text(q1) + nodes._speech_seconds_of_text(q2)
+        self.assertGreater(nodes._speech_seconds_of_text(q2), nodes.MAX_DIRECTOR_SEGMENT_SECONDS)
+        self.assertAlmostEqual(speech_total, 27.778, places=2)
+
+        # Show the 2-slot punct partition alone would leave an over-max tail.
+        two_slot = nodes._director_duration_schedule(speech_total, 15.0)
+        self.assertEqual(len(two_slot), 2)
+        partitioned = nodes._partition_quote_units_by_duration([q1, q2], two_slot, ceiling=15.0)
+        self.assertTrue(
+            any(nodes._speech_seconds_of_text(p) > 15.02 for p in partitioned),
+            "fixture requires an over-max tail after punct partition",
+        )
+
+        beat = (
+            f"分镜4: 小程向妇女们自我介绍。小程「{q1}」"
+            f"分镜5: 妇女们的目光。"
+            f"分镜6: 柳二姐起身走近。柳二姐「{q2}」"
+        )
+        schedule = (15.0, 15.0, 15.0)
+        structure = f"""TITLE: Punct cut duration fit
+=== SEGMENT 1 ===
+DURATION_SECONDS: 12
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Wide establishing shot of the village entrance at dusk.
+DIALOGUE:
+NONE
+HANDOFF:
+Camera settles on the approaching visitor.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES: 1
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+{beat}
+DIALOGUE:
+NONE
+HANDOFF:
+Xiaocheng stands with his suitcase beside him.
+=== END SEGMENT ===
+=== SEGMENT 3 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES: 1, 2
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+They begin walking down the village path together.
+DIALOGUE:
+NONE
+HANDOFF:
+Both walk away down the path as the others watch.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+        source = cards[1]["beat"]
+        mid = source.index("分镜5")
+
+        def _complete(messages, _max_tokens, _seed):
+            user = json.loads(messages[1]["content"])
+            part_count = int(user["part_count"])
+            self.assertEqual(part_count, 2)
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": source[:mid].rstrip(),
+                        "dialogue": "",
+                        "handoff": "Xiaocheng finishes his introduction.",
+                    },
+                    {
+                        "beat": source[mid:].lstrip(),
+                        "dialogue": "",
+                        "handoff": "Xiaocheng stands with his suitcase beside him.",
+                    },
+                ]
+            }, ensure_ascii=False)
+
+        repaired, resolved, _out = nodes._repair_structure_duration_cards(
+            cards, schedule, None, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(len(audit["repairs"]), 1)
+        self.assertIsNone(audit["repairs"][0].get("error"))
+        # Over-max tail forced extra parts beyond the initial 2-way schedule.
+        self.assertGreaterEqual(audit["repairs"][0].get("fitted_part_count", 0), 3)
+        seg2_cards = [
+            card for card in repaired
+            if "小程" in (card.get("dialogue") or "") or "姐姐" in (card.get("dialogue") or "")
+            or "柳二" in (card.get("dialogue") or "")
+        ]
+        # All speech words survive across DIALOGUE parts; no prefix overlap.
+        dialogues = [
+            nodes._clean_structure_dialogue(card.get("dialogue") or "")
+            for card in repaired
+            if nodes._clean_structure_dialogue(card.get("dialogue") or "")
+        ]
+        self.assertGreaterEqual(len(dialogues), 3)
+        joined = "".join(text.replace(" ", "") for text in dialogues)
+        self.assertIn(q1.replace(" ", ""), joined)
+        self.assertIn(q2.replace(" ", ""), joined)
+        norms = [text.replace(" ", "") for text in dialogues]
+        for left, right in zip(norms, norms[1:]):
+            self.assertFalse(right.startswith(left))
+        for card, duration in zip(repaired, resolved):
+            speech = nodes._speech_seconds_of_text(
+                nodes._clean_structure_dialogue(card.get("dialogue") or "")
+            )
+            if speech > 0.02:
+                self.assertLessEqual(speech, duration + 0.02)
+                self.assertLessEqual(duration, 15.0 + 0.001)
+                self.assertGreaterEqual(duration, speech - 0.02)
+        self.assertTrue(all(4.0 <= value <= 15.0 for value in resolved))
+
+
+    def test_repair_still_errors_when_speech_overflows_exceed_schedule_without_overrun(self) -> None:
+
+        """Overrun OFF: same overflows against 45 still error and ask to raise total / enable overrun."""
+        schedule = (15.0, 15.0, 15.0)
+        heavy_a = " ".join(f"alpha{i:02d}" for i in range(62))
+        heavy_b = " ".join(f"bravo{i:02d}" for i in range(50))
+        structure = f"""TITLE: Hard budget overflow
+=== SEGMENT 1 ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Wide establishing shot of the quiet square at dusk.
+DIALOGUE:
+NONE
+HANDOFF:
+Camera settles on the approaching visitor.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Visitor greets the guides near the gate and offers a friendly introduction.
+DIALOGUE:
+{heavy_a}
+HANDOFF:
+Visitor stands facing the guides with luggage at their feet.
+=== END SEGMENT ===
+=== SEGMENT 3 ===
+DURATION_SECONDS: 15
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+A guide welcomes the visitor and walks them toward the village path.
+DIALOGUE:
+{heavy_b}
+HANDOFF:
+Both walk away down the path as the others watch.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+
+        def _complete(*_args, **_kwargs):
+            raise AssertionError("repair must fail before calling complete when overrun is off")
+
+        with self.assertRaises(nodes.PromptRefinerError) as ctx:
+            nodes._repair_structure_duration_cards(
+                cards, schedule, None, _complete, 1024, 0, audit,
+                max_segment_seconds=15.0,
+                allow_duration_overrun=False,
+            )
+        message = str(ctx.exception)
+        self.assertIn("Cannot safely repair", message)
+        self.assertIn("allow_duration_overrun", message)
+        self.assertIn("target=45.000s", message)
+        self.assertNotIn("overflow_budget_expand", audit)
+        self.assertEqual(audit["repairs"], [])
 
     def test_modest_dialogue_imbalance_retargets_flat_equal_split(self) -> None:
         """Backup: lowered MIN_UNITS should retarget when LLM echoes host equals."""
@@ -2018,11 +3164,13 @@ Handoff {index}.
         segments, rebalanced, misses = nodes._segments_from_structure_cards(
             cards, R2V, schedule, (), (), (), (),
             coverage_plan=plan, locked_durations=False,
+        max_segment_seconds=10.0,
         )
         durations = [seg.duration_seconds for seg in segments]
         self.assertEqual(misses, [])
         self.assertTrue(rebalanced)
-        self.assertAlmostEqual(sum(durations), 90.0, places=2)
+        self.assertAlmostEqual(sum(durations), 45.0, places=2)
+        self.assertTrue(all(4.0 <= value <= 10.0 for value in durations))
         self.assertGreater(durations[0], durations[1])
 
     def test_header_beat_labels_are_detected_without_machine_block(self) -> None:
@@ -2045,3 +3193,127 @@ Handoff {index}.
         self.assertIsNone(
             nodes._build_coverage_knife_plan(brief, budget_seconds=60.0, group_count=6)
         )
+
+
+class AudioVoiceLabelTests(unittest.TestCase):
+    """Standalone <Audio N> is a character voice ref, never ambient/Foley."""
+
+    def test_extract_keeps_handwritten_speaker_labels(self) -> None:
+        brief = (
+            "Global\n"
+            "@reference_audio_1 小程声音参考, @reference_audio_2 柳二姐声音参考.\n"
+            "小程「你好」\n"
+            "柳二姐「嗯」\n"
+        )
+        labels = nodes._extract_audio_voice_labels(brief)
+        self.assertEqual(nodes._speaker_from_audio_label(labels[1]), "小程")
+        self.assertEqual(nodes._speaker_from_audio_label(labels[2]), "柳二姐")
+
+    def test_normalize_preserves_trailing_voice_label(self) -> None:
+        brief = "@reference_audio_1 小程声音参考, @reference_image_1 face.png"
+        out = nodes._normalize_director_asset_links(brief, {1: "img"}, {}, {1: "audio"}, {})
+        self.assertIn("<Audio 1> 小程声音参考", out)
+        self.assertIn("<Picture 1>", out)
+        self.assertNotIn("@reference_audio_1", out)
+
+    def test_uuid_filename_is_not_a_speaker_name(self) -> None:
+        uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        brief = f"@reference_audio_1 {uuid}.wav\n小程「过来」\n"
+        labels = nodes._extract_audio_voice_labels(brief)
+        self.assertEqual(labels[1], f"{uuid}.wav")
+        self.assertEqual(nodes._speaker_from_audio_label(labels[1]), "")
+        bindings = nodes._resolve_audio_speaker_bindings((1,), labels, brief)
+        self.assertEqual(bindings.get(1), "小程")
+
+    def test_inventory_forbids_ambient_even_for_uuid(self) -> None:
+        uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        brief = f"@reference_audio_1 {uuid}\n妇女「坐下」\n"
+        lines = nodes._director_long_inventory_lines(
+            (),
+            (),
+            (1,),
+            (),
+            audio_labels=nodes._extract_audio_voice_labels(brief),
+            context_text=brief,
+        )
+        joined = "\n".join(lines)
+        self.assertIn("<Audio 1>", joined)
+        self.assertIn("voice/timbre", joined)
+        self.assertIn("NOT ambient", joined)
+        self.assertIn("妇女", joined)
+        self.assertNotRegex(joined, r"(?i)cicada|seeds\s+Foley|Ambient village|瓜子")
+        self.assertIn("NOT ambient noise, Foley, or SFX", joined)
+
+    def test_ensure_rewrites_ambient_and_not_used_when_dialogue_present(self) -> None:
+        prompt = (
+            "subject_definitions:\nS1.\n\n"
+            "summary:\nBeat.\n\n"
+            "retention_analysis:\n"
+            "<Audio 1>/<Audio 2>: Not used in this segment; no audio cue assigned.\n"
+            "<Audio 1>: Ambient village/cicada bed.\n"
+            "<Audio 2>: seeds Foley.\n\n"
+            "detailed_description:\n"
+            "小程 says <d>[Chinese] 你好</d> then 柳二姐 <d>[Chinese] 嗯</d>.\n\n"
+            "overall_soundscape:\nWind.\n\n"
+            "non_diegetic_music:\nN/A\n"
+        )
+        labels = {
+            1: "小程声音参考",
+            2: "柳二姐声音参考",
+        }
+        out = nodes._ensure_full_reference_audio_voice_labels(
+            prompt,
+            (1, 2),
+            labels,
+            context_text="小程「你好」\n柳二姐「嗯」",
+        )
+        self.assertNotRegex(out, r"(?i)Not used in this segment")
+        self.assertNotRegex(out, r"(?i)cicada|seeds Foley|Ambient village")
+        self.assertIn("小程", out)
+        self.assertIn("柳二姐", out)
+        self.assertRegex(out, r"<Audio 1>: retain voice/timbre")
+        self.assertRegex(out, r"<Audio 2>: retain voice/timbre")
+
+    def test_story_shot_binds_handwritten_voice_to_quoted_speaker(self) -> None:
+        beat = nodes._StoryBeatSpec(
+            index=1,
+            estimated_seconds=8.0,
+            shot_start=1,
+            shot_end=1,
+            label="b1",
+            body="",
+            key_dialogue=(),
+        )
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=8.0,
+            group_count=1,
+            estimated_sum=8.0,
+            compressed=False,
+            allocations=(8.0,),
+            card_counts=(1,),
+            segment_to_beat=(1,),
+        )
+        card = {
+            "index": 1,
+            "duration_raw": "8",
+            "continuity_raw": "false",
+            "beat": "placeholder",
+            "dialogue": "",
+            "handoff": "end",
+            "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+        }
+        brief = (
+            "Global\n"
+            "@reference_audio_1 小程声音参考\n"
+            "@reference_audio_2 柳二姐声音参考\n"
+            "\n"
+            "分镜1使用参考: <Picture 1>\n"
+            "小程「你好啊」\n"
+        )
+        normalized = nodes._normalize_director_asset_links(
+            brief, {1: "img"}, {}, {1: "a", 2: "b"}, {}
+        )
+        out = nodes._apply_story_shot_contract([card], normalized, plan)
+        self.assertIn(1, out[0]["assets"]["audios"])
+

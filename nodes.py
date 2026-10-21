@@ -123,6 +123,22 @@ MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS = 600.0
 _DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER = "<4-15>"
 
 
+def _effective_max_segment_seconds(max_segment_seconds: float | None = None) -> float:
+    """Clamp the host per-group ceiling into the legal H3 range (default 15)."""
+
+    if max_segment_seconds is None:
+        return MAX_DIRECTOR_SEGMENT_SECONDS
+    return min(
+        MAX_DIRECTOR_SEGMENT_SECONDS,
+        max(MIN_DIRECTOR_SEGMENT_SECONDS, float(max_segment_seconds)),
+    )
+
+
+def _director_duration_template_placeholder(max_segment_seconds: float | None = None) -> str:
+    cap = _effective_max_segment_seconds(max_segment_seconds)
+    return f"<{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}-{cap:g}>"
+
+
 @dataclass(frozen=True)
 class _DirectorLongQualityProfile:
     """Output-density settings for Director group prompts.
@@ -974,7 +990,13 @@ def _normalize_asset_links(
             raise PromptRefinerError(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
-        return f"<{labels[kind]} {slot}>"
+        tag = f"<{labels[kind]} {slot}>"
+        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
+        if kind == "audio":
+            trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
+            if trailing:
+                return tag + trailing.group(0)
+        return tag
 
     return pattern.sub(replace, brief)
 
@@ -1078,7 +1100,13 @@ def _normalize_director_asset_links(
             raise PromptRefinerError(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
-        return f"<{labels[kind]} {slot}>"
+        tag = f"<{labels[kind]} {slot}>"
+        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
+        if kind == "audio":
+            trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
+            if trailing:
+                return tag + trailing.group(0)
+        return tag
 
     return re.sub(r"@reference_(image|video|audio)_([1-9])\b", replace_asset, brief, flags=re.IGNORECASE)
 
@@ -1225,9 +1253,12 @@ H3 production contract for every R2V prompt:
    <d>[Language] exact dialogue</d>; preserve user wording and language, use one speaker per shot when possible, and
    keep speech below about 2–2.5 words per available second after visible action.
 5. overall_soundscape: use one to four English sentences describing continuous ambient sound, physical foley, and
-   non-verbal human sound across this group. Never repeat dialogue or music here.
+   non-verbal human sound across this group. Never repeat dialogue or music here. Never name <Audio N> here;
+   ambient/Foley belong only in this field, while <Audio N> stays a voice/timbre reference in retention_analysis.
 6. non_diegetic_music: use N/A when no score is requested; otherwise specify instruments, rhythm, and dynamic change,
    never merely an abstract mood word.
+
+{_AUDIO_VOICE_CONTRACT}
 
 For FL2V, apply the same chronological shot, dialogue, sound, and observability rules inside
 integrated_multimodal_description, using [Shot 1] and later timestamped shots. Preserve keyframe composition and make
@@ -1263,7 +1294,14 @@ def _build_long_director_request(
     standalone_audios = sorted(set(audio_slots))
     paired_audios = sorted(set(video_audio_slots))
     engine = _director_mode_engine(mode)
-    inventory = _director_long_inventory_lines(images, videos, standalone_audios, paired_audios)
+    inventory = _director_long_inventory_lines(
+        images,
+        videos,
+        standalone_audios,
+        paired_audios,
+        audio_labels=_extract_audio_voice_labels(brief),
+        context_text=brief,
+    )
     prompt = f"{ENGINE_TAGS[engine]}\nLong-video project brief:\n{brief.strip()}"
     if inventory:
         prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
@@ -1470,9 +1508,14 @@ def _director_long_inventory_lines(
     director_videos: Iterable[_DirectorVideoFrames],
     audio_slots: Iterable[int],
     video_audio_slots: Iterable[int],
+    audio_labels: dict[int, str] | None = None,
+    context_text: str = "",
 ) -> list[str]:
     """List the references actually attached to this completion."""
 
+    labels = audio_labels or {}
+    slots = tuple(sorted(set(audio_slots)))
+    bindings = _resolve_audio_speaker_bindings(slots, labels, context_text)
     inventory = [f"<Picture {slot}>: connected image reference." for slot, _ in image_references]
     inventory.extend(
         f"<Video {video.slot}>: connected Director IMAGE frame batch; {len(video.frame_uris)} visual samples attached."
@@ -1483,8 +1526,8 @@ def _director_long_inventory_lines(
         for slot in sorted(set(video_audio_slots))
     )
     inventory.extend(
-        f"<Audio {slot}>: connected standalone audio; raw audio is not transcribed by Qwen-VL."
-        for slot in sorted(set(audio_slots))
+        _audio_voice_inventory_line(slot, labels.get(slot, ""), speaker=bindings.get(slot, ""))
+        for slot in slots
     )
     return inventory
 
@@ -1539,7 +1582,15 @@ def _select_director_segment_assets(
         pictures = tuple(sorted(set(image_slots)))
     videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
     paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
-    audios = _plan_slot_list(raw_assets.get("audios"), audio_slots, "audios")
+    # Same empty-list rescue as pictures: Qwen-VL cannot hear audio, so structure
+    # cards / coverage knife often emit audios:[]. Without this, connected
+    # reference_audio_* never reach ui_specs or materialized Group ref_audio pins.
+    audios = _plan_slot_list(
+        raw_assets.get("audios"),
+        audio_slots,
+        "audios",
+        fallback_when_empty=True,
+    )
     if any(slot not in videos for slot in paired):
         raise PromptRefinerError(
             f"Director plan segment {index} selected a paired video-audio slot without its matching video slot."
@@ -1599,6 +1650,71 @@ def _decorate_full_reference_prompt(
     return _ensure_full_reference_picture_labels(prompt, picture_slots)
 
 
+def _force_assigned_dialogue_in_prompt(prompt: str, dialogue: str) -> str:
+    """Replace refined <d> bodies with structure-assigned DIALOGUE (no brief restart).
+
+    Structure partition may split one spoken line across adjacent groups as
+    prefix|remainder. Refine still sees the full line in the project brief and
+    can restart it. When DIALOGUE is pre-assigned, pin <d> contents to that
+    assignment so adjacent groups never re-speak a shared prefix.
+    """
+
+    cleaned = _clean_structure_dialogue(dialogue)
+    if not cleaned or not (prompt or "").strip():
+        return prompt
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return prompt
+    pattern = re.compile(
+        r"(<d>\s*\[[^\]\n]+\]\s*)(.*?)(</d>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    matches = list(pattern.finditer(prompt))
+    if not matches:
+        first = lines[0]
+        lang0 = "Chinese" if _CJK_SPEECH_CHAR.search(first) else "English"
+        injection = f"<d>[{lang0}] {first}</d>"
+        for more in lines[1:]:
+            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
+            injection += f"\n<d>[{lang}] {more}</d>"
+        anchor = re.search(r"(?im)^overall_soundscape\s*:", prompt)
+        if anchor:
+            return prompt[: anchor.start()].rstrip() + "\n" + injection + "\n" + prompt[anchor.start() :]
+        return prompt.rstrip() + "\n" + injection
+
+    out = prompt
+    if len(lines) == 1:
+        first = matches[0]
+        replacement = f"{first.group(1)}{lines[0]}{first.group(3)}"
+        pieces: list[tuple[int, int, str]] = [(first.start(), first.end(), replacement)]
+        for match in matches[1:]:
+            pieces.append((match.start(), match.end(), ""))
+        for start_i, end_i, repl in reversed(pieces):
+            out = out[:start_i] + repl + out[end_i:]
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out
+
+    for index, match in reversed(list(enumerate(matches))):
+        if index < len(lines):
+            repl = f"{match.group(1)}{lines[index]}{match.group(3)}"
+        else:
+            repl = ""
+        out = out[: match.start()] + repl + out[match.end() :]
+    if len(lines) > len(matches):
+        extras = []
+        for more in lines[len(matches) :]:
+            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
+            extras.append(f"<d>[{lang}] {more}</d>")
+        block = "\n".join(extras)
+        anchor = re.search(r"(?im)^overall_soundscape\s*:", out)
+        if anchor:
+            out = out[: anchor.start()].rstrip() + "\n" + block + "\n" + out[anchor.start() :]
+        else:
+            out = out.rstrip() + "\n" + block
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
 def _finalize_director_segment_prompt(
     text: str,
     *,
@@ -1608,6 +1724,8 @@ def _finalize_director_segment_prompt(
     index: int,
     required_shot_ids: Iterable[int] = (),
     shot_contract_text: str = "",
+    audio_slots: Iterable[int] = (),
+    audio_labels: dict[int, str] | None = None,
 ) -> str:
     """Accept one group's H3 prompt, or raise a segment-specific error for retry."""
 
@@ -1671,7 +1789,16 @@ def _finalize_director_segment_prompt(
             prompt = prompt[:anchor.start()].rstrip() + "\n" + insertion + "\n" + prompt[anchor.start():]
         else:
             prompt = prompt.rstrip() + "\n" + insertion
-    return _decorate_full_reference_prompt(prompt, engine, picture_slots, lora_triggers)
+    prompt = _decorate_full_reference_prompt(prompt, engine, picture_slots, lora_triggers)
+    # Audio voice retention is applied by the caller AFTER dialogue forcing, so
+    # unused-vs-bound decisions see the final <d> lines. Keep a first-pass here
+    # for callers that do not re-run ensure.
+    return _ensure_full_reference_audio_voice_labels(
+        prompt,
+        audio_slots,
+        audio_labels,
+        context_text=shot_contract_text,
+    )
 
 
 def _assigned_brief_shot_ids(text: str) -> tuple[int, ...]:
@@ -1762,15 +1889,18 @@ def _structure_handoff(value: str, beat: str) -> str:
     return text
 
 
-def _parse_duration_token(raw: str, index: int) -> float:
+def _parse_duration_token(
+    raw: str, index: int, *, max_segment_seconds: float | None = None
+) -> float:
     match = re.fullmatch(r"\s*([+-]?\d+(?:\.\d+)?)\s*(?:s|seconds?)?\s*", raw or "", re.IGNORECASE)
     if not match:
         raise PromptRefinerError(f"Director plan segment {index} is missing a valid DURATION_SECONDS value.")
     duration = float(match.group(1))
-    if not MIN_DIRECTOR_SEGMENT_SECONDS <= duration <= MAX_DIRECTOR_SEGMENT_SECONDS:
+    cap = _effective_max_segment_seconds(max_segment_seconds)
+    if not MIN_DIRECTOR_SEGMENT_SECONDS <= duration <= cap:
         raise PromptRefinerError(
             f"Director plan segment {index} is {duration:.3f}s; every H3 group must be "
-            f"{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{MAX_DIRECTOR_SEGMENT_SECONDS:.0f}s."
+            f"{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{cap:g}s."
         )
     return round(duration, 3)
 
@@ -1809,9 +1939,22 @@ def _parse_director_structure_output(text: str) -> tuple[str, list[dict[str, Any
         r"^\s*===\s*END\s+SEGMENT(?:\s+\d+)?\s*===\s*$",
         flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
+    blocks = [(match.group(1), match.group(2), False) for match in block_pattern.finditer(cleaned)]
+    end_markers = list(re.finditer(
+        r"^\s*===\s*END\s+SEGMENT(?:\s+\d+)?\s*===\s*$",
+        cleaned, flags=re.IGNORECASE | re.MULTILINE,
+    ))
+    tail = cleaned[end_markers[-1].end():] if end_markers else cleaned
+    open_starts = list(re.finditer(
+        r"^\s*===\s*SEGMENT\s+(\d+)\s*===\s*$",
+        tail, flags=re.IGNORECASE | re.MULTILINE,
+    ))
+    if open_starts:
+        last_start = open_starts[-1]
+        blocks.append((last_start.group(1), tail[last_start.end():], True))
     cards: list[dict[str, Any]] = []
-    for match in block_pattern.finditer(cleaned):
-        fields = _marked_plan_fields(match.group(2))
+    for index, block, unfinished in blocks:
+        fields = _marked_plan_fields(block)
         beat = fields.get("BEAT", "").strip()
         dialogue = fields.get("DIALOGUE", "").strip()
         handoff = fields.get("HANDOFF", "").strip()
@@ -1821,9 +1964,11 @@ def _parse_director_structure_output(text: str) -> tuple[str, list[dict[str, Any
             beat = _clip_text(prompt, 1500)
             if not dialogue and spoken:
                 dialogue = "\n".join(spoken)
+        if unfinished and not beat:
+            continue
         cards.append(
             {
-                "index": int(match.group(1)),
+                "index": int(index),
                 "duration_raw": fields.get("DURATION_SECONDS", ""),
                 "continuity_raw": fields.get("CONTINUITY_FROM_PREV"),
                 "assets": {
@@ -1940,7 +2085,264 @@ def _dialogue_speech_units(text: str) -> float:
     return float(word_count) + cjk_count / _CJK_CHARS_PER_ENGLISH_WORD
 
 
-def _ideal_durations_for_speech(units: Iterable[float]) -> list[float]:
+_BEAT_ASCII_DOUBLE_QUOTE = re.compile(r'"([^"\n]{2,120})"')
+_BEAT_CURLY_DOUBLE_QUOTE = re.compile(r"[“]([^”]{2,120})[”]")
+
+
+def _beat_quote_pattern_list() -> tuple[re.Pattern[str], ...]:
+    """Corner-bracket + ASCII/curly double-quote scanners (module-level patterns)."""
+
+    return (_DIALOGUE_QUOTE, _BEAT_ASCII_DOUBLE_QUOTE, _BEAT_CURLY_DOUBLE_QUOTE)
+
+
+def _iter_beat_quote_matches(beat: str) -> list[re.Match[str]]:
+    """Quote matches in document order; overlapping hits keep the earliest span."""
+
+    raw = beat or ""
+    matches: list[re.Match[str]] = []
+    for pattern in _beat_quote_pattern_list():
+        matches.extend(pattern.finditer(raw))
+    matches.sort(key=lambda match: (match.start(), -(match.end() - match.start())))
+    ordered: list[re.Match[str]] = []
+    last_end = -1
+    for match in matches:
+        if match.start() < last_end:
+            continue
+        token = match.group(1).strip()
+        if len(token) < 2:
+            continue
+        ordered.append(match)
+        last_end = match.end()
+    return ordered
+
+
+def _beat_quoted_speech_units(beat: str) -> list[str]:
+    """Ordered spoken inners from BEAT quotes (NV empty-DIALOGUE case)."""
+
+    return [match.group(1).strip() for match in _iter_beat_quote_matches(beat)]
+
+
+def _beat_quoted_speech_text(beat: str) -> str:
+    """Join quoted / corner-bracket spoken spans from a BEAT body (NV empty-DIALOGUE case)."""
+
+    return "\n".join(_beat_quoted_speech_units(beat))
+
+
+def _speech_seconds_of_text(text: str) -> float:
+    return _dialogue_speech_units(text) / _DIALOGUE_WORDS_PER_SECOND
+
+
+def _tokenize_speech_pieces(text: str) -> list[str]:
+    """Split speech into Latin words and CJK characters for budget cuts."""
+
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    pieces: list[str] = []
+    cursor = 0
+    for match in re.finditer(
+        r"[A-Za-z0-9]+(?:[''\u2019][A-Za-z0-9]+)?|[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9d]",
+        raw,
+    ):
+        if match.start() > cursor and raw[cursor:match.start()].strip():
+            # Keep intervening punctuation attached to the previous piece when possible.
+            gap = raw[cursor:match.start()]
+            if pieces and not gap.isspace():
+                pieces[-1] = pieces[-1] + gap.rstrip()
+        pieces.append(match.group(0))
+        cursor = match.end()
+    if cursor < len(raw) and pieces:
+        tail = raw[cursor:].strip()
+        if tail:
+            pieces[-1] = pieces[-1] + tail
+    return pieces
+
+
+def _join_speech_pieces(pieces: list[str]) -> str:
+    if not pieces:
+        return ""
+    _trail_punct = ",.!?;:，。！？、；："
+    out: list[str] = []
+    for piece in pieces:
+        if not out:
+            out.append(piece)
+            continue
+        prev = out[-1]
+        prev_tail = prev[-1:] if prev else ""
+        piece_head = piece[:1]
+        # CJK runs (including tokens with trailing punctuation) stay glued.
+        cjk_run = bool(
+            (_CJK_SPEECH_CHAR.fullmatch(piece) or _CJK_SPEECH_CHAR.match(piece_head))
+            and (_CJK_SPEECH_CHAR.search(prev_tail) or prev_tail in _trail_punct)
+        )
+        if cjk_run or piece_head in _trail_punct:
+            out.append(piece)
+        else:
+            out.append(" " + piece)
+    return "".join(out).strip()
+
+
+# Preferred cross-part dialogue cut marks: Chinese 。！？；， first, then English / clause.
+_SPEECH_SPLIT_PREFERRED_PUNCT = frozenset("。！？!?；;，,、…")
+
+
+def _speech_piece_ends_preferred_punct(piece: str) -> bool:
+    """True when the piece ends on a preferred sentence/clause punctuation mark."""
+
+    for ch in reversed(piece or ""):
+        if ch.isspace():
+            continue
+        return ch in _SPEECH_SPLIT_PREFERRED_PUNCT
+    return False
+
+
+def _split_speech_text_at_seconds(text: str, budget_seconds: float) -> tuple[str, str]:
+    """Take a head whose speech fits ``budget_seconds``; return (head, tail).
+
+    When a mid-unit cut is required, prefer the boundary nearest the duration budget
+    that lands on punctuation, at or before the budget (leave remainder for the next
+    part). Preferred marks: ``。！？；，`` (plus English ``!?``, ``;``, ``,``, ``、``,
+    ``…``); otherwise fall back to the existing token/char second-budget cut.
+    Soft ±0.02s tolerance is unchanged. Contiguous prefix|remainder with no spoken
+    overlap.
+    """
+
+    pieces = _tokenize_speech_pieces(text)
+    if not pieces:
+        return "", ""
+    if budget_seconds <= 0.02:
+        return "", text.strip()
+
+    taken: list[str] = []
+    hard_end = -1
+    for index, piece in enumerate(pieces):
+        probe = _join_speech_pieces(taken + [piece])
+        sec = _speech_seconds_of_text(probe)
+        if taken and sec > budget_seconds + 0.02:
+            break
+        taken.append(piece)
+        hard_end = index
+
+    if hard_end < 0:
+        return "", text.strip()
+    if hard_end >= len(pieces) - 1:
+        return _join_speech_pieces(pieces), ""
+
+    cut = hard_end
+    for i in range(hard_end, -1, -1):
+        if _speech_piece_ends_preferred_punct(pieces[i]):
+            cut = i
+            break
+
+    head = _join_speech_pieces(pieces[: cut + 1])
+    tail = _join_speech_pieces(pieces[cut + 1 :])
+    return head, tail
+
+
+def _partition_quote_units_by_duration(
+    units: list[str],
+    durations: list[float] | tuple[float, ...],
+    *,
+    ceiling: float | None = None,
+) -> list[str]:
+    """Pack quote lines into per-part DIALOGUE strings sized to each duration slot.
+
+    Walks quote units in order. Whole units stay intact when they fit the current
+    remainder or a later part's full limit. A unit is mid-split with
+    `_split_speech_text_at_seconds` (punctuation-preferring) only when it alone
+    exceeds the current remainder *and* would not fit wholly in any later slot — then this part gets
+    only the prefix and later parts get only the leftover suffix (never a
+    restart of the spoken prefix). Never drops countable speech: the last part
+    absorbs any remainder even if that overflows its nominal slot.
+    """
+
+    limits = [
+        float(duration if ceiling is None else min(duration, ceiling))
+        for duration in durations
+    ]
+    n = len(limits)
+    if not units or not n:
+        return [""] * max(n, 0)
+
+    queue = [unit for unit in units if (unit or "").strip()]
+    if not queue:
+        return [""] * n
+
+    buckets: list[list[str]] = [[] for _ in range(n)]
+    for part_index, limit in enumerate(limits):
+        if part_index == n - 1:
+            buckets[part_index].extend(queue)
+            queue = []
+            break
+        used = 0.0
+        while queue:
+            remain = limit - used
+            if remain <= 0.02:
+                break
+            unit = queue[0]
+            unit_sec = _speech_seconds_of_text(unit)
+            if unit_sec <= remain + 0.02:
+                buckets[part_index].append(queue.pop(0))
+                used += unit_sec
+                continue
+            # Prefer spilling a whole unit when later slots can absorb the rest
+            # of the queue without overflowing their combined budgets.
+            later_limits = limits[part_index + 1 :]
+            later_max = max(later_limits) if later_limits else 0.0
+            later_capacity = sum(later_limits)
+            queue_sec = sum(_speech_seconds_of_text(item) for item in queue)
+            if (
+                unit_sec <= later_max + 0.02
+                and queue_sec <= later_capacity + 0.02
+            ):
+                break
+            # Must cut here: contiguous prefix|remainder (never restart the line).
+            head, tail = _split_speech_text_at_seconds(unit, remain)
+            if head:
+                buckets[part_index].append(head)
+            if tail:
+                queue[0] = tail
+            else:
+                queue.pop(0)
+            break
+    if queue:
+        buckets[-1].extend(queue)
+
+    return ["\n".join(part).strip() for part in buckets]
+
+
+def _strip_beat_quote_spans(beat: str, inners: set[str]) -> str:
+    """Remove quote wrappers whose inner text is in ``inners``; keep narrative glue."""
+
+    if not beat or not inners:
+        return beat
+    matches = [match for match in _iter_beat_quote_matches(beat) if match.group(1).strip() in inners]
+    if not matches:
+        return beat
+    out = beat
+    for match in reversed(matches):
+        out = out[: match.start()] + out[match.end() :]
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r" *\n *", "\n", out)
+    out = re.sub(r" +([,.!?;:，。！？、])", r"\1", out)
+    return out.strip()
+
+
+def _structure_card_speech_seconds(dialogue: str, beat: str = "") -> float:
+    """Speech seconds for overflow: DIALOGUE field, else quoted spans inside BEAT."""
+
+    cleaned = _clean_structure_dialogue(dialogue)
+    if cleaned:
+        return _dialogue_speech_units(cleaned) / _DIALOGUE_WORDS_PER_SECOND
+    quoted = _beat_quoted_speech_text(beat)
+    if not quoted:
+        return 0.0
+    return _dialogue_speech_units(quoted) / _DIALOGUE_WORDS_PER_SECOND
+
+
+def _ideal_durations_for_speech(
+    units: Iterable[float], *, max_segment_seconds: float | None = None
+) -> list[float]:
     """Map speech load onto 4–15s. Silence stays at 4s; heavy speech reaches 15s."""
 
     ideals: list[float] = []
@@ -1950,7 +2352,7 @@ def _ideal_durations_for_speech(units: Iterable[float]) -> list[float]:
             continue
         speech_seconds = float(unit) / _DIALOGUE_WORDS_PER_SECOND
         ideals.append(
-            min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, speech_seconds))
+            min(_effective_max_segment_seconds(max_segment_seconds), max(MIN_DIRECTOR_SEGMENT_SECONDS, speech_seconds))
         )
     return ideals
 
@@ -1968,14 +2370,19 @@ def _pearson_correlation(left: list[float], right: list[float]) -> float:
     return float(np.dot(x_center, y_center) / denom)
 
 
-def _durations_ignore_dialogue_load(durations: list[float], units: list[float]) -> bool:
+def _durations_ignore_dialogue_load(
+    durations: list[float],
+    units: list[float],
+    *,
+    max_segment_seconds: float | None = None,
+) -> bool:
     """True when beat lengths are flat or do not follow assigned dialogue."""
 
     if len(durations) < 2 or len(durations) != len(units):
         return False
     if max(units) - min(units) < _DIALOGUE_REDISTRIBUTE_MIN_UNITS:
         return False
-    ideals = _ideal_durations_for_speech(units)
+    ideals = _ideal_durations_for_speech(units, max_segment_seconds=max_segment_seconds)
     ideal_spread = max(ideals) - min(ideals)
     # A gap that still fits inside the 4s floor does not justify a new rhythm.
     if ideal_spread < 2.0:
@@ -1992,6 +2399,8 @@ def _durations_ignore_dialogue_load(durations: list[float], units: list[float]) 
 
 def _retarget_durations_to_dialogue(
     segments: list[_DirectorLongSegment],
+    *,
+    max_segment_seconds: float | None = None,
 ) -> tuple[list[_DirectorLongSegment], bool]:
     """Replace a flat or dialogue-blind rhythm with speech-based 4–15s targets.
 
@@ -2002,9 +2411,9 @@ def _retarget_durations_to_dialogue(
 
     units = [_dialogue_speech_units(segment.dialogue) for segment in segments]
     durations = [float(segment.duration_seconds) for segment in segments]
-    if not _durations_ignore_dialogue_load(durations, units):
+    if not _durations_ignore_dialogue_load(durations, units, max_segment_seconds=max_segment_seconds):
         return segments, False
-    ideals = _ideal_durations_for_speech(units)
+    ideals = _ideal_durations_for_speech(units, max_segment_seconds=max_segment_seconds)
     updated = [
         replace(segment, duration_seconds=round(ideal, 3))
         for segment, ideal in zip(segments, ideals)
@@ -2077,10 +2486,203 @@ _AUDIO_VOICE_MAPPING = re.compile(
     r"<Audio\s+(?P<slot>\d+)>\s*(?P<name>[^,，\n]+?)\s*声线(?:参考)?",
     flags=re.IGNORECASE,
 )
+_AUDIO_AT_LABEL = re.compile(
+    r"@reference_audio_(?P<slot>\d+)\b[ \t]*(?P<label>[^@\n,，;；]*)",
+    flags=re.IGNORECASE,
+)
+_AUDIO_ANGLE_LABEL = re.compile(
+    r"<Audio\s+(?P<slot>\d+)>\s*(?P<label>[^,，\n]+)",
+    flags=re.IGNORECASE,
+)
+_AUDIO_VOICE_LABEL_SUFFIX = re.compile(
+    r"(?:的)?(?:声音参考|声线参考|声线|voice\s*reference|voice\s*line|timbre)\s*$",
+    flags=re.IGNORECASE,
+)
+_AUDIO_FILENAME_SUFFIX = re.compile(
+    r"\.(?:wav|mp3|flac|m4a|ogg|aac|wma)\s*$",
+    flags=re.IGNORECASE,
+)
+_AUDIO_UUID_LIKE = re.compile(
+    r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+    flags=re.IGNORECASE,
+)
+_AUDIO_RETENTION_MISUSE = re.compile(
+    r"(?:ambient|cicada|foley|village\s+noise|seeds?\b|瓜子|蝉|环境音|底噪|"
+    r"not\s+used|no\s+audio\s+cue|unused\s+in\s+this\s+segment)",
+    flags=re.IGNORECASE,
+)
+_DIALOGUE_SPEAKER_QUOTE = re.compile(
+    r"(?P<name>[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9·・]{0,11})\s*[「『\"“]"
+)
 _PICTURE_DESCRIPTION_MAPPING = re.compile(
     r"<Picture\s+(?P<slot>\d+)>\s*(?P<label>[^,，\n]+)",
     flags=re.IGNORECASE,
 )
+
+
+def _speaker_from_audio_label(label: str) -> str:
+    """Strip voice-reference suffixes / filenames so 小程声音参考 -> 小程.
+
+    UUID-like NV filenames are not speaker names.
+    """
+
+    text_value = (label or "").strip().strip(".,;:。；、")
+    if not text_value:
+        return ""
+    text_value = _AUDIO_FILENAME_SUFFIX.sub("", text_value).strip()
+    if _AUDIO_UUID_LIKE.fullmatch(text_value):
+        return ""
+    stripped = _AUDIO_VOICE_LABEL_SUFFIX.sub("", text_value).strip()
+    if _AUDIO_UUID_LIKE.fullmatch(stripped):
+        return ""
+    if stripped == text_value and ("." in stripped or _AUDIO_UUID_LIKE.fullmatch(stripped)):
+        return ""
+    return stripped or ""
+
+
+def _label_is_meaningful_voice_name(label: str) -> bool:
+    """True when the brief label names a speaker, not a UUID/filename."""
+
+    return bool(_speaker_from_audio_label(label))
+
+
+def _extract_audio_voice_labels(brief: str) -> dict[int, str]:
+    """Map <Audio N> / @reference_audio_N slots to brief voice labels.
+
+    Hand-edited Comfy briefs may say ``@reference_audio_1 小程声音参考``.
+    NV zip exports often keep a UUID filename after the tag; those are stored
+    but treated as unnamed voice refs (not ambient/Foley).
+    """
+
+    labels: dict[int, str] = {}
+
+    def _keep(slot: int, raw: str) -> None:
+        cleaned = (raw or "").strip().strip(".,;:。；、")
+        if not cleaned:
+            return
+        previous = labels.get(slot, "")
+        score = 2 if _label_is_meaningful_voice_name(cleaned) else 1
+        prev_score = 2 if previous and _label_is_meaningful_voice_name(previous) else (1 if previous else 0)
+        if score > prev_score or (score == prev_score and len(cleaned) > len(previous)):
+            labels[slot] = cleaned
+
+    for match in _AUDIO_AT_LABEL.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    for match in _AUDIO_ANGLE_LABEL.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    for match in _AUDIO_VOICE_MAPPING.finditer(brief or ""):
+        name = (match.group("name") or "").strip()
+        if name:
+            _keep(int(match.group("slot")), f"{name}声线")
+    return labels
+
+
+def _infer_brief_dialogue_speakers(text: str, *, limit: int = 8) -> tuple[str, ...]:
+    """Collect likely spoken-character names from brief / beat / prompt text."""
+
+    found: list[str] = []
+    for match in _DIALOGUE_SPEAKER_QUOTE.finditer(text or ""):
+        name = (match.group("name") or "").strip()
+        if len(name) < 1:
+            continue
+        if name in {"说", "道", "喊", "问", "答", "叫", "回", "and", "says", "said"}:
+            continue
+        found.append(name)
+    return tuple(dict.fromkeys(found))[:limit]
+
+
+def _resolve_audio_speaker_bindings(
+    audio_slots,
+    audio_labels,
+    context_text: str = "",
+):
+    """Map each audio slot to a speaker name when possible.
+
+    Prefer explicit brief voice labels. For UUID-only labels, fall back to
+    dialogue speakers found in the brief/beat/prompt, assigned in slot order.
+    """
+
+    slots = tuple(sorted({int(slot) for slot in audio_slots}))
+    labels = audio_labels or {}
+    bindings = {}
+    for slot in slots:
+        speaker = _speaker_from_audio_label(labels.get(slot, ""))
+        if speaker:
+            bindings[slot] = speaker
+    unbound = [slot for slot in slots if slot not in bindings]
+    if not unbound:
+        return bindings
+    used = set(bindings.values())
+    candidates = [name for name in _infer_brief_dialogue_speakers(context_text) if name not in used]
+    for slot, name in zip(unbound, candidates):
+        bindings[slot] = name
+    return bindings
+
+
+def _audio_voice_inventory_line(
+    slot: int,
+    label: str = "",
+    *,
+    speaker: str = "",
+) -> str:
+    """One inventory line stating Audio N is a character voice ref."""
+
+    speaker = speaker or _speaker_from_audio_label(label)
+    if speaker and label and _label_is_meaningful_voice_name(label) and speaker != label:
+        detail = f"for speaker 「{speaker}」 ({label})"
+    elif speaker:
+        detail = f"for speaker 「{speaker}」"
+    elif label and not _speaker_from_audio_label(label):
+        detail = (
+            f"(source tag label {label!r} is a file id, not a scene sound; "
+            "treat as unnamed character voice/timbre reference)"
+        )
+    else:
+        detail = "(unnamed character voice/timbre reference; not ambient/Foley/SFX)"
+    return (
+        f"<Audio {slot}>: character voice/timbre reference {detail}; "
+        "raw audio is not transcribed by Qwen-VL. NOT ambient noise, Foley, or SFX. "
+        "Bind this slot to the matching speaker's <d> dialogue when they speak in the group."
+    )
+
+
+def _audio_voice_retention_line(
+    slot: int,
+    label: str = "",
+    *,
+    speaker: str = "",
+    unused: bool = False,
+) -> str:
+    """Retention-analysis line for a standalone voice reference."""
+
+    speaker = speaker or _speaker_from_audio_label(label)
+    if speaker:
+        who = f"「{speaker}」"
+    elif label and not _speaker_from_audio_label(label):
+        who = "the dialogue speaker using this voice reference"
+    else:
+        who = "the mapped dialogue speaker"
+    if unused:
+        return (
+            f"<Audio {slot}>: voice/timbre reference for {who} unused in this segment "
+            "(no dialogue for this speaker here); not ambient or Foley."
+        )
+    return (
+        f"<Audio {slot}>: retain voice/timbre reference for {who}; "
+        "use this character's speaking voice for their <d> lines; not ambient or Foley."
+    )
+
+
+_AUDIO_VOICE_CONTRACT = """
+AUDIO VOICE CONTRACT (standalone <Audio N> / @reference_audio_N):
+- Each <Audio N> is a character voice/timbre reference (声线), never ambient bed, cicada, village noise, seeds Foley, or other SFX.
+- When the brief labels a slot with a speaker name (e.g. 小程声音参考 / 柳二姐声音参考), preserve that binding in retention_analysis.
+- When the brief only has a UUID/filename after @reference_audio_N, still treat it as a voice/timbre reference — never invent environmental audio for that slot.
+- In retention_analysis, write one explicit line per supplied <Audio N> binding it to a dialogue speaker's voice for <d> lines.
+- If this group contains <d> dialogue, you MUST use the relevant <Audio N> for the speaking character; never write "Not used" / "no audio cue" for an assigned voice slot that covers that speaker.
+- Only say a voice reference is unused when this group has no dialogue for that speaker.
+- Put continuous ambient sound and physical Foley only in overall_soundscape — never attribute them to <Audio N>.
+""".strip()
 
 
 def _normalize_dialogue_needle(text: str) -> str:
@@ -2346,18 +2948,18 @@ def _story_duration_schedule(
     beats = _parse_story_beats_from_brief(brief)
     requested_budget = float(budget_seconds)
     if allow_duration_overrun and beats:
+        # Soft target: widget total is guidance. Story beat estimated_seconds may
+        # pull the plan over or under that target. Shot ranges are coverage metadata
+        # only — never shot_count * segment_duration as a total floor.
         required = sum(max(float(beat.estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS) for beat in beats)
-        shot_floor = sum(
-            (beat.shot_end - beat.shot_start + 1) * max_segment_seconds
-            for beat in beats
-            if beat.shot_start is not None and beat.shot_end is not None
-        )
-        budget_seconds = max(requested_budget, required, shot_floor)
+        budget_seconds = required
         if budget_seconds > MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:
             raise PromptRefinerError(
                 f"Story-complete duration {budget_seconds:.3f}s exceeds the safety ceiling "
-                f"of {MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Reduce STORY_BEATS estimates or shot ranges."
+                f"of {MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Reduce STORY_BEATS estimates."
             )
+    else:
+        budget_seconds = requested_budget
     fallback = _director_duration_schedule(
         budget_seconds,
         max_segment_seconds,
@@ -2477,9 +3079,19 @@ def _apply_story_shot_contract(
     active = _coverage_knife_plan_for_card_count(plan, len(cards))
     ordered = sorted(cards, key=lambda card: int(card["index"]))
     voices = {
-        match.group("name").strip(): int(match.group("slot"))
-        for match in _AUDIO_VOICE_MAPPING.finditer(brief or "")
+        speaker: slot
+        for slot, label in _extract_audio_voice_labels(brief or "").items()
+        for speaker in (_speaker_from_audio_label(label),)
+        if speaker
     }
+    # NV beat packs declare standalone audio as Global @reference_audio_N filename
+    # (no <Audio N> ... voice-line). Keep those slots available when a shot
+    # does not retarget audio explicitly.
+    global_audios = sorted({
+        int(slot) for slot in re.findall(r"@reference_audio_(\d+)\b", brief or "", flags=re.IGNORECASE)
+    } | {
+        int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", brief or "", flags=re.IGNORECASE)
+    })
     picture_descriptions = {
         int(match.group("slot")): _picture_label_aliases(match.group("label"))
         for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or "")
@@ -2515,13 +3127,21 @@ def _apply_story_shot_contract(
                 slot for slot, aliases in picture_descriptions.items()
                 if any(alias in exact for alias in aliases)
             })
-            # A character merely appearing in a shot does not mean that voice
-            # reference is needed. Bind audio only when that mapped speaker has
-            # an actual quoted line in the assigned shot slice.
+            # Prefer explicit <Audio N> / @reference_audio_N tags in the shot
+            # (parity with <Picture N>). Also bind voice-mapped speakers that
+            # have an actual quoted line in the assigned shot slice.
             audios = sorted({
+                int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", exact, flags=re.IGNORECASE)
+            } | {
+                int(slot) for slot in re.findall(
+                    r"@reference_audio_(\d+)\b", exact, flags=re.IGNORECASE
+                )
+            } | {
                 slot for name, slot in voices.items()
                 if name and re.search(re.escape(name) + r"\s*[「『\"]", exact)
             })
+            if not audios and global_audios:
+                audios = list(global_audios)
             card = ordered[card_position]
             assets = dict(card.get("assets") or {})
             assets["pictures"] = pictures
@@ -2717,6 +3337,8 @@ def _beat_compress_priority(plan: _CoverageKnifePlan) -> tuple[int, ...]:
 def _enforce_coverage_duration_allocations(
     segments: list[_DirectorLongSegment],
     plan: _CoverageKnifePlan,
+    *,
+    max_segment_seconds: float | None = None,
 ) -> list[_DirectorLongSegment]:
     """Seed/repair per-beat totals after dialogue retarget without dropping trailing beats.
 
@@ -2727,6 +3349,7 @@ def _enforce_coverage_duration_allocations(
     if not segments or not plan.beats:
         return segments
     active = _coverage_knife_plan_for_card_count(plan, len(segments))
+    cap = _effective_max_segment_seconds(max_segment_seconds)
     ordered = sorted(segments, key=lambda item: item.index)
     values = [float(item.duration_seconds) for item in ordered]
     budget = float(active.budget_seconds)
@@ -2734,7 +3357,7 @@ def _enforce_coverage_duration_allocations(
     floors: list[float] = []
     for allocation, cards in zip(active.allocations, active.card_counts):
         min_total = cards * MIN_DIRECTOR_SEGMENT_SECONDS
-        max_total = cards * MAX_DIRECTOR_SEGMENT_SECONDS
+        max_total = cards * cap
         floors.append(min(max(float(allocation), min_total), max_total))
     # If floors exceed budget (extreme compression), scale floors down but keep
     # trailing beat at least one MIN card.
@@ -2784,7 +3407,7 @@ def _enforce_coverage_duration_allocations(
             for seg_idx in members[donor]:
                 values[seg_idx] = max(MIN_DIRECTOR_SEGMENT_SECONDS, values[seg_idx] - donor_share)
             for seg_idx in members[beat_idx]:
-                values[seg_idx] = min(MAX_DIRECTOR_SEGMENT_SECONDS, values[seg_idx] + recv_share)
+                values[seg_idx] = min(cap, values[seg_idx] + recv_share)
             beat_totals[donor] -= take
             beat_totals[beat_idx] += take
             deficit -= take
@@ -2792,14 +3415,14 @@ def _enforce_coverage_duration_allocations(
                 break
     # Clamp + final rebalance to exact budget while preferring compressible beats.
     values = [
-        min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, value))
+        min(cap, max(MIN_DIRECTOR_SEGMENT_SECONDS, value))
         for value in values
     ]
     repaired = [
         replace(segment, duration_seconds=round(value, 3))
         for segment, value in zip(ordered, values)
     ]
-    return _rebalance_director_segment_durations(repaired, budget)
+    return _rebalance_director_segment_durations(repaired, budget, max_segment_seconds=cap)
 
 
 def _coverage_knife_debug_summary(
@@ -2836,10 +3459,12 @@ def _segments_from_structure_cards(
     anchor_all_pictures: bool = False,
     coverage_plan: _CoverageKnifePlan | None = None,
     locked_durations: bool = False,
+    max_segment_seconds: float | None = None,
 ) -> tuple[list[_DirectorLongSegment], bool, list[str]]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
     target_schedule = tuple(schedule)
+    cap = _effective_max_segment_seconds(max_segment_seconds)
     expected = len(target_schedule)
     if locked_durations and len(cards) != expected:
         raise PromptRefinerError(f"Locked schedule has {expected} groups, received {len(cards)} cards.")
@@ -2860,9 +3485,9 @@ def _segments_from_structure_cards(
                 "The structure pass must describe that group's story slice before prompt refinement."
             )
         duration = (
-            _parse_duration_token(str(target_schedule[index - 1]), index)
+            _parse_duration_token(str(target_schedule[index - 1]), index, max_segment_seconds=cap)
             if locked_durations
-            else _parse_duration_token(str(card.get("duration_raw") or ""), index)
+            else _parse_duration_token(str(card.get("duration_raw") or ""), index, max_segment_seconds=cap)
         )
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
@@ -2908,17 +3533,17 @@ def _segments_from_structure_cards(
                 beat_pos = int(beat_idx) - 1
                 cards_in_beat = active.card_counts[beat_pos]
                 share = active.allocations[beat_pos] / max(1, cards_in_beat)
-                share = min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, share))
+                share = min(cap, max(MIN_DIRECTOR_SEGMENT_SECONDS, share))
                 seeded.append(replace(segment, duration_seconds=round(share, 3)))
             segments = seeded
-    segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments)
+    segments, dialogue_retargeted = _retarget_durations_to_dialogue(segments, max_segment_seconds=cap)
     actual_total = round(sum(segment.duration_seconds for segment in segments), 3)
     durations_rebalanced = False
     if dialogue_retargeted or abs(actual_total - total_seconds) > 0.02 or coverage_plan is not None:
-        segments = _rebalance_director_segment_durations(segments, total_seconds)
+        segments = _rebalance_director_segment_durations(segments, total_seconds, max_segment_seconds=cap)
         durations_rebalanced = True
     if coverage_plan is not None:
-        segments = _enforce_coverage_duration_allocations(segments, coverage_plan)
+        segments = _enforce_coverage_duration_allocations(segments, coverage_plan, max_segment_seconds=cap)
         durations_rebalanced = True
     return segments, durations_rebalanced, landmark_misses
 
@@ -2929,6 +3554,7 @@ def _long_director_structure_system(
     *,
     anchor_all_pictures: bool = False,
     coverage_plan: _CoverageKnifePlan | None = None,
+    max_segment_seconds: float | None = None,
 ) -> str:
     """Ask for beat cards only.  H3 prompts are written later, one group at a time."""
 
@@ -2936,6 +3562,8 @@ def _long_director_structure_system(
     engine = _director_mode_engine(mode)
     total_seconds = sum(durations)
     target_seconds = total_seconds / len(durations)
+    cap = _effective_max_segment_seconds(max_segment_seconds)
+    duration_placeholder = _director_duration_template_placeholder(cap)
     if engine == FULL_REFERENCE_ENGINE:
         if anchor_all_pictures:
             picture_rule = (
@@ -2970,8 +3598,8 @@ no JSON, and no H3 prompt fields.
 The host has fixed a total project duration of {total_seconds:.3f} seconds and exactly {len(durations)} groups.
 {target_seconds:.3f} seconds is only the average used to estimate that group count. It is not the duration of any
 group and must not be copied onto every segment. Produce exactly {len(durations)} segments. Choose each
-DURATION_SECONDS from the beat's content, always within 4–15 seconds, and make their sum exactly
-{total_seconds:.3f} seconds. Do not mechanically equalize every group. Dialogue-heavy beats go longer (near 15
+DURATION_SECONDS from the beat's content, always within {MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{cap:g} seconds, and make their sum exactly
+{total_seconds:.3f} seconds. Do not mechanically equalize every group. Dialogue-heavy beats go longer (near {cap:g}
 seconds). Short actions, reactions, reveals, and concise dialogue go shorter (near 4 seconds).
 Split long actions, dialogue, and emotional turns across adjacent cards at natural boundaries; never truncate,
 omit, duplicate, or reorder story content.
@@ -2982,7 +3610,7 @@ writes each group's prompt.
 Exact return template (repeat the SEGMENT block exactly {len(durations)} times):
 TITLE: short project title
 === SEGMENT 1 ===
-DURATION_SECONDS: {_DIRECTOR_DURATION_TEMPLATE_PLACEHOLDER}
+DURATION_SECONDS: {duration_placeholder}
 CONTINUITY_FROM_PREV: false
 PICTURES:
 VIDEOS:
@@ -3010,6 +3638,8 @@ Use false for a hard cut, new camera setup, time jump, location/subject change, 
 wording such as "hard cut", "cut to", "镜头切到", "硬切", "转场", or "新场景". Do not use true merely because the
 same character appears again.
 Keep speaker IDs stable, such as (S1) and (S2), inside BEAT and DIALOGUE.
+AUDIOS lists standalone character voice/timbre reference slots (@reference_audio_N / <Audio N>), never ambient or Foley.
+When a card's DIALOGUE includes a speaker who has a brief voice label (e.g. 小程声音参考), include that speaker's audio slot.
 """.strip()
         + coverage_addon
     )
@@ -3070,8 +3700,11 @@ H3 production contract for this prompt:
    <d>[Language] exact dialogue</d>; preserve user wording and language, use one speaker per shot when possible, and
    keep speech below about 2–2.5 words per available second after visible action.
 5. overall_soundscape: one to four English sentences describing continuous ambient sound, physical foley, and
-   non-verbal human sound in this group. Never repeat dialogue or music here.
+   non-verbal human sound in this group. Never repeat dialogue or music here. Never name <Audio N> here;
+   ambient/Foley belong only in this field, while <Audio N> stays a voice/timbre reference in retention_analysis.
 6. non_diegetic_music: use N/A when no score is requested; otherwise specify instruments, rhythm, and dynamic change.
+
+{_AUDIO_VOICE_CONTRACT}
 
 Prompt density: {quality.name}. {_director_long_craft_requirement(quality)} Do not expose reasoning or repeat a
 character's full appearance unless it changes in this beat. {density_target} This density setting never permits
@@ -3091,6 +3724,7 @@ def _build_long_director_structure_request(
     *,
     anchor_all_pictures: bool = False,
     coverage_plan: _CoverageKnifePlan | None = None,
+    max_segment_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     """Split the story into beat cards without sending still-image bytes.
 
@@ -3112,7 +3746,14 @@ def _build_long_director_structure_request(
     )
     if coverage_plan is not None:
         prompt += "\n\n" + _format_coverage_knife_instructions(coverage_plan)
-    inventory = _director_long_inventory_lines(images, videos, audio_slots, video_audio_slots)
+    inventory = _director_long_inventory_lines(
+        images,
+        videos,
+        audio_slots,
+        video_audio_slots,
+        audio_labels=_extract_audio_voice_labels(brief),
+        context_text=brief,
+    )
     if inventory:
         prompt += "\n\nConnected reference inventory:\n" + "\n".join(inventory)
     if reference_text.strip():
@@ -3150,6 +3791,7 @@ def _build_long_director_structure_request(
                 schedule,
                 anchor_all_pictures=anchor_all_pictures,
                 coverage_plan=coverage_plan,
+                max_segment_seconds=max_segment_seconds,
             ),
         },
         {"role": "user", "content": content},
@@ -3246,7 +3888,12 @@ def _build_long_director_segment_request(
             "of any local camera-shot numbering."
         )
     inventory = _director_long_inventory_lines(
-        images, videos, segment.audio_slots, segment.video_audio_slots
+        images,
+        videos,
+        segment.audio_slots,
+        segment.video_audio_slots,
+        audio_labels=_extract_audio_voice_labels(brief),
+        context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
     )
     if inventory:
         prompt += "\n\nReferences attached to this segment:\n" + "\n".join(inventory)
@@ -3405,7 +4052,12 @@ def _save_structure_diagnostic(record: dict[str, Any]) -> str:
 
 
 def _validate_verbatim_partition(source: str, pieces: list[str], field: str) -> None:
-    """Only allow contiguous slices; no rewritten, omitted, reordered, or repeated content."""
+    """Require contiguous coverage across pieces; cutting into parts is allowed.
+
+    Local repair must redistribute the original field across parts without
+    dropping, paraphrasing, reordering, or repeating text. This is coverage of
+    the original across the split — not whole-card equality on every part.
+    """
     cursor = 0
     for piece in pieces:
         piece = piece.strip()
@@ -3423,17 +4075,323 @@ def _validate_verbatim_partition(source: str, pieces: list[str], field: str) -> 
         raise PromptRefinerError(f"Local repair omitted trailing {field} text.")
 
 
+
+
+def _realign_durations_to_part_dialogue(
+    parts: list[dict[str, Any]],
+    assigned_times: list[float] | tuple[float, ...],
+    *,
+    effective_max: float,
+) -> tuple[float, ...]:
+    """Rebuild part durations so each slot covers its DIALOGUE speech load.
+
+    Quote partitioning cuts on token boundaries, so speech seconds can land a
+    fraction above an equal-split host slot. Keep the overflow total, clamp to
+    ``[MIN, effective_max]``, and ensure speaking parts are not under-budget.
+    """
+
+    times = [float(value) for value in assigned_times]
+    n = len(parts)
+    if n == 0 or n != len(times):
+        return tuple(times)
+    speeches = [
+        _speech_seconds_of_text(str(part.get("dialogue") or "")) for part in parts
+    ]
+    if not any(value > 0.02 for value in speeches):
+        return tuple(times)
+    total = round(sum(times), 3)
+    if not (n * MIN_DIRECTOR_SEGMENT_SECONDS <= total <= n * effective_max):
+        return tuple(times)
+    if any(value > effective_max + 0.02 for value in speeches):
+        return tuple(times)
+
+    weights = [max(value, 0.01) for value in speeches]
+    weight_sum = sum(weights)
+    values = [
+        min(effective_max, max(MIN_DIRECTOR_SEGMENT_SECONDS, total * (weight / weight_sum)))
+        for weight in weights
+    ]
+    for index, speech in enumerate(speeches):
+        if speech > 0.02:
+            values[index] = max(values[index], min(effective_max, speech))
+
+    for _ in range(n + 2):
+        difference = total - sum(values)
+        if abs(difference) < 0.00001:
+            break
+        if difference > 0:
+            capacity = [effective_max - value for value in values]
+        else:
+            # Do not shrink a speaking part below its speech load.
+            capacity = [
+                value - max(MIN_DIRECTOR_SEGMENT_SECONDS, speeches[index] if speeches[index] > 0.02 else MIN_DIRECTOR_SEGMENT_SECONDS)
+                for index, value in enumerate(values)
+            ]
+        available = sum(max(0.0, room) for room in capacity)
+        if available <= 0.00001:
+            break
+        for index, room in enumerate(capacity):
+            if room <= 0:
+                continue
+            change = difference * (room / available)
+            if difference > 0:
+                values[index] = min(effective_max, values[index] + change)
+            else:
+                floor = (
+                    max(MIN_DIRECTOR_SEGMENT_SECONDS, speeches[index])
+                    if speeches[index] > 0.02
+                    else MIN_DIRECTOR_SEGMENT_SECONDS
+                )
+                values[index] = max(floor, values[index] + change)
+
+    values = [round(value, 3) for value in values]
+    residue = round(total - sum(values), 3)
+    for index in range(n - 1, -1, -1):
+        if abs(residue) <= 0.0001:
+            break
+        floor = (
+            max(MIN_DIRECTOR_SEGMENT_SECONDS, speeches[index])
+            if speeches[index] > 0.02
+            else MIN_DIRECTOR_SEGMENT_SECONDS
+        )
+        if residue > 0:
+            adjustment = min(residue, round(effective_max - values[index], 3))
+        else:
+            adjustment = max(residue, round(floor - values[index], 3))
+        values[index] = round(values[index] + adjustment, 3)
+        residue = round(total - sum(values), 3)
+    if abs(residue) > 0.002:
+        return tuple(times)
+    return tuple(values)
+
+
+
+
+def _split_beat_text_near_ratio(beat: str, ratio: float) -> tuple[str, str]:
+    """Contiguous BEAT split near `ratio`; prefer punctuation; both sides nonempty."""
+
+    raw = (beat or "").strip()
+    if not raw:
+        return "...", "..."
+    if len(raw) == 1:
+        return raw, raw
+    ratio = min(0.95, max(0.05, float(ratio)))
+    cut = max(1, min(len(raw) - 1, int(round(len(raw) * ratio))))
+    preferred = "。！？；，、.!?;:\n…"
+    chosen = cut
+    for i in range(cut, 0, -1):
+        if raw[i - 1] in preferred:
+            chosen = i
+            break
+    head = raw[:chosen].rstrip()
+    tail = raw[chosen:].lstrip()
+    if not head:
+        head, tail = raw[:1], raw[1:].lstrip() or raw[-1:]
+    if not tail:
+        head, tail = (raw[:-1].rstrip() or raw[:1]), raw[-1:]
+    return head, tail
+
+
+def _force_split_speech_within_max(text: str, effective_max: float) -> tuple[str, str]:
+    """Split speech so the head fits `effective_max`; never return an empty tail when over max.
+
+    Prefers punctuation via `_split_speech_text_at_seconds`. If punct walk-back or a
+    single oversized first piece still leaves the head over max, fall back to a hard
+    piece cut at the last in-budget index (no punct walk-back).
+    """
+
+    dialogue = (text or "").strip()
+    if not dialogue:
+        return "", ""
+    if _speech_seconds_of_text(dialogue) <= effective_max + 0.02:
+        return dialogue, ""
+    head, tail = _split_speech_text_at_seconds(dialogue, effective_max)
+    if tail and _speech_seconds_of_text(head) <= effective_max + 0.02:
+        return head, tail
+    # Retry slightly under the ceiling to force a cut when soft tolerance absorbed all.
+    head, tail = _split_speech_text_at_seconds(dialogue, max(0.5, effective_max - 0.5))
+    if tail and _speech_seconds_of_text(head) <= effective_max + 0.02:
+        return head, tail
+    pieces = _tokenize_speech_pieces(dialogue)
+    if len(pieces) < 2:
+        # Indivisible token: keep as head; caller may still fail fit at max.
+        return dialogue, ""
+    taken: list[str] = []
+    for piece in pieces:
+        probe = _join_speech_pieces(taken + [piece])
+        if taken and _speech_seconds_of_text(probe) > effective_max + 0.02:
+            break
+        taken.append(piece)
+    if not taken:
+        taken = [pieces[0]]
+    if len(taken) >= len(pieces):
+        taken = pieces[:-1]
+    head = _join_speech_pieces(taken)
+    tail = _join_speech_pieces(pieces[len(taken) :])
+    return head, tail
+
+
+def _ensure_repair_parts_fit_dialogue(
+    parts: list[dict[str, Any]],
+    assigned_times: list[float] | tuple[float, ...],
+    *,
+    effective_max: float,
+) -> tuple[list[dict[str, Any]], tuple[float, ...]]:
+    """After punct-aware dialogue partition: raise DURATION to speech, or add parts.
+
+    Never truncates speech and never reintroduces prefix overlap. When a part's
+    DIALOGUE speech exceeds `effective_max`, mid-split that part at preferred
+    punctuation (falling back to a coarser piece cut) into additional groups.
+    Each resulting part's duration matches its dialogue speech estimate, clamped
+    to `[MIN, effective_max]`. Total duration may grow when MIN floors apply.
+    """
+
+    working: list[dict[str, Any]] = [dict(part) for part in parts]
+    if not working:
+        return working, tuple(float(v) for v in assigned_times)
+
+    index = 0
+    guard = 0
+    max_guard = max(32, len(working) * 8)
+    while index < len(working) and guard < max_guard:
+        guard += 1
+        part = working[index]
+        dialogue = str(part.get("dialogue") or "")
+        speech = _speech_seconds_of_text(dialogue)
+        if speech <= effective_max + 0.02:
+            index += 1
+            continue
+        head, tail = _force_split_speech_within_max(dialogue, effective_max)
+        if not tail:
+            # Cannot split further without truncation; leave for duration clamp / caller.
+            index += 1
+            continue
+        beat = str(part.get("beat") or "")
+        full_dlg = dialogue.strip()
+        ratio = (len(head) / len(full_dlg)) if full_dlg else 0.5
+        beat_head, beat_tail = _split_beat_text_near_ratio(beat, ratio)
+        mid_handoff = str(part.get("handoff") or "").strip() or "Speech continues."
+        # Prefer a short mid-state; keep original final handoff on the tail part.
+        if len(mid_handoff) > 80:
+            mid_handoff = mid_handoff[:77].rstrip() + "..."
+        part_a = {
+            **part,
+            "beat": beat_head,
+            "dialogue": head,
+            "handoff": mid_handoff,
+        }
+        part_b = {
+            **part,
+            "beat": beat_tail,
+            "dialogue": tail,
+            "handoff": str(part.get("handoff") or mid_handoff),
+        }
+        working[index : index + 1] = [part_a, part_b]
+        # Recheck part_a (may still be over max if hard first-piece overflow).
+        continue
+
+    speeches = [_speech_seconds_of_text(str(part.get("dialogue") or "")) for part in working]
+    n = len(working)
+    seed_total = round(sum(float(v) for v in assigned_times), 3) if assigned_times else 0.0
+    if n <= 0:
+        return working, tuple()
+    # Prefer keeping the reserved overflow budget when it still covers speech floors.
+    speech_floors = [
+        (
+            max(MIN_DIRECTOR_SEGMENT_SECONDS, min(effective_max, round(speech, 3)))
+            if speech > 0.02
+            else MIN_DIRECTOR_SEGMENT_SECONDS
+        )
+        for speech in speeches
+    ]
+    floor_sum = round(sum(speech_floors), 3)
+    # Duration must cover speech: start from speech floors, then distribute any
+    # reserved slack without dropping a speaking part below its speech estimate.
+    if seed_total >= floor_sum - 0.002 and n * MIN_DIRECTOR_SEGMENT_SECONDS <= seed_total <= n * effective_max:
+        # Equal-split seed of the reserved seconds, then realign up to speech.
+        milliseconds, remainder = divmod(round(seed_total * 1000), n)
+        seed_times = tuple(
+            (milliseconds + (i < remainder)) / 1000 for i in range(n)
+        )
+        realigned = _realign_durations_to_part_dialogue(
+            working, seed_times, effective_max=effective_max,
+        )
+        # Realign may bail (return seed) when speech still exceeds a slot; fall through
+        # to explicit speech-matched durations when any part still misses.
+        ok = True
+        for part, duration in zip(working, realigned):
+            speech = _speech_seconds_of_text(str(part.get("dialogue") or ""))
+            if speech > duration + 0.02:
+                ok = False
+                break
+        if ok:
+            return working, tuple(round(float(v), 3) for v in realigned)
+
+    # Expand: each part duration matches its dialogue speech (clamped).
+    times = [round(value, 3) for value in speech_floors]
+    return working, tuple(times)
+
+
+def _apply_empty_origin_beat_quote_dialogues(
+    parts: list[dict[str, Any]],
+    durations: list[float] | tuple[float, ...],
+    *,
+    original_dialogue: str,
+    original_beat: str = "",
+    ceiling: float | None = None,
+) -> None:
+    """Empty-origin overflow: lift BEAT quotes into part DIALOGUE by duration budget.
+
+    When the structure card had empty/NONE DIALOGUE but countable quoted speech
+    inside BEAT, local repair must not leave that speech only-in-BEAT (refine
+    would emit NONE / silence). Partition quote lines across parts to fit each
+    duration slot, assign them to DIALOGUE, and strip those quote spans from
+    each part's BEAT so refine does not double-speak. Model lifts are replaced
+    by this deterministic assignment — never silently dropped.
+    """
+
+    if original_dialogue:
+        return
+    source_beat = original_beat or "\n".join(str(part.get("beat") or "") for part in parts)
+    units = _beat_quoted_speech_units(source_beat)
+    if not units:
+        # No countable BEAT quotes: clear any model-invented lifts that overrun.
+        for part, duration in zip(parts, durations):
+            limit = float(duration if ceiling is None else min(duration, ceiling))
+            speech = _dialogue_speech_units(str(part.get("dialogue") or "")) / _DIALOGUE_WORDS_PER_SECOND
+            if speech > limit + 0.02:
+                part["dialogue"] = ""
+        return
+    assigned = _partition_quote_units_by_duration(units, durations, ceiling=ceiling)
+    inner_set = set(units)
+    for part, dialogue in zip(parts, assigned):
+        part["dialogue"] = dialogue
+        stripped = _strip_beat_quote_spans(str(part.get("beat") or ""), inner_set)
+        if stripped.strip():
+            part["beat"] = stripped
+        # If stripping would empty the beat, keep narrative (quotes still in DIALOGUE).
+
+
 def _repair_structure_duration_cards(
     cards: list[dict[str, Any]], schedule: tuple[float, ...],
     coverage_plan: _CoverageKnifePlan | None, complete: Callable, max_tokens: int, seed: int,
     audit: dict[str, Any],
+    *,
+    max_segment_seconds: float | None = None,
+    allow_duration_overrun: bool = False,
 ) -> tuple[list[dict[str, Any]], tuple[float, ...], _CoverageKnifePlan | None]:
     """Split only overflowing content, preserving its time and all other cards' text.
 
     A rejected duration is an overflow signal, not permission to overwrite the
     schedule. The host reserves that budget and deterministically redistributes
     the remaining time, or refuses if there is no feasible 4s floor.
+
+    When ``allow_duration_overrun`` is on (soft target) and speech overflows alone
+    exceed the schedule total, expand the host target up to
+    ``MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS`` so ordinary groups still fit
+    ``[MIN, effective_max]`` and overflowing cards can split without truncation.
     """
+    effective_max = _effective_max_segment_seconds(max_segment_seconds)
     _require_compatible_director_segment_count(len(cards), len(schedule))
     _require_coherent_segment_indexes([int(c["index"]) for c in cards], len(cards))
     ordered = sorted(cards, key=lambda c: int(c["index"]))
@@ -3449,7 +4407,7 @@ def _repair_structure_duration_cards(
         # overflowing cards. Do not reject the provisional average before repair.
         schedule = (
             _locked_structure_schedule(replacement, coverage_plan)
-            if MIN_DIRECTOR_SEGMENT_SECONDS <= each <= MAX_DIRECTOR_SEGMENT_SECONDS
+            if MIN_DIRECTOR_SEGMENT_SECONDS <= each <= effective_max
             else tuple(replacement)
         )
     overflows: dict[int, float] = {}
@@ -3465,12 +4423,19 @@ def _repair_structure_duration_cards(
         # Compare against the card's own claim and the 4-15 hard caps — not the equal host
         # seed schedule — so variable DURATION_SECONDS chosen by the structure pass survive.
         dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
-        speech_seconds = _dialogue_speech_units(dialogue) / _DIALOGUE_WORDS_PER_SECOND
+        beat_text = str(card.get("beat") or "")
+        # NV: spoken lines often live in BEAT while DIALOGUE is empty — count those too.
+        speech_seconds = _structure_card_speech_seconds(dialogue, beat_text)
         if duration < MIN_DIRECTOR_SEGMENT_SECONDS:
             raise PromptRefinerError(f"Director structure segment {pos + 1}: duration {duration:.3f}s is below 4s.")
-        if duration > MAX_DIRECTOR_SEGMENT_SECONDS:
+        if duration > effective_max:
+            # Clamp only when there is no countable speech in DIALOGUE or BEAT quotes.
+            # Substantial spoken lines (field or embedded) must overflow-split, never clamp-only.
+            if speech_seconds <= 0:
+                ordered[pos] = {**card, "duration_raw": f"{effective_max:g}"}
+                continue
             overflows[pos] = round(max(duration, speech_seconds), 3)
-        elif speech_seconds > MAX_DIRECTOR_SEGMENT_SECONDS:
+        elif speech_seconds > effective_max:
             overflows[pos] = round(speech_seconds, 3)
         elif speech_seconds > duration + 0.02:
             overflows[pos] = round(speech_seconds, 3)
@@ -3484,28 +4449,57 @@ def _repair_structure_duration_cards(
             len(card_times) == len(schedule)
             and abs(sum(card_times) - sum(schedule)) <= 0.02
             and all(
-                MIN_DIRECTOR_SEGMENT_SECONDS <= value <= MAX_DIRECTOR_SEGMENT_SECONDS
+                MIN_DIRECTOR_SEGMENT_SECONDS <= value <= effective_max
                 for value in card_times
             )
         ):
             return ordered, tuple(round(value, 3) for value in card_times), coverage_plan
         return ordered, schedule, coverage_plan
     details = "; ".join(f"segment {p + 1}: {d:.3f}s" for p, d in overflows.items())
-    total = sum(schedule)
-    remaining = round(total - sum(overflows.values()), 3)
+    total = float(sum(schedule))
+    overflow_sum = float(sum(overflows.values()))
+    remaining = round(total - overflow_sum, 3)
     ordinary = [p for p in range(len(ordered)) if p not in overflows]
-    if not (len(ordinary) * MIN_DIRECTOR_SEGMENT_SECONDS <= remaining
-            <= len(ordinary) * MAX_DIRECTOR_SEGMENT_SECONDS):
-        raise PromptRefinerError(
-            f"Cannot safely repair {details}: reserving overflowing content leaves {remaining:.3f}s "
-            f"for {len(ordinary)} other groups (4–15s each); target={total:.3f}s. "
-            "Content was not truncated. Revise the brief or its duration budget."
-        )
+    ordinary_min = len(ordinary) * MIN_DIRECTOR_SEGMENT_SECONDS
+    ordinary_max = len(ordinary) * effective_max
+    soft_overrun = bool(allow_duration_overrun) or total > MAX_DIRECTOR_TOTAL_SECONDS
+    if not (ordinary_min <= remaining <= ordinary_max):
+        # Soft overrun: widget total is an estimate. Speech overflows may exceed it;
+        # expand the host target so overflowing cards keep full speech and ordinary
+        # groups still fit [MIN, effective_max], then continue with splits.
+        if soft_overrun and remaining < ordinary_min:
+            # Prefer enough room for ordinary cards up to the per-group ceiling.
+            ordinary_budget = ordinary_max if ordinary else 0.0
+            expanded = round(overflow_sum + ordinary_budget, 3)
+            if expanded > MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:
+                raise PromptRefinerError(
+                    f"Cannot safely repair {details}: expanding for overflowing speech needs "
+                    f"{expanded:.3f}s but exceeds the safety ceiling of "
+                    f"{MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Content was not truncated. "
+                    "Reduce dialogue or STORY_BEATS estimates."
+                )
+            total = expanded
+            remaining = round(total - overflow_sum, 3)
+            audit["expanded_total_seconds"] = total
+            audit["overflow_budget_expand"] = True
+        else:
+            hint = (
+                " Enable allow_duration_overrun or raise total_duration_seconds."
+                if not soft_overrun
+                else " Content was not truncated. Revise the brief or its duration budget."
+            )
+            raise PromptRefinerError(
+                f"Cannot safely repair {details}: reserving overflowing content leaves {remaining:.3f}s "
+                f"for {len(ordinary)} other groups ({MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{effective_max:g}s each); "
+                f"target={total:.3f}s."
+                + (" Content was not truncated." if soft_overrun else "")
+                + hint
+            )
     ordinary_segments = [
         _DirectorLongSegment(p + 1, schedule[p], "", (), (), (), (), p > 0) for p in ordinary
     ]
     ordinary_times = dict(zip(ordinary, [
-        s.duration_seconds for s in _rebalance_director_segment_durations(ordinary_segments, remaining)
+        s.duration_seconds for s in _rebalance_director_segment_durations(ordinary_segments, remaining, max_segment_seconds=effective_max)
     ]))
     for pos, duration in ordinary_times.items():
         dialogue = _clean_structure_dialogue(str(ordered[pos].get("dialogue") or ""))
@@ -3525,9 +4519,19 @@ def _repair_structure_duration_cards(
             result_beats.append(beat_id)
             continue
         seconds = overflows[pos]
-        split_times = _director_duration_schedule(seconds, MAX_DIRECTOR_SEGMENT_SECONDS)
+        split_times = _director_duration_schedule(seconds, effective_max)
         if len(split_times) == 1:
-            result.append(dict(card))
+            single = dict(card)
+            original_beat_one = str(card["beat"]).strip()
+            original_dialogue_one = _clean_structure_dialogue(str(card.get("dialogue") or "")
+            )
+            _apply_empty_origin_beat_quote_dialogues(
+                [single],
+                split_times,
+                original_dialogue=original_dialogue_one,
+                original_beat=original_beat_one,
+            )
+            result.append(single)
             result_times.append(seconds)
             result_beats.append(beat_id)
             continue
@@ -3535,17 +4539,37 @@ def _repair_structure_duration_cards(
         original_dialogue = _clean_structure_dialogue(str(card.get("dialogue") or ""))
         repair = {"segment": pos + 1, "duration": seconds, "source": card, "attempts": []}
         audit["repairs"].append(repair)
+        part_count = len(split_times)
+        empty_dialogue_hint = (
+            " Original DIALOGUE is empty: leave every part dialogue empty; "
+            "cut BEAT into contiguous verbatim slices that together cover the full original "
+            "BEAT (including any corner-bracket or quoted speech). Do not drop or paraphrase "
+            "quoted speech. The host will lift those quotes into each part's DIALOGUE."
+            if not original_dialogue
+            else ""
+        )
         messages = [
             {"role": "system", "content": (
                 "Repair only this Director structure card at natural action, dialogue, or emotional boundaries. "
                 "Return JSON {\"parts\":[{\"beat\":\"verbatim slice\",\"dialogue\":\"verbatim slice or empty\","
-                "\"handoff\":\"physical ending state\"}]}. Each part must contain a nonempty contiguous BEAT slice. "
+                "\"handoff\":\"physical ending state\"}]} with exactly "
+                f"{part_count} parts, one per durations entry, matching those durations in order. "
+                "Each part must contain a nonempty contiguous BEAT slice. "
+                "Cut BEAT across parts so the slices cover the original in order — "
+                "splits are required when the card overflows; do not keep the whole card BEAT on every part. "
                 "Partition all BEAT and DIALOGUE text verbatim and in order, without omissions or repetition. "
                 "Keep matching actions and dialogue together. No H3 prompt, no new story. "
                 "Each part continues the previous one; preserve the original final handoff."
+                + empty_dialogue_hint
             )},
             {"role": "user", "content": json.dumps({
-                "durations": split_times, "beat": original_beat, "dialogue": original_dialogue,
+                "part_count": part_count,
+                "durations": split_times,
+                "instruction": (
+                    f"Return exactly {part_count} parts matching these durations in order. "
+                    "Cover the original BEAT across parts as contiguous verbatim slices."
+                ),
+                "beat": original_beat, "dialogue": original_dialogue,
                 "handoff": card.get("handoff", ""),
             }, ensure_ascii=False)},
         ]
@@ -3555,17 +4579,86 @@ def _repair_structure_duration_cards(
             try:
                 clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", _strip_reasoning(raw).strip())
                 parts = json.loads(clean)["parts"]
-                if not isinstance(parts, list) or len(parts) != len(split_times):
+                if not isinstance(parts, list) or not parts:
                     raise PromptRefinerError("Local repair returned the wrong part count.")
                 if not all(isinstance(p, dict) and isinstance(p.get("beat"), str) and p["beat"].strip()
                            and isinstance(p.get("dialogue"), str) and isinstance(p.get("handoff"), str)
                            and p["handoff"].strip() for p in parts):
                     raise PromptRefinerError("Local repair needs BEAT, DIALOGUE and HANDOFF in every part.")
-                for field, source in (("beat", original_beat), ("dialogue", original_dialogue)):
-                    _validate_verbatim_partition(source, [p[field] for p in parts], field)
-                for part, duration in zip(parts, split_times):
+                # Coverage across parts (contiguous slices), not whole-card BEAT equality.
+                _validate_verbatim_partition(original_beat, [p["beat"] for p in parts], "beat")
+                # Empty/NONE original DIALOGUE: skip verbatim check (model may leave parts
+                # empty or lift quoted lines from BEAT). Nonempty originals stay strict.
+                if original_dialogue:
+                    _validate_verbatim_partition(
+                        original_dialogue, [p["dialogue"] for p in parts], "dialogue"
+                    )
+                if len(parts) == len(split_times):
+                    assigned_times = split_times
+                else:
+                    # Model chose a different natural beat count. Accept when every
+                    # part's speech fits the host ceiling and overflow_seconds can be
+                    # redistributed across that many legal [MIN, effective_max] groups.
+                    n_parts = len(parts)
+                    if not (
+                        n_parts * MIN_DIRECTOR_SEGMENT_SECONDS
+                        <= seconds
+                        <= n_parts * effective_max
+                    ):
+                        raise PromptRefinerError("Local repair returned the wrong part count.")
+                    # Empty-origin: partition BEAT quotes into part DIALOGUE by slot budget.
+                    _apply_empty_origin_beat_quote_dialogues(
+                        parts,
+                        (effective_max,) * n_parts,
+                        original_dialogue=original_dialogue,
+                        original_beat=original_beat,
+                        ceiling=effective_max,
+                    )
+                    milliseconds, remainder = divmod(round(seconds * 1000), n_parts)
+                    assigned_times = tuple(
+                        (milliseconds + (index < remainder)) / 1000 for index in range(n_parts)
+                    )
+                    if not all(
+                        MIN_DIRECTOR_SEGMENT_SECONDS <= value <= effective_max
+                        for value in assigned_times
+                    ):
+                        raise PromptRefinerError("Local repair returned the wrong part count.")
+                    repair["accepted_part_count"] = n_parts
+                    repair["rebuilt_durations"] = list(assigned_times)
+                # Empty-origin: lift BEAT quotes into DIALOGUE sized to each part slot.
+                _apply_empty_origin_beat_quote_dialogues(
+                    parts,
+                    assigned_times,
+                    original_dialogue=original_dialogue,
+                    original_beat=original_beat,
+                )
+                # After punct-aware partition: raise each part DURATION to its DIALOGUE
+                # speech, or re-split over-max parts into more groups — never abort/truncate.
+                parts, assigned_times = _ensure_repair_parts_fit_dialogue(
+                    parts, assigned_times, effective_max=effective_max,
+                )
+                fitted_sum = round(sum(assigned_times), 3)
+                if fitted_sum > round(seconds, 3) + 0.002:
+                    if not soft_overrun:
+                        raise PromptRefinerError(
+                            "Local repair dialogue does not fit its assigned duration."
+                        )
+                    delta = round(fitted_sum - seconds, 3)
+                    expanded = round(total + delta, 3)
+                    if expanded > MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:
+                        raise PromptRefinerError(
+                            "Local repair dialogue does not fit its assigned duration."
+                        )
+                    total = expanded
+                    seconds = fitted_sum
+                    audit["expanded_total_seconds"] = total
+                    audit["overflow_budget_expand"] = True
+                for part, duration in zip(parts, assigned_times):
                     if _dialogue_speech_units(part["dialogue"]) / _DIALOGUE_WORDS_PER_SECOND > duration + 0.02:
                         raise PromptRefinerError("Local repair dialogue does not fit its assigned duration.")
+                split_times = assigned_times
+                repair["fitted_part_count"] = len(parts)
+                repair["fitted_durations"] = list(assigned_times)
                 break
             except (ValueError, KeyError, TypeError, PromptRefinerError) as error:
                 repair["error"] = str(error)
@@ -3573,8 +4666,20 @@ def _repair_structure_duration_cards(
                     raise PromptRefinerError(
                         f"Local repair failed for segment {pos + 1}, {seconds:.3f}s: {error}"
                     ) from error
-                messages.extend([{"role": "assistant", "content": raw},
-                                 {"role": "user", "content": f"Rejected: {error}. Correct only these parts."}])
+                retry_hint = (
+                    " Cut BEAT across parts as contiguous verbatim slices that cover the original "
+                    "(no drop, no paraphrase). "
+                    + (
+                        "Leave part dialogue empty; keep corner-bracket/quoted speech inside BEAT "
+                        "for verbatim coverage (host lifts quotes into DIALOGUE). "
+                        if not original_dialogue
+                        else ""
+                    )
+                )
+                messages.extend([
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": f"Rejected: {error}.{retry_hint}Correct only these parts."},
+                ])
         for part_index, (part, duration) in enumerate(zip(parts, split_times)):
             result.append({**card, "beat": part["beat"], "dialogue": part["dialogue"],
                            "continuity_raw": card.get("continuity_raw") if part_index == 0 else "true",
@@ -3592,7 +4697,7 @@ def _repair_structure_duration_cards(
     if abs(sum(result_times) - total) > 0.002:
         raise PromptRefinerError(f"Local repair failed total duration conservation: {sum(result_times)} vs {total}.")
     for i, value in enumerate(result_times, 1):
-        _parse_duration_token(str(value), i)
+        _parse_duration_token(str(value), i, max_segment_seconds=effective_max)
     return result, tuple(result_times), coverage_plan
 
 
@@ -3614,6 +4719,7 @@ def _plan_director_with_independent_segment_refine(
     seed: int,
     anchor_all_pictures: bool = False,
     max_segment_seconds: float = MAX_DIRECTOR_SEGMENT_SECONDS,
+    allow_duration_overrun: bool = False,
 ) -> tuple[str, list[_DirectorLongSegment], bool, str, dict[str, Any]]:
     """Split the timeline once, then write each Director prompt in its own completion.
 
@@ -3632,7 +4738,7 @@ def _plan_director_with_independent_segment_refine(
     structure_skipped = len(target_schedule) == 1
     story_schedule, coverage_plan = _story_duration_schedule(
         brief, budget_seconds=sum(target_schedule), max_segment_seconds=max_segment_seconds,
-        allow_duration_overrun=sum(target_schedule) > MAX_DIRECTOR_TOTAL_SECONDS,
+        allow_duration_overrun=bool(allow_duration_overrun),
     )
     target_schedule = story_schedule if coverage_plan is not None else target_schedule
     target_schedule = _locked_structure_schedule(target_schedule, coverage_plan)
@@ -3668,6 +4774,7 @@ def _plan_director_with_independent_segment_refine(
             video_audio_slots,
             anchor_all_pictures=anchor_all_pictures,
             coverage_plan=coverage_plan,
+            max_segment_seconds=max_segment_seconds,
         )
         last_error: Exception | None = None
         title = "Untitled MiniMax H3 Director project"
@@ -3696,6 +4803,8 @@ def _plan_director_with_independent_segment_refine(
                 cards, resolved_schedule, coverage_plan = _repair_structure_duration_cards(
                     cards, target_schedule, coverage_plan, complete, structure_max_tokens,
                     completion_seed, structure_audit,
+                    max_segment_seconds=max_segment_seconds,
+                    allow_duration_overrun=bool(allow_duration_overrun),
                 )
                 segments, durations_rebalanced, coverage_landmark_misses = _segments_from_structure_cards(
                     cards,
@@ -3709,7 +4818,7 @@ def _plan_director_with_independent_segment_refine(
                     coverage_plan=coverage_plan,
                     # Allow dialogue retargeting while coverage allocations remain enforced.
                     locked_durations=False,
-                )
+                 max_segment_seconds=max_segment_seconds)
                 durations_rebalanced = durations_rebalanced or (resolved_schedule != target_schedule)
                 if structure_audit["repairs"]:
                     diagnostic_path = _save_structure_diagnostic(structure_audit)
@@ -3766,6 +4875,7 @@ def _plan_director_with_independent_segment_refine(
             attempts = attempt
             text = complete(messages, refine_max_tokens, completion_seed)
             try:
+                audio_labels = _extract_audio_voice_labels(brief)
                 prompt = _finalize_director_segment_prompt(
                     text or "",
                     engine=engine,
@@ -3774,6 +4884,16 @@ def _plan_director_with_independent_segment_refine(
                     index=segment.index,
                     required_shot_ids=_assigned_brief_shot_ids(segment.beat),
                     shot_contract_text=segment.beat,
+                    audio_slots=segment.audio_slots,
+                    audio_labels=audio_labels,
+                )
+                if segment.dialogue:
+                    prompt = _force_assigned_dialogue_in_prompt(prompt, segment.dialogue)
+                prompt = _ensure_full_reference_audio_voice_labels(
+                    prompt,
+                    segment.audio_slots,
+                    audio_labels,
+                    context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
                 )
                 last_error = None
                 break
@@ -3938,6 +5058,99 @@ def _insert_after_h3_field(prompt: str, field_name: str, lines: Iterable[str]) -
     return prompt[: line_end + 1] + content + "\n" + prompt[line_end + 1 :]
 
 
+def _ensure_full_reference_audio_voice_labels(
+    prompt: str,
+    audio_slots: Iterable[int],
+    audio_labels: dict[int, str] | None = None,
+    *,
+    context_text: str = "",
+) -> str:
+    """Rewrite or insert retention_analysis lines so <Audio N> stays a voice ref.
+
+    Models often invent ambient/Foley for standalone audio or mark a speaker's
+    voice as unused even when the group has <d> dialogue. Correct those locally.
+    UUID-only brief labels are still voice refs; bind them to inferred dialogue
+    speakers when possible.
+    """
+
+    slots = tuple(sorted({int(slot) for slot in audio_slots}))
+    if not slots or "retention_analysis:" not in (prompt or ""):
+        return prompt
+    labels = audio_labels or {}
+    context = "\n".join(part for part in (context_text or "", prompt or "") if part)
+    bindings = _resolve_audio_speaker_bindings(slots, labels, context)
+    has_dialogue = bool(re.search(r"<d\b", prompt or "", flags=re.IGNORECASE))
+
+    def _line_for(slot: int) -> str:
+        label = labels.get(slot, "")
+        speaker = bindings.get(slot, "")
+        unused = not has_dialogue
+        if has_dialogue and speaker:
+            # Speaker named but never appears near dialogue in this prompt: still
+            # keep as bound voice ref when the segment was assigned this slot.
+            unused = False
+        return _audio_voice_retention_line(slot, label, speaker=speaker, unused=unused)
+
+    start = prompt.find("retention_analysis:")
+    if start < 0:
+        return prompt
+    next_fields = [
+        prompt.find(name, start + len("retention_analysis:"))
+        for name in (
+            "detailed_description:",
+            "integrated_multimodal_description:",
+            "overall_soundscape:",
+            "non_diegetic_music:",
+        )
+    ]
+    end_candidates = [pos for pos in next_fields if pos >= 0]
+    end = min(end_candidates) if end_candidates else len(prompt)
+    head = prompt[:start]
+    field = prompt[start:end]
+    tail = prompt[end:]
+
+    kept_lines: list[str] = []
+    for raw_line in field.splitlines():
+        audio_hit = re.search(r"<Audio\s+(\d+)>", raw_line, flags=re.IGNORECASE)
+        if not audio_hit:
+            kept_lines.append(raw_line)
+            continue
+        slot = int(audio_hit.group(1))
+        if slot not in slots:
+            kept_lines.append(raw_line)
+            continue
+        if _AUDIO_RETENTION_MISUSE.search(raw_line):
+            continue
+        if re.search(r"voice|timbre|声线|说话|speaker", raw_line, flags=re.IGNORECASE):
+            # If a "good" line still invents ambient beside voice words, drop it.
+            if re.search(r"ambient|cicada|foley|瓜子|蝉", raw_line, flags=re.IGNORECASE):
+                continue
+            kept_lines.append(raw_line)
+            continue
+        continue
+
+    present = {
+        int(match.group(1))
+        for line in kept_lines
+        for match in [re.search(r"<Audio\s+(\d+)>", line, flags=re.IGNORECASE)]
+        if match
+    }
+    insertions = [_line_for(slot) for slot in slots if slot not in present]
+    original_lines = field.splitlines()
+    if not insertions and kept_lines == original_lines:
+        return prompt
+    if not kept_lines:
+        kept_lines = ["retention_analysis:"]
+    if kept_lines and kept_lines[0].strip().lower().startswith("retention_analysis:"):
+        rebuilt = [kept_lines[0], *insertions, *kept_lines[1:]]
+    else:
+        rebuilt = ["retention_analysis:", *insertions, *kept_lines]
+    body = "\n".join(rebuilt).rstrip() + "\n"
+    if tail and not tail.startswith("\n"):
+        return head + body + "\n" + tail
+    return head + body + tail
+
+
 def _ensure_full_reference_picture_labels(prompt: str, picture_slots: Iterable[int]) -> str:
     """Guarantee that Director-bound image references are visible in the H3 text."""
 
@@ -3974,7 +5187,10 @@ def _plan_continuity_flag(value: Any, default: bool) -> bool:
 
 
 def _rebalance_director_segment_durations(
-    segments: Iterable[_DirectorLongSegment], total_seconds: float
+    segments: Iterable[_DirectorLongSegment],
+    total_seconds: float,
+    *,
+    max_segment_seconds: float | None = None,
 ) -> list[_DirectorLongSegment]:
     """Scale model-chosen beats to the requested total without losing their rhythm.
 
@@ -3988,17 +5204,23 @@ def _rebalance_director_segment_durations(
     items = list(segments)
     if not items:
         return items
+    cap = _effective_max_segment_seconds(max_segment_seconds)
     current_total = sum(item.duration_seconds for item in items)
     if current_total <= 0:
         raise PromptRefinerError("Director plan has no positive segment durations to rebalance.")
     if not (
-        len(items) * MIN_DIRECTOR_SEGMENT_SECONDS <= total_seconds <= len(items) * MAX_DIRECTOR_SEGMENT_SECONDS
+        len(items) * MIN_DIRECTOR_SEGMENT_SECONDS <= total_seconds <= len(items) * cap
     ):
-        raise PromptRefinerError("Requested Director duration cannot be represented by the returned group count.")
+        raise PromptRefinerError(
+            f"The returned {len(items)} Director groups can represent "
+            f"{len(items) * MIN_DIRECTOR_SEGMENT_SECONDS:g} to "
+            f"{len(items) * cap:g} seconds; "
+            f"requested total is {total_seconds:g} seconds."
+        )
 
     ratio = total_seconds / current_total
     values = [
-        min(MAX_DIRECTOR_SEGMENT_SECONDS, max(MIN_DIRECTOR_SEGMENT_SECONDS, item.duration_seconds * ratio))
+        min(cap, max(MIN_DIRECTOR_SEGMENT_SECONDS, item.duration_seconds * ratio))
         for item in items
     ]
     # One or more clips may have hit a legal boundary. Reallocate the remaining
@@ -4008,7 +5230,7 @@ def _rebalance_director_segment_durations(
         if abs(difference) < 0.00001:
             break
         if difference > 0:
-            capacity = [MAX_DIRECTOR_SEGMENT_SECONDS - value for value in values]
+            capacity = [cap - value for value in values]
         else:
             capacity = [value - MIN_DIRECTOR_SEGMENT_SECONDS for value in values]
         available = sum(max(0.0, item) for item in capacity)
@@ -4019,7 +5241,7 @@ def _rebalance_director_segment_durations(
                 continue
             change = difference * (room / available)
             if difference > 0:
-                values[index] = min(MAX_DIRECTOR_SEGMENT_SECONDS, values[index] + change)
+                values[index] = min(cap, values[index] + change)
             else:
                 values[index] = max(MIN_DIRECTOR_SEGMENT_SECONDS, values[index] + change)
 
@@ -4029,7 +5251,7 @@ def _rebalance_director_segment_durations(
         if abs(residue) <= 0.0001:
             break
         if residue > 0:
-            adjustment = min(residue, round(MAX_DIRECTOR_SEGMENT_SECONDS - values[index], 3))
+            adjustment = min(residue, round(cap - values[index], 3))
         else:
             adjustment = max(residue, round(MIN_DIRECTOR_SEGMENT_SECONDS - values[index], 3))
         values[index] = round(values[index] + adjustment, 3)
@@ -4101,10 +5323,9 @@ def _validate_long_director_plan(
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        # Honor per-segment PICTURES by default.  Empty/missing falls back to
-        # every connected still.  anchor_all_pictures restores the old force-all
-        # behavior so every R2V group carries the full still set.  FL2V ignores
-        # asset lists.
+        # Honor per-segment PICTURES/AUDIOS by default.  Empty/missing falls back
+        # to every connected still / standalone audio.  anchor_all_pictures
+        # restores the old force-all still set.  FL2V ignores asset lists.
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
             raw.get("assets", {}),
@@ -4116,6 +5337,7 @@ def _validate_long_director_plan(
             anchor_all_pictures=anchor_all_pictures,
         )
         prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
+        prompt = _ensure_full_reference_audio_voice_labels(prompt, audios)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
         continuity = _plan_continuity_flag(raw_continuity, index > 1) if index > 1 else False
         segments.append(
@@ -5416,9 +6638,11 @@ class Qwen38LongVideoDirectorPlanner:
                         "default": False,
                         "label": "Prioritize story completeness (allow duration overrun)",
                         "tooltip": (
-                            "Off: total duration is a hard budget. On: total duration is a target/minimum; "
-                            "when STORY_BEATS estimates need more time, the planner may expand the final plan "
-                            f"up to {MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f} seconds instead of compressing plot."
+                            "Off: stick as close as possible to total_duration_seconds. On: that widget total is a "
+                            "soft target — STORY_BEATS estimated_seconds (and later dialogue pacing) may pull the "
+                            "plan over or under it. Shot ranges are coverage only and never multiply into the total. "
+                            "Every group stays inside 4s..segment_duration_seconds, with a safety ceiling of "
+                            f"{MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s."
                         ),
                     },
                 ),
@@ -5677,6 +6901,7 @@ class Qwen38LongVideoDirectorPlanner:
                         seed=int(seed),
                         anchor_all_pictures=bool(anchor_all_pictures),
                         max_segment_seconds=float(segment_duration_seconds),
+                        allow_duration_overrun=bool(allow_duration_overrun),
                     )
                 )
                 effective_max_tokens = int(refine_record["segment_refine_max_tokens"])
@@ -5820,3 +7045,170 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen38LongVideoDirectorPlanner": "Qwen3.8 Long Video Planner → MiniMax H3 Director",
     "Qwen38DirectorGroupReRefiner": "Qwen3.8 Director Group Re-Refiner",
 }
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
+# pad-for-mmap-overwrite
