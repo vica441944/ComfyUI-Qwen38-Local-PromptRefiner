@@ -186,8 +186,7 @@ class LongDirectorRefineTests(unittest.TestCase):
         )
 
         self.assertEqual(title, "Night office")
-        # Unlock keeps structure DURATION_SECONDS (8/12/10) vs equal host seed → rebalanced.
-        self.assertTrue(rebalanced)
+        self.assertFalse(rebalanced)
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(call["seed"] == 7 for call in calls))
         self.assertEqual(calls[0]["max_tokens"], max(512 + 3 * 480, 4096))
@@ -1444,6 +1443,24 @@ class StoryShotAudioBindingTests(unittest.TestCase):
         # when the shot already named an audio tag.
         self.assertEqual(out[0]["assets"]["audios"], [2])
 
+    def test_shot_contract_lifts_exact_dialogue_without_beat_duplication(self) -> None:
+        brief = (
+            "分镜1使用参考:\n"
+            "柳二姐抬眼说「（声音慵懒）蛇不就在这吗？来，摸摸看。」然后靠近。\n"
+        )
+        out = nodes._apply_story_shot_contract([self._card()], brief, self._plan_one_shot())
+        self.assertEqual(out[0]["dialogue"], "（声音慵懒）蛇不就在这吗？来，摸摸看。")
+        self.assertNotIn("蛇不就在这吗", out[0]["beat"])
+        self.assertIn("然后靠近", out[0]["beat"])
+
+    def test_shot_contract_preserves_structure_dialogue_when_shot_has_none(self) -> None:
+        card = self._card()
+        card["dialogue"] = "柳二姐: （声音慵懒）蛇不就在这吗？"
+        brief = "分镜1使用参考:\n柳二姐抬眼，然后靠近。\n"
+        out = nodes._apply_story_shot_contract([card], brief, self._plan_one_shot())
+        self.assertEqual(out[0]["dialogue"], card["dialogue"])
+        self.assertIn("柳二姐抬眼", out[0]["beat"])
+
 
 class R2VPictureSelectionTests(unittest.TestCase):
     """Tighten mode keeps per-segment stills; full-anchor restores force-all."""
@@ -1730,6 +1747,16 @@ if __name__ == "__main__":
 
 
 class CoverageKnifeTests(unittest.TestCase):
+    def test_dialogue_landmark_ignores_delivery_cue_but_keeps_spoken_words(self) -> None:
+        cue_landmark = nodes._normalize_dialogue_needle("（声音慵懒）蛇不就在这吗")
+        panting_landmark = nodes._normalize_dialogue_needle("（娇喘）啊……弟弟好大")
+        spoken = nodes._normalize_dialogue_needle("柳二姐「蛇不就在这吗？来，摸摸看。」")
+        self.assertEqual(cue_landmark, "蛇不就在这吗")
+        self.assertEqual(panting_landmark, "啊弟弟好大")
+        self.assertIn(cue_landmark, spoken)
+        # Parentheses without delivery-cue words remain semantically significant.
+        self.assertIn("明天", nodes._normalize_dialogue_needle("我们（明天）出发"))
+
     """Host-side beat floor + proportional compression when budget < Σest."""
 
     JOB18_EST = (45.0, 20.0, 30.0, 40.0, 50.0, 30.0, 45.0)
@@ -2483,6 +2510,75 @@ Both continue down the path.
         # Quotes stripped from BEAT so refine does not double-speak.
         self.assertNotIn("Please show me", joined_beat)
         self.assertNotIn("Follow me along", joined_beat)
+
+    def test_repair_preserves_d_tag_dialogue_and_ignores_speaker_label_landmark(self) -> None:
+        """Regression: BEAT <d> lines survive a 17.111s split; 女声 is not a quote."""
+        schedule = (10.0, 10.0)
+        structure = """TITLE: Tagged dialogue repair
+=== SEGMENT 1 ===
+DURATION_SECONDS: 10
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+The woman approaches the doorway and pauses.
+DIALOGUE:
+NONE
+HANDOFF:
+She looks into the room.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 17.111
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+She enters and says <d>[Chinese] 你终于来了，我一直在这里等你。</d> 随后他转身回答 <d>[Chinese] 路上耽搁了一会儿，我们现在开始吧。</d>
+DIALOGUE:
+NONE
+HANDOFF:
+They face each other beside the table.
+=== END SEGMENT ==="""
+        _title, cards = nodes._parse_director_structure_output(structure)
+        self.assertEqual(
+            nodes._beat_quoted_speech_units(cards[1]["beat"]),
+            ["你终于来了，我一直在这里等你。", "路上耽搁了一会儿，我们现在开始吧。"],
+        )
+        story_beat = nodes._story_beat_from_fields(
+            1, 27.111, None, None, "dialogue scene", structure, ["女声"]
+        )
+        self.assertEqual(story_beat.key_dialogue, ())
+        plan = nodes._CoverageKnifePlan(
+            beats=(story_beat,), budget_seconds=20.0, group_count=2,
+            estimated_sum=27.111, compressed=True, allocations=(20.0,),
+            card_counts=(2,), segment_to_beat=(1, 1),
+        )
+        audit: dict = {"schedule": schedule, "outputs": [], "repairs": []}
+
+        def _complete(messages, _max_tokens, _seed):
+            payload = json.loads(messages[-1]["content"])
+            beat = payload["beat"]
+            cut = beat.index("随后")
+            return json.dumps({"parts": [
+                {"beat": beat[:cut].rstrip(), "dialogue": "", "handoff": "The first line ends."},
+                {"beat": beat[cut:].lstrip(), "dialogue": "", "handoff": payload["handoff"]},
+            ]}, ensure_ascii=False)
+
+        repaired, resolved, _out_plan = nodes._repair_structure_duration_cards(
+            cards, schedule, plan, _complete, 1024, 0, audit,
+            max_segment_seconds=15.0, allow_duration_overrun=True,
+        )
+        dialogue = "\n".join(card.get("dialogue") or "" for card in repaired)
+        beat = "\n".join(card.get("beat") or "" for card in repaired)
+        self.assertIn("你终于来了，我一直在这里等你。", dialogue)
+        self.assertIn("路上耽搁了一会儿，我们现在开始吧。", dialogue)
+        self.assertNotIn("<d>", beat)
+        self.assertAlmostEqual(sum(resolved), audit["expanded_total_seconds"], places=3)
+        self.assertEqual(audit["overflow_budget_expand_detail"]["overflow_segments"], [2])
 
     def test_repair_expands_soft_target_when_speech_overflows_exceed_schedule(self) -> None:
         """Overrun ON: speech overflows beyond 45s expand soft target and split without truncating."""

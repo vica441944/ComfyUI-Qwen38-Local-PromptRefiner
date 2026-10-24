@@ -1143,8 +1143,11 @@ def _director_duration_schedule(
     count = max(1, int(np.ceil(total_seconds / max_segment_seconds)))
     count = min(count, max(1, int(total_seconds // MIN_DIRECTOR_SEGMENT_SECONDS)))
     each = total_seconds / count
-    if not MIN_DIRECTOR_SEGMENT_SECONDS <= each <= MAX_DIRECTOR_SEGMENT_SECONDS:
-        raise PromptRefinerError("The requested total duration cannot be divided into valid 4–15 second H3 groups.")
+    if not MIN_DIRECTOR_SEGMENT_SECONDS <= each <= max_segment_seconds:
+        raise PromptRefinerError(
+            f"The requested total duration cannot be divided into valid "
+            f"{MIN_DIRECTOR_SEGMENT_SECONDS:.0f}–{max_segment_seconds:g} second H3 groups."
+        )
     # Distribute milliseconds rather than accumulating rounded error in the
     # final card (e.g. 180.123s / 45 used to leave a 3.991s tail).
     milliseconds, remainder = divmod(round(total_seconds * 1000), count)
@@ -2087,12 +2090,16 @@ def _dialogue_speech_units(text: str) -> float:
 
 _BEAT_ASCII_DOUBLE_QUOTE = re.compile(r'"([^"\n]{2,120})"')
 _BEAT_CURLY_DOUBLE_QUOTE = re.compile(r"[“]([^”]{2,120})[”]")
+_BEAT_DIALOGUE_TAG = re.compile(
+    r"<d(?:\s+[^>]*)?>\s*(?:\[[^\]\r\n]+\]\s*)?(.*?)\s*</d>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def _beat_quote_pattern_list() -> tuple[re.Pattern[str], ...]:
-    """Corner-bracket + ASCII/curly double-quote scanners (module-level patterns)."""
+    """Spoken-span scanners for BEAT, including MiniMax ``<d>`` dialogue tags."""
 
-    return (_DIALOGUE_QUOTE, _BEAT_ASCII_DOUBLE_QUOTE, _BEAT_CURLY_DOUBLE_QUOTE)
+    return (_DIALOGUE_QUOTE, _BEAT_ASCII_DOUBLE_QUOTE, _BEAT_CURLY_DOUBLE_QUOTE, _BEAT_DIALOGUE_TAG)
 
 
 def _iter_beat_quote_matches(beat: str) -> list[re.Match[str]]:
@@ -2688,7 +2695,26 @@ AUDIO VOICE CONTRACT (standalone <Audio N> / @reference_audio_N):
 def _normalize_dialogue_needle(text: str) -> str:
     """Collapse punctuation/whitespace so landmark lines still match paraphrased spacing."""
 
-    collapsed = re.sub(r"\s+", "", (text or "").strip())
+    raw = (text or "").strip()
+    # Parenthetical delivery directions are metadata, not spoken words.  A
+    # structure card may preserve "蛇不就在这吗" while legitimately moving or
+    # omitting "（声音慵懒）" from DIALOGUE.  Drop only cue-like parentheses;
+    # ordinary parenthetical dialogue content remains part of the landmark.
+    # In screenplay-style dialogue, one or more leading parentheticals are
+    # always delivery/action directions (e.g. （娇喘）, （停顿后，低声）).
+    raw = re.sub(r"^(?:\s*[（(][^）)\r\n]{1,80}[）)]\s*)+", "", raw)
+    cue_words = (
+        r"声音|语气|语调|声线|轻声|低声|高声|小声|大声|慵懒|温柔|急促|喘息|"
+        r"耳语|呢喃|喊|笑|哭|softly|quietly|loudly|whisper(?:ing)?|"
+        r"languid(?:ly)?|breath(?:y|ily)|shout(?:ing)?|laugh(?:ing)?|crying"
+    )
+    raw = re.sub(
+        rf"[（(][^）)\r\n]*(?:{cue_words})[^）)\r\n]*[）)]",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    collapsed = re.sub(r"\s+", "", raw)
     collapsed = re.sub(r"[…\.…·・，,。.!！?？:：;；、\-—_~～\"'“”‘’「」『』（）()【】\[\]]+", "", collapsed)
     return collapsed.casefold()
 
@@ -2712,7 +2738,7 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     selected: list[str] = []
     norms: list[str] = []
     for token in ranked:
-        if _is_placeholder_landmark(token):
+        if _is_placeholder_landmark(token) or _is_speaker_only_landmark(token):
             continue
         norm = _normalize_dialogue_needle(token)
         if len(norm) < 2:
@@ -2754,7 +2780,9 @@ def _story_beat_from_fields(
     keys = tuple(
         item.strip()
         for item in (key_dialogue or ())
-        if str(item).strip() and not _is_placeholder_landmark(str(item))
+        if str(item).strip()
+        and not _is_placeholder_landmark(str(item))
+        and not _is_speaker_only_landmark(str(item))
     )
     if not keys:
         keys = _extract_dialogue_landmarks(body)
@@ -3117,6 +3145,13 @@ def _apply_story_shot_contract(
             )
         for card_position, assigned_shots in zip(card_positions, partitions):
             exact = "\n\n".join(blocks[shot] for shot in assigned_shots)
+            exact_dialogue_units = _beat_quoted_speech_units(exact)
+            exact_dialogue = "\n".join(exact_dialogue_units).strip()
+            exact_beat = (
+                _strip_beat_quote_spans(exact, set(exact_dialogue_units))
+                if exact_dialogue_units
+                else exact
+            )
             pictures = sorted({
                 int(slot) for slot in re.findall(r"<Picture\s+(\d+)>", exact, flags=re.IGNORECASE)
             })
@@ -3148,11 +3183,14 @@ def _apply_story_shot_contract(
             assets["audios"] = audios
             ordered[card_position] = {
                 **card,
-                "beat": exact,
-                # The exact shot block already contains every quoted line. Do
-                # not duplicate it in DIALOGUE: that field participates in the
-                # speech-duration budget and would count the same line twice.
-                "dialogue": "",
+                "beat": exact_beat,
+                # Exact shot dialogue is authoritative. Lift it into DIALOGUE
+                # and remove the matching quote span from BEAT so it is counted
+                # once. If this shot slice contains no quoted line, retain the
+                # structure pass dialogue instead of silently deleting it.
+                "dialogue": exact_dialogue or _clean_structure_dialogue(
+                    str(card.get("dialogue") or "")
+                ),
                 "assets": assets,
             }
     return ordered
@@ -3246,6 +3284,20 @@ def _is_placeholder_landmark(landmark: str) -> bool:
     return len(_normalize_dialogue_needle(raw)) < 2
 
 
+def _is_speaker_only_landmark(landmark: str) -> bool:
+    """A voice/speaker label identifies who talks; it is not verbatim dialogue."""
+
+    raw = re.sub(r"\s+", "", (landmark or "").strip()).casefold()
+    if not raw:
+        return False
+    return bool(re.fullmatch(
+        r"(?:男声|女声|旁白|画外音|电话(?:中|里|那头)?(?:的)?(?:男声|女声)|"
+        r"voice\d*|speaker\d*|malevoice|femalevoice|narrator)",
+        raw,
+        flags=re.IGNORECASE,
+    ))
+
+
 def _format_coverage_landmark_miss(misses: Iterable[str], *, limit: int = 180) -> str:
     tokens = [str(item).strip() for item in misses if str(item).strip()]
     if not tokens:
@@ -3293,7 +3345,7 @@ def _validate_structure_coverage(
         # only records lines that are absent from the whole plan.
         global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
-            if _is_placeholder_landmark(landmark):
+            if _is_placeholder_landmark(landmark) or _is_speaker_only_landmark(landmark):
                 continue
             needle = _normalize_dialogue_needle(landmark)
             if len(needle) < 2:
@@ -4482,6 +4534,12 @@ def _repair_structure_duration_cards(
             remaining = round(total - overflow_sum, 3)
             audit["expanded_total_seconds"] = total
             audit["overflow_budget_expand"] = True
+            audit["overflow_budget_expand_detail"] = {
+                "reason": "speech_overflow_exceeds_target_budget",
+                "original_total_seconds": round(sum(schedule), 3),
+                "expanded_total_seconds": total,
+                "overflow_segments": [pos + 1 for pos in sorted(overflows)],
+            }
         else:
             hint = (
                 " Enable allow_duration_overrun or raise total_duration_seconds."
@@ -4653,6 +4711,12 @@ def _repair_structure_duration_cards(
                     seconds = fitted_sum
                     audit["expanded_total_seconds"] = total
                     audit["overflow_budget_expand"] = True
+                    audit["overflow_budget_expand_detail"] = {
+                        "reason": "repaired_dialogue_requires_more_time",
+                        "original_total_seconds": round(sum(schedule), 3),
+                        "expanded_total_seconds": total,
+                        "overflow_segment": pos + 1,
+                    }
                 for part, duration in zip(parts, assigned_times):
                     if _dialogue_speech_units(part["dialogue"]) / _DIALOGUE_WORDS_PER_SECOND > duration + 0.02:
                         raise PromptRefinerError("Local repair dialogue does not fit its assigned duration.")
