@@ -1567,7 +1567,13 @@ def _select_director_segment_assets(
     *,
     anchor_all_pictures: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Validate model-selected slots.  R2V honors per-segment pictures unless full-anchor is on."""
+    """Validate model-selected slots.
+
+    R2V honors per-segment pictures. An empty or missing picture list attaches
+    no stills. ``anchor_all_pictures`` is the only path that forces every
+    connected still onto the group. Standalone audio still falls back when its
+    list is empty, because Qwen-VL cannot hear those clips.
+    """
 
     if raw_assets is None:
         raw_assets = {}
@@ -1575,19 +1581,22 @@ def _select_director_segment_assets(
         raise PromptRefinerError(f"Director plan segment {index} assets must be a JSON object.")
     if mode != DIRECTOR_LONG_R2V_MODE:
         return (), (), (), ()
+    # Empty or missing PICTURES means this group carries no stills. Do not
+    # expand it to every connected reference_image_*. anchor_all_pictures
+    # below is the only force-all path.
     pictures = _plan_slot_list(
         raw_assets.get("pictures"),
         image_slots,
         "pictures",
-        fallback_when_empty=True,
+        fallback_when_empty=False,
     )
     if anchor_all_pictures:
         pictures = tuple(sorted(set(image_slots)))
     videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
     paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
-    # Same empty-list rescue as pictures: Qwen-VL cannot hear audio, so structure
-    # cards / coverage knife often emit audios:[]. Without this, connected
-    # reference_audio_* never reach ui_specs or materialized Group ref_audio pins.
+    # Qwen-VL cannot hear audio, so structure cards often emit audios:[].
+    # Keep this empty-list rescue so connected reference_audio_* still reach
+    # ui_specs and materialized Group ref_audio pins. Pictures do not use it.
     audios = _plan_slot_list(
         raw_assets.get("audios"),
         audio_slots,
@@ -1823,11 +1832,12 @@ def _segment_visual_references(
 ) -> tuple[list[tuple[int, str]], list[_DirectorVideoFrames]]:
     """Limit a refine call to the frames that belong to this group.
 
-    R2V attaches only the picture slots selected for this group (or every
-    connected still when anchor-all / empty-selection fallback filled them).
-    FL2V sends the first frame only to group 1, the last frame only to the
-    final group, and supplemental pictures 3–9 to planning.  Video batches
-    are attached only when the structure pass assigned them.
+    R2V attaches only the picture slots listed for this group. An empty
+    selection attaches no stills. ``anchor_all_pictures`` fills every
+    connected still before this filter runs. FL2V sends the first frame only
+    to group 1, the last frame only to the final group, and supplemental
+    pictures 3–9 to planning. Video batches are attached only when the
+    structure pass assigned them.
     """
 
     images = list(image_references)
@@ -5081,11 +5091,17 @@ def _plan_slot_list(
     *,
     fallback_when_empty: bool = False,
 ) -> tuple[int, ...]:
-    """Validate a model-selected one-based asset list against actual connected slots."""
+    """Validate a model-selected one-based asset list against actual connected slots.
+
+    A missing value (``None``) and an empty list both mean "no slots" unless
+    ``fallback_when_empty`` is set, in which case every connected slot is used.
+    """
 
     connected_slots = set(connected)
-    if raw is None or (fallback_when_empty and raw == []):
-        return tuple(sorted(connected_slots))
+    if raw is None or raw == []:
+        if fallback_when_empty:
+            return tuple(sorted(connected_slots))
+        return ()
     if not isinstance(raw, list):
         raise PromptRefinerError(f"Director plan field assets.{field_name} must be a JSON list of slot numbers.")
     selected: list[int] = []
@@ -5387,9 +5403,9 @@ def _validate_long_director_plan(
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        # Honor per-segment PICTURES/AUDIOS by default.  Empty/missing falls back
-        # to every connected still / standalone audio.  anchor_all_pictures
-        # restores the old force-all still set.  FL2V ignores asset lists.
+        # Empty or missing PICTURES attaches no stills. Empty or missing AUDIOS
+        # still falls back to every connected standalone audio. anchor_all_pictures
+        # forces every connected still onto the group. FL2V ignores asset lists.
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
             raw.get("assets", {}),
@@ -6589,9 +6605,9 @@ class Qwen38LongVideoDirectorPlanner:
                         "default": False,
                         "label": "Anchor all pictures",
                         "tooltip": (
-                            "Default off (tighten): each R2V group only carries the pictures that segment listed "
-                            "(empty selection falls back to all connected stills). Turn on (全挂锚图) to restore "
-                            "the old behavior that attaches every connected picture to every R2V group."
+                            "Default off: each R2V group carries only the pictures that segment listed. "
+                            "An empty or missing PICTURES list attaches no stills (空＝不挂图). "
+                            "Turn on (全挂锚图) to attach every connected picture to every R2V group."
                         ),
                     },
                 ),

@@ -198,7 +198,7 @@ class LongDirectorRefineTests(unittest.TestCase):
         )
         self.assertEqual(segments[0].picture_slots, (1,))
         self.assertEqual(segments[1].picture_slots, (1,))
-        self.assertEqual(segments[2].picture_slots, (1, 2))  # empty PICTURES → all connected
+        self.assertEqual(segments[2].picture_slots, ())  # empty PICTURES → no stills
         self.assertEqual(segments[0].video_slots, (1,))
         self.assertEqual(segments[1].video_slots, (2,))
         self.assertEqual(segments[1].video_audio_slots, (2,))
@@ -219,8 +219,8 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertIn("uri-video-2a", json.dumps(calls[2]["parts"]))
         self.assertIn("uri-picture-1", json.dumps(calls[2]["parts"]))
         self.assertNotIn("uri-picture-2", json.dumps(calls[2]["parts"]))
-        self.assertIn("uri-picture-1", json.dumps(calls[3]["parts"]))
-        self.assertIn("uri-picture-2", json.dumps(calls[3]["parts"]))
+        self.assertNotIn("uri-picture-1", json.dumps(calls[3]["parts"]))
+        self.assertNotIn("uri-picture-2", json.dumps(calls[3]["parts"]))
         self.assertNotIn("uri-video-2a", json.dumps(calls[3]["parts"]))
         self.assertIn("<Audio 1>", calls[3]["user"])
         self.assertIn("per_segment_refine:", debug)
@@ -256,7 +256,7 @@ class LongDirectorRefineTests(unittest.TestCase):
         self.assertTrue(groups[1]["continuityFromPrev"])
         self.assertFalse(groups[2]["continuityFromPrev"])
         self.assertEqual(set(groups[1]["ref_images"]), {0})
-        self.assertEqual(set(groups[2]["ref_images"]), {0, 1})
+        self.assertEqual(groups[2]["ref_images"], {})
         self.assertEqual(set(groups[1]["ref_videos"]), {1})
         self.assertEqual(set(groups[2]["ref_videos"]), set())
         self.assertIn("UNIQUE_PROMPT_TWO", groups[1]["prompt"])
@@ -1354,7 +1354,7 @@ class LlamaPerformanceKwargTests(unittest.TestCase):
 
 
 class R2VAudioSelectionTests(unittest.TestCase):
-    """Standalone audio must survive empty AUDIOS the same way pictures do."""
+    """Standalone audio still falls back when AUDIOS is empty. Pictures do not."""
 
     def test_empty_audio_selection_falls_back_to_all_connected(self) -> None:
         _pictures, _videos, _paired, audios = nodes._select_director_segment_assets(
@@ -1463,7 +1463,7 @@ class StoryShotAudioBindingTests(unittest.TestCase):
 
 
 class R2VPictureSelectionTests(unittest.TestCase):
-    """Tighten mode keeps per-segment stills; full-anchor restores force-all."""
+    """Empty PICTURES attaches no stills; anchor_all_pictures still force-attaches every connected still."""
 
     def test_model_selected_pictures_are_kept(self) -> None:
         pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
@@ -1476,28 +1476,138 @@ class R2VPictureSelectionTests(unittest.TestCase):
             (),
         )
         self.assertEqual(pictures, (1, 3))
+        with self.assertRaises(nodes.PromptRefinerError):
+            nodes._select_director_segment_assets(
+                R2V,
+                {"pictures": [4], "videos": [], "video_audios": [], "audios": []},
+                1,
+                (1, 2, 3),
+                (),
+                (),
+                (),
+            )
 
-    def test_empty_picture_selection_falls_back_to_all_connected(self) -> None:
-        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+    def test_empty_or_missing_pictures_attach_no_stills(self) -> None:
+        connected = tuple(range(1, 10))
+        pictures, videos, _paired, audios = nodes._select_director_segment_assets(
             R2V,
             {"pictures": [], "videos": [], "video_audios": [], "audios": []},
             2,
-            (1, 2, 3),
+            connected,
+            (1,),
+            (),
+            (1, 2),
+        )
+        self.assertEqual(pictures, ())
+        self.assertEqual(videos, ())
+        self.assertEqual(audios, (1, 2))
+        missing_pictures, missing_videos, _paired, missing_audios = nodes._select_director_segment_assets(
+            R2V,
+            {},
+            3,
+            connected,
+            (1,),
+            (),
+            (3,),
+        )
+        self.assertEqual(missing_pictures, ())
+        self.assertEqual(missing_videos, ())
+        self.assertEqual(missing_audios, (3,))
+
+        segment = nodes._DirectorLongSegment(
+            index=1,
+            duration_seconds=8.0,
+            prompt=r2v_prompt("BLANK"),
+            picture_slots=pictures,
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=audios,
+            continuity_from_prev=False,
+        )
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            [segment],
+            {slot: f"image-{slot}" for slot in connected},
+            {},
+            {},
+            {1: "audio-1", 2: "audio-2"},
+        )
+        self.assertEqual(groups[0]["ref_images"], {})
+        self.assertEqual(set(groups[0]["ref_audios"]), {0, 1})
+
+    def test_blank_shot_reference_does_not_fan_wire_connected_stills(self) -> None:
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|8|1-1|hold|\n"
+            "[/STORY_BEATS]\n"
+            "<Picture 1> 主角甲, <Picture 2> 客厅全景, <Picture 9> 红伞道具\n"
+            "分镜1使用参考:\n"
+            "人物停下，没有指定参考图。\n"
+        )
+        beat = nodes._story_beat_from_fields(1, 8.0, 1, 1, "hold", "")
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=8.0,
+            group_count=1,
+            estimated_sum=8.0,
+            compressed=False,
+            allocations=(8.0,),
+            card_counts=(1,),
+            segment_to_beat=(1,),
+        )
+        card = {
+            "index": 1,
+            "duration_raw": "8",
+            "continuity_raw": "false",
+            "beat": "placeholder",
+            "dialogue": "",
+            "handoff": "end",
+            "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+        }
+        contracted = nodes._apply_story_shot_contract([card], brief, plan)
+        self.assertEqual(contracted[0]["assets"]["pictures"], [])
+        connected = tuple(range(1, 10))
+        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+            R2V,
+            contracted[0]["assets"],
+            1,
+            connected,
             (),
             (),
             (),
         )
-        self.assertEqual(pictures, (1, 2, 3))
-        missing = nodes._select_director_segment_assets(
+        self.assertEqual(pictures, ())
+        anchored, _videos, _paired, _audios = nodes._select_director_segment_assets(
             R2V,
+            contracted[0]["assets"],
+            1,
+            connected,
+            (),
+            (),
+            (),
+            anchor_all_pictures=True,
+        )
+        self.assertEqual(anchored, connected)
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            [
+                nodes._DirectorLongSegment(
+                    index=1,
+                    duration_seconds=8.0,
+                    prompt=r2v_prompt("BLANK", picture=False),
+                    picture_slots=pictures,
+                    video_slots=(),
+                    video_audio_slots=(),
+                    audio_slots=(),
+                    continuity_from_prev=False,
+                )
+            ],
+            {slot: f"image-{slot}" for slot in connected},
             {},
-            3,
-            (1, 2),
-            (),
-            (),
-            (),
-        )[0]
-        self.assertEqual(missing, (1, 2))
+            {},
+            {},
+        )
+        self.assertEqual(groups[0]["ref_images"], {})
 
     def test_anchor_all_pictures_forces_every_connected_still(self) -> None:
         pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
@@ -1596,11 +1706,65 @@ N/A
         self.assertEqual(anchored[0].picture_slots, (1, 2, 3))
         self.assertEqual(anchored[1].picture_slots, (1, 2, 3))
 
+    def test_marked_empty_pictures_line_packs_no_ref_images(self) -> None:
+        prompt = r2v_prompt("EMPTY", picture=False)
+        plan = f"""
+TITLE: No stills
+=== SEGMENT 1 ===
+DURATION_SECONDS: 8
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS: 1
+PROMPT:
+{prompt}
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 8
+CONTINUITY_FROM_PREV: true
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+PROMPT:
+{prompt}
+=== END SEGMENT ===
+""".strip()
+        _title, segments, _rebalanced = nodes._validate_long_director_plan(
+            plan,
+            R2V,
+            (8.0, 8.0),
+            image_slots=tuple(range(1, 10)),
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(1,),
+            lora_triggers=(),
+        )
+        self.assertEqual(segments[0].picture_slots, ())
+        self.assertEqual(segments[1].picture_slots, ())
+        self.assertEqual(segments[0].audio_slots, (1,))
+        self.assertEqual(segments[1].audio_slots, (1,))
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            segments,
+            {slot: f"image-{slot}" for slot in range(1, 10)},
+            {},
+            {},
+            {1: "audio-1"},
+        )
+        self.assertEqual(groups[0]["ref_images"], {})
+        self.assertEqual(groups[1]["ref_images"], {})
+        self.assertEqual(groups[0]["ref_audios"], {0: "audio-1"})
+
     def test_planner_exposes_anchor_all_pictures_widget(self) -> None:
         required = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["required"]
         self.assertIn("anchor_all_pictures", required)
         self.assertEqual(required["anchor_all_pictures"][0], "BOOLEAN")
         self.assertFalse(required["anchor_all_pictures"][1]["default"])
+        tooltip = required["anchor_all_pictures"][1]["tooltip"]
+        self.assertIn("空＝不挂图", tooltip)
+        self.assertIn("no stills", tooltip)
+        self.assertNotIn("falls back to all connected stills", tooltip)
 
 
 
