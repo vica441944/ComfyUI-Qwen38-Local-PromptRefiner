@@ -1349,12 +1349,16 @@ def _json_object_from_model_output(text: str) -> dict[str, Any]:
 
 
 def _marked_plan_slot_list(header: str, field_name: str) -> list[int]:
-    """Read the short `PICTURES: 1, 2` lines in the long-planner return format."""
+    """Read the short `PICTURES: 1, 2` lines in the long-planner return format.
+
+    The value is only the rest of that line. Whitespace must not cross into the
+    next field: an empty ``PICTURES:`` would otherwise capture ``VIDEOS:`` or
+    ``AUDIOS: 1`` and turn a blank still list into some other slot.
+    """
 
     match = re.search(
-        rf"^\s*{re.escape(field_name)}\s*:\s*(.*?)\s*$",
+        rf"(?im)^[^\S\n]*{re.escape(field_name)}[^\S\n]*:[^\S\n]*([^\n]*)",
         header,
-        flags=re.IGNORECASE | re.MULTILINE,
     )
     if not match:
         return []

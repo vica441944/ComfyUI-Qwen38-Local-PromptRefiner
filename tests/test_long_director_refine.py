@@ -1742,6 +1742,8 @@ PROMPT:
         )
         self.assertEqual(segments[0].picture_slots, ())
         self.assertEqual(segments[1].picture_slots, ())
+        self.assertEqual(segments[0].video_slots, ())
+        self.assertEqual(segments[0].video_audio_slots, ())
         self.assertEqual(segments[0].audio_slots, (1,))
         self.assertEqual(segments[1].audio_slots, (1,))
         groups, _packer = nodes._pack_director_long_groups(
