@@ -1573,10 +1573,10 @@ def _select_director_segment_assets(
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     """Validate model-selected slots.
 
-    R2V honors per-segment pictures. An empty or missing picture list attaches
-    no stills. ``anchor_all_pictures`` is the only path that forces every
-    connected still onto the group. Standalone audio still falls back when its
-    list is empty, because Qwen-VL cannot hear those clips.
+    R2V honors per-segment pictures and standalone audios. An empty or missing
+    list attaches nothing. ``anchor_all_pictures`` is the only path that forces
+    every connected still onto the group. Shot-contract tags and voice-mapped
+    speakers fill ``audios`` before this check; connected pins alone do not.
     """
 
     if raw_assets is None:
@@ -1598,14 +1598,14 @@ def _select_director_segment_assets(
         pictures = tuple(sorted(set(image_slots)))
     videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
     paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
-    # Qwen-VL cannot hear audio, so structure cards often emit audios:[].
-    # Keep this empty-list rescue so connected reference_audio_* still reach
-    # ui_specs and materialized Group ref_audio pins. Pictures do not use it.
+    # Empty or missing AUDIOS means this group carries no standalone voice ref.
+    # Do not expand it to every connected reference_audio_*. A previous beat
+    # pack can leave those pins wired after the new brief stops using them.
     audios = _plan_slot_list(
         raw_assets.get("audios"),
         audio_slots,
         "audios",
-        fallback_when_empty=True,
+        fallback_when_empty=False,
     )
     if any(slot not in videos for slot in paired):
         raise PromptRefinerError(
@@ -3099,6 +3099,21 @@ def _picture_label_aliases(label: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+def _audio_slots_named_in_text(text: str) -> frozenset[int]:
+    """Return standalone audio slots named in this text.
+
+    ``@reference_audio_N`` and ``<Audio N>`` count. A connected Comfy pin with
+    no tag in the text does not.
+    """
+
+    raw = text or ""
+    return frozenset(
+        int(slot) for slot in re.findall(r"@reference_audio_(\d+)\b", raw, flags=re.IGNORECASE)
+    ) | frozenset(
+        int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", raw, flags=re.IGNORECASE)
+    )
+
+
 def _apply_story_shot_contract(
     cards: list[dict[str, Any]], brief: str, plan: _CoverageKnifePlan | None,
 ) -> list[dict[str, Any]]:
@@ -3123,14 +3138,10 @@ def _apply_story_shot_contract(
         for speaker in (_speaker_from_audio_label(label),)
         if speaker
     }
-    # NV beat packs declare standalone audio as Global @reference_audio_N filename
-    # (no <Audio N> ... voice-line). Keep those slots available when a shot
-    # does not retarget audio explicitly.
-    global_audios = sorted({
-        int(slot) for slot in re.findall(r"@reference_audio_(\d+)\b", brief or "", flags=re.IGNORECASE)
-    } | {
-        int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", brief or "", flags=re.IGNORECASE)
-    })
+    # An explicit Global @reference_audio_N / <Audio N> line is a brief tag.
+    # Shots that do not name their own slot still receive those tags. Connected
+    # reference_audio_* pins that the brief never names are not included.
+    global_audios = sorted(_audio_slots_named_in_text(brief))
     picture_descriptions = {
         int(match.group("slot")): _picture_label_aliases(match.group("label"))
         for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or "")
@@ -3176,13 +3187,7 @@ def _apply_story_shot_contract(
             # Prefer explicit <Audio N> / @reference_audio_N tags in the shot
             # (parity with <Picture N>). Also bind voice-mapped speakers that
             # have an actual quoted line in the assigned shot slice.
-            audios = sorted({
-                int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", exact, flags=re.IGNORECASE)
-            } | {
-                int(slot) for slot in re.findall(
-                    r"@reference_audio_(\d+)\b", exact, flags=re.IGNORECASE
-                )
-            } | {
+            audios = sorted(_audio_slots_named_in_text(exact) | {
                 slot for name, slot in voices.items()
                 if name and re.search(re.escape(name) + r"\s*[「『\"]", exact)
             })
@@ -4090,13 +4095,18 @@ def _single_group_structure_segment(
     """A one-group project has nothing to split, so refine the brief directly."""
 
     duration = round(float(tuple(schedule)[0]), 3)
+    # One group has no structure card. Hang only the audio slots the brief
+    # actually names; connected reference_audio_* pins are not a selection.
+    named_audios = [
+        slot for slot in audio_slots if slot in _audio_slots_named_in_text(brief)
+    ]
     pictures, videos, paired, audios = _select_director_segment_assets(
         mode,
         {
             "pictures": list(image_slots),
             "videos": list(video_slots),
             "video_audios": list(video_audio_slots),
-            "audios": list(audio_slots),
+            "audios": named_audios,
         },
         1,
         image_slots,
@@ -5505,9 +5515,9 @@ def _validate_long_director_plan(
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        # Empty or missing PICTURES attaches no stills. Empty or missing AUDIOS
-        # still falls back to every connected standalone audio. anchor_all_pictures
-        # forces every connected still onto the group. FL2V ignores asset lists.
+        # Empty or missing PICTURES / AUDIOS attaches nothing. Explicit lists are
+        # validated against connected slots. anchor_all_pictures forces every
+        # connected still onto the group. FL2V ignores asset lists.
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
             raw.get("assets", {}),
