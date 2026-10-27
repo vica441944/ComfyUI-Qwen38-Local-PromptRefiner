@@ -2739,8 +2739,7 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     raw = text or ""
     found: list[str] = []
     for match in _KEY_DIALOGUE_LINE.finditer(raw):
-        for part in re.split(r"[;；|/／]", match.group(1)):
-            token = part.strip()
+        for token in _split_landmark_list(match.group(1)):
             if len(token) >= 2:
                 found.append(token)
     for match in _DIALOGUE_QUOTE.finditer(raw):
@@ -2752,7 +2751,7 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     selected: list[str] = []
     norms: list[str] = []
     for token in ranked:
-        if _is_placeholder_landmark(token) or _is_speaker_only_landmark(token):
+        if _is_non_dialogue_landmark(token):
             continue
         norm = _normalize_dialogue_needle(token)
         if len(norm) < 2:
@@ -2794,9 +2793,7 @@ def _story_beat_from_fields(
     keys = tuple(
         item.strip()
         for item in (key_dialogue or ())
-        if str(item).strip()
-        and not _is_placeholder_landmark(str(item))
-        and not _is_speaker_only_landmark(str(item))
+        if str(item).strip() and not _is_non_dialogue_landmark(str(item))
     )
     if not keys:
         keys = _extract_dialogue_landmarks(body)
@@ -2825,7 +2822,7 @@ def _parse_story_beats_block(brief: str) -> list[_StoryBeatSpec]:
             continue
         shot_start, shot_end = _parse_shot_range_token(row.group("shots"))
         keys_raw = row.group("keys") or ""
-        keys = [part.strip() for part in re.split(r"[;；|/／]", keys_raw) if part.strip()]
+        keys = _split_landmark_list(keys_raw)
         beats.append(
             _story_beat_from_fields(
                 int(row.group(1)),
@@ -3287,6 +3284,103 @@ def _cards_coverage_blob(cards: Iterable[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _split_landmark_list(text: str) -> list[str]:
+    """Split a landmark list on ``;；|/／`` without cutting inside brackets or quotes.
+
+    ``角色甲（画外;平静）;请往前走`` stays a direction cue plus one spoken line.
+    A naive split would turn the parenthetical semicolon into fragments.
+    """
+
+    raw = text or ""
+    if not raw.strip():
+        return []
+    closers = {"(": ")", "（": "）", "「": "」", "『": "』", "“": "”", "‘": "’"}
+    separators = set(";；|/／")
+    parts: list[str] = []
+    buf: list[str] = []
+    stack: list[str] = []
+    for char in raw:
+        if stack and char == stack[-1]:
+            stack.pop()
+            buf.append(char)
+            continue
+        if char in closers:
+            stack.append(closers[char])
+            buf.append(char)
+            continue
+        if char in separators and not stack:
+            token = "".join(buf).strip()
+            if token:
+                parts.append(token)
+            buf = []
+            continue
+        buf.append(char)
+    token = "".join(buf).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+
+def _landmark_brackets_balanced(text: str) -> bool:
+    """False when parentheses or quotes were cut apart by a list split."""
+
+    closers = {"(": ")", "（": "）", "「": "」", "『": "』", "“": "”", "‘": "’"}
+    closer_chars = set(closers.values())
+    stack: list[str] = []
+    ascii_quote = False
+    for char in text or "":
+        if char == '"':
+            ascii_quote = not ascii_quote
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            continue
+        if char in closers:
+            stack.append(closers[char])
+            continue
+        if char in closer_chars:
+            return False
+    return not stack and not ascii_quote
+
+
+_DIRECTION_ONLY_LANDMARK = re.compile(
+    r"^(?:画外音?|旁白|内心(?:独白)?|独白|对白|os|vo|"
+    r"平静|冷静|低声|高声|轻声|小声|大声|耳语|呢喃)$",
+    flags=re.IGNORECASE,
+)
+_AMBIENT_SFX_LANDMARK = re.compile(
+    r"^[\u4e00-\u9fff]{0,8}(?:笑声|哭声|脚步声|环境音|风声|雨声|蝉鸣|掌声|"
+    r"喧哗声|嘈杂声|呼吸声|喘息声|敲门声|铃声|吱呀声)$"
+)
+
+
+def _is_non_dialogue_landmark(landmark: str) -> bool:
+    """Drop fragments, delivery cues, and ambient labels. Keep spoken lines."""
+
+    raw = (landmark or "").strip()
+    if not raw:
+        return True
+    if not _landmark_brackets_balanced(raw):
+        return True
+    if _is_placeholder_landmark(raw) or _is_speaker_only_landmark(raw):
+        return True
+    stripped = raw.strip("\"'“”‘’「」『』")
+    if _DIRECTION_ONLY_LANDMARK.fullmatch(re.sub(r"\s+", "", stripped)):
+        return True
+    if (
+        not re.search(r"[。！？!?说问道喊叫]", stripped)
+        and _AMBIENT_SFX_LANDMARK.fullmatch(stripped)
+    ):
+        return True
+    if re.search(r"[（(）)]", raw):
+        without = re.sub(r"[（(][^）)]*[）)]", "", raw).strip().strip("\"'“”‘’")
+        if not without or re.fullmatch(r"[\u4e00-\u9fffA-Za-z·・]{1,8}", without):
+            return True
+        if _DIRECTION_ONLY_LANDMARK.fullmatch(re.sub(r"\s+", "", without)):
+            return True
+    return False
+
+
 def _is_placeholder_landmark(landmark: str) -> bool:
     """Skip NV-style placeholders such as （露骨台词） / (explicit ...) / empty."""
 
@@ -3359,7 +3453,7 @@ def _validate_structure_coverage(
         # only records lines that are absent from the whole plan.
         global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
-            if _is_placeholder_landmark(landmark) or _is_speaker_only_landmark(landmark):
+            if _is_non_dialogue_landmark(landmark):
                 continue
             needle = _normalize_dialogue_needle(landmark)
             if len(needle) < 2:
@@ -4769,6 +4863,10 @@ def _repair_structure_duration_cards(
         coverage_plan = replace(coverage_plan, group_count=len(result),
                                 card_counts=tuple(result_beats.count(i + 1) for i in range(len(coverage_plan.beats))),
                                 segment_to_beat=tuple(result_beats))
+        # Soft misses stay a returned list before repair. After a duration split,
+        # a real spoken landmark that disappeared still aborts. Direction cues,
+        # cut-off parentheses, and ambient SFX are not landmarks, so they cannot
+        # fail this check.
         misses = _validate_structure_coverage(result, coverage_plan)
         if misses:
             raise PromptRefinerError("Repaired structure has missing dialogue landmarks: " + "; ".join(misses))

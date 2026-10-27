@@ -2277,6 +2277,108 @@ Handoff {seg_index}.
         misses = nodes._validate_structure_coverage(cards, plan)
         self.assertEqual(misses, [])
 
+    def test_parenthetical_key_split_is_not_a_landmark(self) -> None:
+        brief = """
+[STORY_BEATS]
+1|20|1-2|arrival|角色甲（画外;平静）;"人群笑声;请往前走
+[/STORY_BEATS]
+""".strip()
+        beats = nodes._parse_story_beats_block(brief)
+        self.assertEqual(beats[0].key_dialogue, ("请往前走",))
+        self.assertEqual(
+            nodes._split_landmark_list("角色甲（画外;平静）;请往前走"),
+            ["角色甲（画外;平静）", "请往前走"],
+        )
+        for token in ("角色甲（画外", "平静）", '"人群笑声', "角色甲（画外;平静）"):
+            self.assertTrue(nodes._is_non_dialogue_landmark(token))
+        kept = nodes._parse_story_beats_block(
+            "[STORY_BEATS]\n1|20|1-2|talk|你好世界;另一句完整台词\n[/STORY_BEATS]"
+        )
+        self.assertEqual(kept[0].key_dialogue, ("你好世界", "另一句完整台词"))
+        cues_only = nodes._parse_story_beats_block(
+            "[STORY_BEATS]\n1|20|1-2|arrival|角色甲（画外;平静）;\"人群笑声\n[/STORY_BEATS]"
+        )
+        self.assertEqual(cues_only[0].key_dialogue, ())
+
+    def _repair_two_cards(self, key_dialogue: tuple[str, ...]):
+        beat = nodes._StoryBeatSpec(
+            index=1,
+            estimated_seconds=20.0,
+            shot_start=1,
+            shot_end=2,
+            label="arrival",
+            body="",
+            key_dialogue=key_dialogue,
+        )
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=20.0,
+            group_count=2,
+            estimated_sum=20.0,
+            compressed=False,
+            allocations=(10.0, 10.0),
+            card_counts=(2,),
+            segment_to_beat=(1, 1),
+        )
+        structure = """
+TITLE: Fragment landmarks
+=== SEGMENT 1 ===
+DURATION_SECONDS: 12
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Alpha action. Beta action.
+DIALOGUE:
+请往前走。
+HANDOFF:
+Hold at the doorway.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 8
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Second card holds.
+DIALOGUE:
+NONE
+HANDOFF:
+Still at the doorway.
+=== END SEGMENT ===
+""".strip()
+        _title, cards = nodes._parse_director_structure_output(structure)
+        audit: dict = {"schedule": (10.0, 10.0), "outputs": [], "repairs": []}
+
+        def complete(_messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {"beat": "Alpha action.", "dialogue": "", "handoff": "Between actions."},
+                    {"beat": "Beta action.", "dialogue": "请往前走。", "handoff": "Hold at the doorway."},
+                ]
+            })
+
+        return nodes._repair_structure_duration_cards(
+            cards, (10.0, 10.0), plan, complete, 1024, 0, audit,
+            max_segment_seconds=10.0,
+        )
+
+    def test_repaired_structure_ignores_direction_fragments(self) -> None:
+        fragments = ("角色甲（画外", "平静）", '"人群笑声')
+        repaired, resolved, _plan = self._repair_two_cards(fragments)
+        self.assertEqual(len(repaired), 3)
+        self.assertAlmostEqual(sum(resolved), 20.0, places=3)
+        misses = nodes._validate_structure_coverage(repaired, _plan)
+        self.assertEqual(misses, [])
+
+    def test_repaired_structure_still_requires_real_landmarks(self) -> None:
+        with self.assertRaisesRegex(nodes.PromptRefinerError, "missing dialogue landmarks: beat1:MUST_KEEP_LINE_ZX9"):
+            self._repair_two_cards(("MUST_KEEP_LINE_ZX9",))
+
     def test_structure_allocates_cards_and_keeps_trailing_duration_floor(self) -> None:
         plan = nodes._build_coverage_knife_plan(
             self._story_beats_brief(),
