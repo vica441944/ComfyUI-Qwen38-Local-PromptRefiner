@@ -3099,6 +3099,35 @@ def _picture_label_aliases(label: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+def _picture_slots_named_in_text(text: str) -> frozenset[int]:
+    """Return still slots named as ``<Picture N>`` or ``@reference_image_N``."""
+
+    raw = text or ""
+    return frozenset(
+        int(slot) for slot in re.findall(r"<Picture\s+(\d+)>", raw, flags=re.IGNORECASE)
+    ) | frozenset(
+        int(slot) for slot in re.findall(r"@reference_image_(\d+)\b", raw, flags=re.IGNORECASE)
+    )
+
+
+def _picture_slots_for_materialize(
+    picture_slots: Iterable[int],
+    prompt: str,
+    connected: Iterable[int],
+) -> tuple[int, ...]:
+    """Keep shot-contract stills and any picture the finished prompt actually names.
+
+    A connected ``reference_image_N`` is hung when the authoritative list or the
+    segment prompt cites it. Citations of slots that are not linked are ignored.
+    An empty list with no citation stays empty.
+    """
+
+    allowed = {int(slot) for slot in connected}
+    selected = {int(slot) for slot in picture_slots if int(slot) in allowed}
+    cited = {slot for slot in _picture_slots_named_in_text(prompt) if slot in allowed}
+    return tuple(sorted(selected | cited))
+
+
 def _audio_slots_named_in_text(text: str) -> frozenset[int]:
     """Return standalone audio slots named in this text.
 
@@ -3174,9 +3203,9 @@ def _apply_story_shot_contract(
                 if exact_dialogue_units
                 else exact
             )
-            pictures = sorted({
-                int(slot) for slot in re.findall(r"<Picture\s+(\d+)>", exact, flags=re.IGNORECASE)
-            })
+            # 使用参考 may say <Picture N> or @reference_image_N. An empty line
+            # names neither, so it does not inherit every connected still.
+            pictures = sorted(_picture_slots_named_in_text(exact))
             # Global scene references often are not repeated on every
             # “分镜N使用参考” line. Attach them only when their descriptive
             # location appears in this exact shot slice.
@@ -5101,13 +5130,16 @@ def _plan_director_with_independent_segment_refine(
             raise PromptRefinerError(
                 f"Director segment {segment.index} prompt refinement failed after 2 attempts. {last_error}"
             ) from last_error
-        refined.append(replace(segment, prompt=prompt))
+        picture_slots = segment.picture_slots
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            picture_slots = _picture_slots_for_materialize(picture_slots, prompt, image_slots)
+        refined.append(replace(segment, prompt=prompt, picture_slots=picture_slots))
         passes.append(
             {
                 "index": segment.index,
                 "attempts": attempts,
                 "continuity_from_prev": segment.continuity_from_prev,
-                "pictures": list(segment.picture_slots),
+                "pictures": list(picture_slots),
                 "videos": list(segment.video_slots),
                 "video_audios": list(segment.video_audio_slots),
                 "audios": list(segment.audio_slots),
@@ -5530,6 +5562,8 @@ def _validate_long_director_plan(
         )
         prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
         prompt = _ensure_full_reference_audio_voice_labels(prompt, audios)
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            pictures = _picture_slots_for_materialize(pictures, prompt, image_slots)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
         continuity = _plan_continuity_flag(raw_continuity, index > 1) if index > 1 else False
         segments.append(

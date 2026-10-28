@@ -1722,6 +1722,141 @@ class R2VPictureSelectionTests(unittest.TestCase):
         )
         self.assertEqual(groups[0]["ref_images"], {})
 
+    def test_at_reference_image_shot_line_fills_pictures(self) -> None:
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|8|1-1|hold|\n"
+            "[/STORY_BEATS]\n"
+            "@reference_image_9 unused.png\n"
+            "分镜1使用参考: @reference_image_1, @reference_image_2\n"
+            "人物站在办公室。\n"
+        )
+        beat = nodes._story_beat_from_fields(1, 8.0, 1, 1, "hold", "")
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=8.0,
+            group_count=1,
+            estimated_sum=8.0,
+            compressed=False,
+            allocations=(8.0,),
+            card_counts=(1,),
+            segment_to_beat=(1,),
+        )
+        card = {
+            "index": 1,
+            "duration_raw": "8",
+            "continuity_raw": "false",
+            "beat": "placeholder",
+            "dialogue": "",
+            "handoff": "end",
+            "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+        }
+        contracted = nodes._apply_story_shot_contract([card], brief, plan)
+        self.assertEqual(contracted[0]["assets"]["pictures"], [1, 2])
+        pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
+            R2V,
+            contracted[0]["assets"],
+            1,
+            (1, 2, 3),
+            (),
+            (),
+            (),
+        )
+        self.assertEqual(pictures, (1, 2))
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            [
+                nodes._DirectorLongSegment(
+                    index=1,
+                    duration_seconds=8.0,
+                    prompt=r2v_prompt("OFFICE"),
+                    picture_slots=pictures,
+                    video_slots=(),
+                    video_audio_slots=(),
+                    audio_slots=(),
+                    continuity_from_prev=False,
+                )
+            ],
+            {1: "image-1", 2: "image-2", 3: "image-3"},
+            {},
+            {},
+            {},
+        )
+        self.assertEqual(set(groups[0]["ref_images"]), {0, 1})
+
+        blank = (
+            "[STORY_BEATS]\n"
+            "1|8|1-1|hold|\n"
+            "[/STORY_BEATS]\n"
+            "@reference_image_1 hero.png\n"
+            "@reference_image_2 office.png\n"
+            "分镜1使用参考:\n"
+            "人物停下。\n"
+        )
+        empty = nodes._apply_story_shot_contract([card], blank, plan)
+        self.assertEqual(empty[0]["assets"]["pictures"], [])
+
+    def test_prompt_cited_picture_is_packed_when_linked(self) -> None:
+        prompt = (
+            "subject_definitions:\n"
+            "<Picture 1> subject, fully_preserved.\n"
+            "<Picture 2> office environment, fully_preserved.\n"
+            "summary:\n"
+            "The subject enters the office.\n"
+            "retention_analysis:\n"
+            "<Picture 1>: identity.\n"
+            "<Picture 2>: office.\n"
+            "detailed_description:\n"
+            "[Shot 1] The subject crosses the room.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+        self.assertEqual(nodes._picture_slots_for_materialize((1,), prompt, (1, 2)), (1, 2))
+        self.assertEqual(nodes._picture_slots_for_materialize((1,), prompt, (1,)), (1,))
+        silent = r2v_prompt("QUIET", picture=False)
+        self.assertEqual(nodes._picture_slots_for_materialize((), silent, (1, 2, 3)), ())
+        self.assertEqual(
+            nodes._picture_slots_for_materialize((), silent + "\n@reference_image_2 office.png", (1, 2)),
+            (2,),
+        )
+        plan = f"""
+TITLE: Cited still
+=== SEGMENT 1 ===
+DURATION_SECONDS: 8
+CONTINUITY_FROM_PREV: false
+PICTURES: 1
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+PROMPT:
+{prompt}
+=== END SEGMENT ===
+""".strip()
+        _title, segments, _rebalanced = nodes._validate_long_director_plan(
+            plan,
+            R2V,
+            (8.0,),
+            image_slots=(1, 2),
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            lora_triggers=(),
+        )
+        self.assertEqual(segments[0].picture_slots, (1, 2))
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            segments,
+            {1: "image-1", 2: "image-2"},
+            {},
+            {},
+            {},
+        )
+        self.assertEqual(set(groups[0]["ref_images"]), {0, 1})
+        specs = nodes._director_ui_group_specs(R2V, segments)
+        self.assertEqual(specs[0]["pictures"], [1, 2])
+
     def test_anchor_all_pictures_forces_every_connected_still(self) -> None:
         pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
             R2V,
