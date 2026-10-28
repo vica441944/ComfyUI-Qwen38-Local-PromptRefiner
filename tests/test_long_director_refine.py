@@ -2008,6 +2008,118 @@ PROMPT:
         )
         self.assertEqual(segments[0].picture_slots, (1, 2))
 
+    def test_at_reference_image_labels_bind_scene_and_pack_keys(self) -> None:
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|16|1-2|talk|\n"
+            "[/STORY_BEATS]\n"
+            "Global reference description:\n"
+            "@reference_image_1 小程, @reference_image_2 赵凤红, @reference_image_3 办公室.\n"
+            "分镜1使用参考:\n"
+            "小程在办公室里看见赵凤红。\n"
+            "分镜2使用参考:\n"
+            "赵凤红靠近镜头。\n"
+        )
+        normalized = nodes._normalize_director_asset_links(
+            brief, {1: "a", 2: "b", 3: "c"}, {}, {}, {},
+        )
+        self.assertIn("<Picture 3> 办公室", normalized)
+        self.assertNotIn("@reference_image_3", normalized)
+        beat = nodes._story_beat_from_fields(1, 16.0, 1, 2, "talk", "")
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=16.0,
+            group_count=2,
+            estimated_sum=16.0,
+            compressed=False,
+            allocations=(8.0, 8.0),
+            card_counts=(2,),
+            segment_to_beat=(1, 1),
+        )
+        cards = []
+        for index in (1, 2):
+            cards.append({
+                "index": index,
+                "duration_raw": "8",
+                "continuity_raw": "false" if index == 1 else "true",
+                "beat": "placeholder",
+                "dialogue": "",
+                "handoff": "end",
+                "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+            })
+        out = nodes._apply_story_shot_contract(cards, brief, plan)
+        self.assertEqual(out[0]["assets"]["pictures"], [1, 2, 3])
+        self.assertEqual(out[1]["assets"]["pictures"], [2])
+        self.assertFalse(nodes._is_scene_picture_label("赵凤红"))
+        self.assertFalse(nodes._is_scene_picture_label("小程"))
+        self.assertTrue(nodes._is_scene_picture_label("办公室"))
+
+        prompt = (
+            "subject_definitions:\n"
+            "<Subject 1> Heroine, identified from <Picture 2>, must retain her face.\n"
+            "<Environment> Office interior, implied by the window light.\n"
+            "summary:\n"
+            "She stays in the office.\n"
+            "retention_analysis:\n"
+            "<Picture 2>: identity.\n"
+            "detailed_description:\n"
+            "[Shot 1] The camera holds.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+        slots = nodes._picture_slots_for_materialize((2,), prompt, (1, 2, 3))
+        scene = nodes._scene_slots_for_bare_environment(prompt, "", brief, (1, 2, 3), slots)
+        self.assertEqual(scene, (3,))
+        slots = tuple(sorted(set(slots) | set(scene)))
+        bound = nodes._ensure_full_reference_picture_labels(prompt, slots)
+        environment = next(line for line in bound.splitlines() if "<Environment>" in line)
+        self.assertIn("identified from <Picture 3>", environment)
+        self.assertIn("<Picture 2>", bound)
+        segment = nodes._DirectorLongSegment(
+            index=2,
+            duration_seconds=8.0,
+            prompt=bound,
+            picture_slots=slots,
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            continuity_from_prev=True,
+        )
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V,
+            [segment],
+            {1: "image-1", 2: "image-2", 3: "image-3"},
+            {},
+            {},
+            {},
+        )
+        self.assertEqual(groups[0]["ref_images"][1], "image-2")
+        self.assertEqual(groups[0]["ref_images"][2], "image-3")
+        self.assertNotIn(0, groups[0]["ref_images"])
+        specs = nodes._director_ui_group_specs(R2V, [segment])
+        self.assertEqual(specs[0]["pictures"], [2, 3])
+
+        quiet = (
+            "subject_definitions:\n"
+            "<Subject 1> Heroine.\n"
+            "summary:\n"
+            "She waits.\n"
+            "retention_analysis:\n"
+            "No still.\n"
+            "detailed_description:\n"
+            "[Shot 1] She waits.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+        self.assertEqual(
+            nodes._scene_slots_for_bare_environment(quiet, "人物停下。", brief, (1, 2, 3), ()),
+            (),
+        )
+
     def test_anchor_all_pictures_forces_every_connected_still(self) -> None:
         pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
             R2V,

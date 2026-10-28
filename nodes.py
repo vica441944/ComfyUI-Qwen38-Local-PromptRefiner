@@ -991,8 +991,9 @@ def _normalize_asset_links(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
         tag = f"<{labels[kind]} {slot}>"
-        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
-        if kind == "audio":
+        # Keep the words after the tag. NV writes "@reference_image_3 办公室"
+        # and "@reference_audio_1 小程声音参考".
+        if kind in {"audio", "image"}:
             trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
             if trailing:
                 return tag + trailing.group(0)
@@ -1101,8 +1102,9 @@ def _normalize_director_asset_links(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
         tag = f"<{labels[kind]} {slot}>"
-        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
-        if kind == "audio":
+        # Keep the words after the tag. NV writes "@reference_image_3 办公室"
+        # and "@reference_audio_1 小程声音参考".
+        if kind in {"audio", "image"}:
             trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
             if trailing:
                 return tag + trailing.group(0)
@@ -3165,6 +3167,122 @@ def _picture_label_aliases(label: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+_AT_PICTURE_LABEL = re.compile(
+    r"@reference_image_(?P<slot>\d+)\b[ \t]*(?P<label>[^@\n,，;；]*)",
+    flags=re.IGNORECASE,
+)
+# Place words, not character names. A label matches when it names a space.
+_SCENE_PICTURE_LABEL = re.compile(
+    r"(?:"
+    r"办公室|室内|室外|内景|外景|场景|走廊|房间|客厅|卧室|厨房|门口|村口|"
+    r"[\u4e00-\u9fff]{0,12}(?:室|厅|房|屋|廊|景)"
+    r"|office|interior|exterior|indoors?|outdoors?|room|scene|hallway|corridor|lobby"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_scene_picture_label(label: str) -> bool:
+    """True when a global still label names a place rather than a person."""
+
+    text = re.sub(r"\s+", "", label or "")
+    if len(text) < 2:
+        return False
+    return bool(_SCENE_PICTURE_LABEL.search(text))
+
+
+def _picture_description_labels(brief: str) -> dict[int, str]:
+    """Map still slots to the global label after ``<Picture N>`` or ``@reference_image_N``."""
+
+    labels: dict[int, str] = {}
+
+    def _keep(slot: int, raw: str) -> None:
+        cleaned = (raw or "").strip().strip("。.;；:：,，")
+        if not cleaned:
+            return
+        previous = labels.get(slot, "")
+        if len(cleaned) >= len(previous):
+            labels[slot] = cleaned
+
+    for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    for match in _AT_PICTURE_LABEL.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    return labels
+
+
+def _picture_descriptions_from_brief(brief: str) -> dict[int, tuple[str, ...]]:
+    """Aliases for global still labels, including NV ``@reference_image_N`` lines."""
+
+    return {
+        slot: _picture_label_aliases(label)
+        for slot, label in _picture_description_labels(brief).items()
+        if _picture_label_aliases(label)
+    }
+
+
+def _alias_matched_picture_slots(
+    text: str,
+    brief: str,
+    connected: Iterable[int],
+) -> tuple[int, ...]:
+    """Slots whose global label appears in this shot or group text."""
+
+    allowed = {int(slot) for slot in connected}
+    found: list[int] = []
+    for slot, aliases in _picture_descriptions_from_brief(brief).items():
+        if slot not in allowed:
+            continue
+        if any(alias and alias in (text or "") for alias in aliases):
+            found.append(slot)
+    return tuple(sorted(found))
+
+
+def _scene_slots_for_bare_environment(
+    prompt: str,
+    context_text: str,
+    brief: str,
+    connected: Iterable[int],
+    already: Iterable[int],
+) -> tuple[int, ...]:
+    """Bind one uncited scene still when ``<Environment>`` names no picture.
+
+    Several scene stills attach only when their own label appears in the group
+    text. A single uncited scene still is the source of a bare Environment line.
+    Character labels are not scene stills and are never added here.
+    """
+
+    bare = False
+    for match in _ENVIRONMENT_LINE.finditer(prompt or ""):
+        if not re.search(r"<Picture\s+\d+>", match.group(2) or "", flags=re.IGNORECASE):
+            bare = True
+            break
+    if not bare:
+        return ()
+    allowed = {int(slot) for slot in connected}
+    owned = {int(slot) for slot in already}
+    labels = _picture_description_labels(brief)
+    scene_slots = [
+        slot
+        for slot, label in labels.items()
+        if slot in allowed and slot not in owned and _is_scene_picture_label(label)
+    ]
+    if not scene_slots:
+        return ()
+    descriptions = _picture_descriptions_from_brief(brief)
+    haystack = f"{context_text or ''}\n{prompt or ''}"
+    mentioned = [
+        slot
+        for slot in scene_slots
+        if any(alias and alias in haystack for alias in descriptions.get(slot, ()))
+    ]
+    if mentioned:
+        return tuple(sorted(mentioned))
+    if len(scene_slots) == 1:
+        return (scene_slots[0],)
+    return ()
+
+
 def _picture_slots_named_in_text(text: str) -> frozenset[int]:
     """Return still slots named as ``<Picture N>`` or ``@reference_image_N``."""
 
@@ -3237,10 +3355,8 @@ def _apply_story_shot_contract(
     # Shots that do not name their own slot still receive those tags. Connected
     # reference_audio_* pins that the brief never names are not included.
     global_audios = sorted(_audio_slots_named_in_text(brief))
-    picture_descriptions = {
-        int(match.group("slot")): _picture_label_aliases(match.group("label"))
-        for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or "")
-    }
+    # <Picture N> label and NV @reference_image_N label share one alias table.
+    picture_descriptions = _picture_descriptions_from_brief(brief)
     for beat_position, beat in enumerate(active.beats, start=1):
         if beat.shot_start is None or beat.shot_end is None:
             continue
@@ -5211,6 +5327,15 @@ def _plan_director_with_independent_segment_refine(
                 prompt,
                 image_slots,
             )
+            picture_slots = tuple(sorted(set(picture_slots) | set(
+                _alias_matched_picture_slots(f"{segment.beat}\n{prompt}", brief, image_slots)
+            )))
+            scene_slots = _scene_slots_for_bare_environment(
+                prompt, segment.beat, brief, image_slots, picture_slots,
+            )
+            if scene_slots:
+                picture_slots = tuple(sorted(set(picture_slots) | set(scene_slots)))
+                prompt = _ensure_full_reference_picture_labels(prompt, picture_slots)
         refined.append(replace(segment, prompt=prompt, picture_slots=picture_slots))
         passes.append(
             {
