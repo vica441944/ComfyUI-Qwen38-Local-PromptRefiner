@@ -1666,69 +1666,135 @@ def _decorate_full_reference_prompt(
     return _ensure_full_reference_picture_labels(prompt, picture_slots)
 
 
+_SPEAKER_ID_PREFIX = re.compile(r"^(?:[(（]\s*S\d+\s*[)）]\s*)+", flags=re.IGNORECASE)
+_ASSIGNED_D_WRAPPER = re.compile(
+    r"^\s*<d>\s*(?:\[[^\]\n]+\]\s*)?(.*?)\s*</d>\s*$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _unwrap_assigned_spoken_line(line: str) -> str:
+    """Reduce one assigned line to spoken words, without speaker ids or <d> wrappers."""
+
+    text = (line or "").strip()
+    for _ in range(8):
+        if not text:
+            break
+        stripped = _SPEAKER_ID_PREFIX.sub("", text).strip()
+        wrapped = _ASSIGNED_D_WRAPPER.fullmatch(stripped)
+        if wrapped:
+            text = wrapped.group(1).strip()
+            continue
+        if stripped != text:
+            text = stripped
+            continue
+        break
+    return text.strip()
+
+
+def _dialogue_tag_spans(text: str) -> list[tuple[int, int, str]]:
+    """Outermost ``<d>`` spans, so a nested ``<d>…<d>…</d></d>`` is one span."""
+
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    while cursor < len(text):
+        match = re.search(r"<d\b[^>]*>", text[cursor:], flags=re.IGNORECASE)
+        if not match:
+            break
+        start = cursor + match.start()
+        open_end = cursor + match.end()
+        depth = 1
+        pos = open_end
+        end: int | None = None
+        while pos < len(text) and depth:
+            nxt = re.search(r"</d>|<d\b[^>]*>", text[pos:], flags=re.IGNORECASE)
+            if not nxt:
+                break
+            token = nxt.group(0)
+            at = pos + nxt.start()
+            if token.lower().startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    end = pos + nxt.end()
+                    break
+                pos = pos + nxt.end()
+            else:
+                depth += 1
+                pos = pos + nxt.end()
+        if end is None:
+            cursor = open_end
+            continue
+        body = text[open_end : end - len("</d>")]
+        lang_match = re.match(r"\s*\[([^\]]+)\]", body)
+        lang = lang_match.group(1).strip() if lang_match else ""
+        spans.append((start, end, lang))
+        cursor = end
+    return spans
+
+
+def _strip_unassigned_spoken_lines(prompt: str) -> str:
+    """Drop spoken ``<d>`` spans when this group was assigned no dialogue."""
+
+    spans = _dialogue_tag_spans(prompt or "")
+    if not spans:
+        return prompt
+    out = prompt
+    for start, end, _lang in reversed(spans):
+        out = out[:start] + out[end:]
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r" +([,.;:!?，。！？])", r"\1", out)
+    return re.sub(r"\n{3,}", "\n\n", out)
+
+
+def _spoken_tag(line: str, lang: str = "") -> str:
+    language = lang or ("Chinese" if _CJK_SPEECH_CHAR.search(line) else "English")
+    return f"<d>[{language}] {line}</d>"
+
+
 def _force_assigned_dialogue_in_prompt(prompt: str, dialogue: str) -> str:
     """Replace refined <d> bodies with structure-assigned DIALOGUE (no brief restart).
 
     Structure partition may split one spoken line across adjacent groups as
     prefix|remainder. Refine still sees the full line in the project brief and
     can restart it. When DIALOGUE is pre-assigned, pin <d> contents to that
-    assignment so adjacent groups never re-speak a shared prefix.
+    assignment so adjacent groups never re-speak a shared prefix. An empty
+    assignment removes spoken <d> lines. Assigned text is unwrapped first so a
+    line that already contains ``(S1)`` / ``<d>`` cannot nest inside another tag.
     """
 
+    if not (prompt or "").strip():
+        return prompt
     cleaned = _clean_structure_dialogue(dialogue)
-    if not cleaned or not (prompt or "").strip():
-        return prompt
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    lines = [
+        _unwrap_assigned_spoken_line(line)
+        for line in cleaned.splitlines()
+        if _unwrap_assigned_spoken_line(line)
+    ]
     if not lines:
-        return prompt
-    pattern = re.compile(
-        r"(<d>\s*\[[^\]\n]+\]\s*)(.*?)(</d>)",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    matches = list(pattern.finditer(prompt))
-    if not matches:
-        first = lines[0]
-        lang0 = "Chinese" if _CJK_SPEECH_CHAR.search(first) else "English"
-        injection = f"<d>[{lang0}] {first}</d>"
-        for more in lines[1:]:
-            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
-            injection += f"\n<d>[{lang}] {more}</d>"
+        return _strip_unassigned_spoken_lines(prompt)
+    spans = _dialogue_tag_spans(prompt)
+    if not spans:
+        injection = "\n".join(_spoken_tag(line) for line in lines)
         anchor = re.search(r"(?im)^overall_soundscape\s*:", prompt)
         if anchor:
             return prompt[: anchor.start()].rstrip() + "\n" + injection + "\n" + prompt[anchor.start() :]
         return prompt.rstrip() + "\n" + injection
 
     out = prompt
-    if len(lines) == 1:
-        first = matches[0]
-        replacement = f"{first.group(1)}{lines[0]}{first.group(3)}"
-        pieces: list[tuple[int, int, str]] = [(first.start(), first.end(), replacement)]
-        for match in matches[1:]:
-            pieces.append((match.start(), match.end(), ""))
-        for start_i, end_i, repl in reversed(pieces):
-            out = out[:start_i] + repl + out[end_i:]
-        out = re.sub(r"\n{3,}", "\n\n", out)
-        return out
-
-    for index, match in reversed(list(enumerate(matches))):
+    for index, (start, end, lang) in reversed(list(enumerate(spans))):
         if index < len(lines):
-            repl = f"{match.group(1)}{lines[index]}{match.group(3)}"
+            repl = _spoken_tag(lines[index], lang)
         else:
             repl = ""
-        out = out[: match.start()] + repl + out[match.end() :]
-    if len(lines) > len(matches):
-        extras = []
-        for more in lines[len(matches) :]:
-            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
-            extras.append(f"<d>[{lang}] {more}</d>")
-        block = "\n".join(extras)
+        out = out[:start] + repl + out[end:]
+    if len(lines) > len(spans):
+        extras = "\n".join(_spoken_tag(line) for line in lines[len(spans) :])
         anchor = re.search(r"(?im)^overall_soundscape\s*:", out)
         if anchor:
-            out = out[: anchor.start()].rstrip() + "\n" + block + "\n" + out[anchor.start() :]
+            out = out[: anchor.start()].rstrip() + "\n" + extras + "\n" + out[anchor.start() :]
         else:
-            out = out.rstrip() + "\n" + block
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out
+            out = out.rstrip() + "\n" + extras
+    return re.sub(r"\n{3,}", "\n\n", out)
 
 
 def _finalize_director_segment_prompt(
@@ -3229,13 +3295,10 @@ def _apply_story_shot_contract(
             ordered[card_position] = {
                 **card,
                 "beat": exact_beat,
-                # Exact shot dialogue is authoritative. Lift it into DIALOGUE
-                # and remove the matching quote span from BEAT so it is counted
-                # once. If this shot slice contains no quoted line, retain the
-                # structure pass dialogue instead of silently deleting it.
-                "dialogue": exact_dialogue or _clean_structure_dialogue(
-                    str(card.get("dialogue") or "")
-                ),
+                # The assigned shot slice is authoritative. A slice with no
+                # quoted speech is empty dialogue, even when the structure pass
+                # left the previous group's line on this card.
+                "dialogue": exact_dialogue,
                 "assets": assets,
             }
     return ordered
@@ -4032,8 +4095,8 @@ def _build_long_director_segment_request(
         dialogue_body = segment.dialogue
     else:
         dialogue_rule = (
-            "No dialogue was pre-assigned. Use a spoken line from the project brief only when it belongs to this "
-            "beat; otherwise write no dialogue."
+            "No dialogue was pre-assigned to this group. Do not write any <d> spoken line, and do not repeat a line "
+            "already spoken in another group. Continue action, camera, and sound only."
         )
         dialogue_body = "NONE"
     if previous is None:
@@ -5111,8 +5174,10 @@ def _plan_director_with_independent_segment_refine(
                     audio_slots=segment.audio_slots,
                     audio_labels=audio_labels,
                 )
-                if segment.dialogue:
+                if _clean_structure_dialogue(segment.dialogue):
                     prompt = _force_assigned_dialogue_in_prompt(prompt, segment.dialogue)
+                else:
+                    prompt = _strip_unassigned_spoken_lines(prompt)
                 prompt = _ensure_full_reference_audio_voice_labels(
                     prompt,
                     segment.audio_slots,

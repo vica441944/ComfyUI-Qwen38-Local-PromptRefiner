@@ -1571,8 +1571,71 @@ class StoryShotAudioBindingTests(unittest.TestCase):
         card["dialogue"] = "柳二姐: （声音慵懒）蛇不就在这吗？"
         brief = "分镜1使用参考:\n柳二姐抬眼，然后靠近。\n"
         out = nodes._apply_story_shot_contract([card], brief, self._plan_one_shot())
-        self.assertEqual(out[0]["dialogue"], card["dialogue"])
+        # The shot slice has no quotes, so Structure's leftover line is not spoken here.
+        self.assertEqual(out[0]["dialogue"], "")
         self.assertIn("柳二姐抬眼", out[0]["beat"])
+
+    def test_later_shot_without_quotes_drops_structure_dialogue(self) -> None:
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|16|1-2|talk|\n"
+            "[/STORY_BEATS]\n"
+            "分镜1使用参考:\n"
+            "她说「小六……看来你还没有尽兴呢。让姐姐好好伺候你……」\n"
+            "分镜2使用参考:\n"
+            "她的手停在袜夹上，镜头推向嘴唇，然后淡出。\n"
+        )
+        beat = nodes._story_beat_from_fields(1, 16.0, 1, 2, "talk", "")
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=16.0,
+            group_count=2,
+            estimated_sum=16.0,
+            compressed=False,
+            allocations=(8.0, 8.0),
+            card_counts=(2,),
+            segment_to_beat=(1, 1),
+        )
+        spoken = "小六……看来你还没有尽兴呢。让姐姐好好伺候你……"
+        cards = []
+        for index in (1, 2):
+            card = self._card()
+            card["index"] = index
+            card["dialogue"] = spoken
+            cards.append(card)
+        out = nodes._apply_story_shot_contract(cards, brief, plan)
+        self.assertIn("尽兴", out[0]["dialogue"])
+        self.assertEqual(out[1]["dialogue"], "")
+        invented = (
+            "detailed_description:\n"
+            "[Brief Shot 4] She speaks softly: (S1) <d>[Chinese] (S1) <d>[Chinese] "
+            f"{spoken}</d></d> The camera stays on her face.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+        )
+        stripped = nodes._strip_unassigned_spoken_lines(invented)
+        self.assertNotIn("<d", stripped.lower())
+        self.assertNotIn("尽兴", stripped)
+        self.assertIn("The camera stays on her face", stripped)
+        self.assertIn("overall_soundscape:", stripped)
+
+    def test_assigned_dialogue_wrappers_do_not_nest(self) -> None:
+        spoken = "让姐姐好好伺候你……"
+        assigned = f"(S1) <d>[Chinese] (S1) <d>[Chinese] {spoken}</d></d>"
+        prompt = (
+            "detailed_description:\n"
+            "She speaks: (S1) <d>[Chinese] (S1) <d>[Chinese] "
+            "小六……看来你还没有尽兴呢。让姐姐好好伺候你……</d></d>\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+        )
+        out = nodes._force_assigned_dialogue_in_prompt(prompt, assigned)
+        self.assertIn(f"<d>[Chinese] {spoken}</d>", out)
+        self.assertNotIn("</d></d>", out)
+        self.assertNotIn("<d>[Chinese] (S1)", out)
+        self.assertNotIn("<d>[Chinese] <d>", out.lower())
+        self.assertEqual(out.lower().count("<d"), 1)
+        self.assertEqual(out.lower().count("</d>"), 1)
 
 
 class R2VPictureSelectionTests(unittest.TestCase):
