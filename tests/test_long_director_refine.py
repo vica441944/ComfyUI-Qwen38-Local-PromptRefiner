@@ -2891,6 +2891,25 @@ Still at the doorway.
         with self.assertRaisesRegex(nodes.PromptRefinerError, "missing dialogue landmarks: beat1:MUST_KEEP_LINE_ZX9"):
             self._repair_two_cards(("MUST_KEEP_LINE_ZX9",))
 
+    def test_moan_label_does_not_abort_repaired_structure(self) -> None:
+        self.assertTrue(nodes._is_non_dialogue_landmark("赵凤红呻吟"))
+        self.assertFalse(nodes._is_non_dialogue_landmark("你别呻吟"))
+        self.assertFalse(nodes._is_non_dialogue_landmark("啊……小程……你真会玩"))
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|15|1-4|beat|啊……小程……你真会玩;赵凤红呻吟\n"
+            "[/STORY_BEATS]\n"
+        )
+        beats = nodes._parse_story_beats_block(brief)
+        self.assertIn("啊……小程……你真会玩", beats[0].key_dialogue)
+        self.assertNotIn("赵凤红呻吟", beats[0].key_dialogue)
+        repaired, resolved, plan = self._repair_two_cards(("赵凤红呻吟",))
+        self.assertEqual(len(repaired), 3)
+        self.assertAlmostEqual(sum(resolved), 20.0, places=3)
+        self.assertFalse(any("赵凤红呻吟" in item for item in nodes._validate_structure_coverage(repaired, plan)))
+        spoken = " ".join(str(card.get("dialogue") or "") for card in repaired)
+        self.assertIn("请往前走", spoken)
+
     def test_structure_allocates_cards_and_keeps_trailing_duration_floor(self) -> None:
         plan = nodes._build_coverage_knife_plan(
             self._story_beats_brief(),

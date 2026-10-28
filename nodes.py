@@ -3563,8 +3563,11 @@ _DIRECTION_ONLY_LANDMARK = re.compile(
 )
 _AMBIENT_SFX_LANDMARK = re.compile(
     r"^[\u4e00-\u9fff]{0,8}(?:笑声|哭声|脚步声|环境音|风声|雨声|蝉鸣|掌声|"
-    r"喧哗声|嘈杂声|呼吸声|喘息声|敲门声|铃声|吱呀声)$"
+    r"喧哗声|嘈杂声|呼吸声|喘息声|敲门声|铃声|吱呀声|"
+    r"呻吟|娇喘|浪叫|闷哼|低吟|吟叫|尖叫|抽泣|呜咽)$"
 )
+# A short cue such as 你别呻吟 is speech; 赵凤红呻吟 is a performance label.
+_VOCAL_CUE_PREFIX_IS_SPEECH = re.compile(r"[不别请要让把被]")
 
 
 def _is_non_dialogue_landmark(landmark: str) -> bool:
@@ -3581,8 +3584,9 @@ def _is_non_dialogue_landmark(landmark: str) -> bool:
     if _DIRECTION_ONLY_LANDMARK.fullmatch(re.sub(r"\s+", "", stripped)):
         return True
     if (
-        not re.search(r"[。！？!?说问道喊叫]", stripped)
+        not re.search(r"[。！？!?，,说问道喊叫]", stripped)
         and _AMBIENT_SFX_LANDMARK.fullmatch(stripped)
+        and not _VOCAL_CUE_PREFIX_IS_SPEECH.search(stripped)
     ):
         return True
     if re.search(r"[（(）)]", raw):
