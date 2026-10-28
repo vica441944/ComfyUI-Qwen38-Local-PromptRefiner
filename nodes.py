@@ -991,8 +991,9 @@ def _normalize_asset_links(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
         tag = f"<{labels[kind]} {slot}>"
-        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
-        if kind == "audio":
+        # Keep the words after the tag. NV writes "@reference_image_3 办公室"
+        # and "@reference_audio_1 小程声音参考".
+        if kind in {"audio", "image"}:
             trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
             if trailing:
                 return tag + trailing.group(0)
@@ -1101,8 +1102,9 @@ def _normalize_director_asset_links(
                 f"{match.group(0)} was used in brief, but reference_{kind}_{slot} is not connected."
             )
         tag = f"<{labels[kind]} {slot}>"
-        # Keep NV voice labels: "@reference_audio_1 小程声音参考" -> "<Audio 1> 小程声音参考"
-        if kind == "audio":
+        # Keep the words after the tag. NV writes "@reference_image_3 办公室"
+        # and "@reference_audio_1 小程声音参考".
+        if kind in {"audio", "image"}:
             trailing = re.match(r"[ \t]+[^@\n,，;；]+", brief[match.end() :])
             if trailing:
                 return tag + trailing.group(0)
@@ -1349,12 +1351,16 @@ def _json_object_from_model_output(text: str) -> dict[str, Any]:
 
 
 def _marked_plan_slot_list(header: str, field_name: str) -> list[int]:
-    """Read the short `PICTURES: 1, 2` lines in the long-planner return format."""
+    """Read the short `PICTURES: 1, 2` lines in the long-planner return format.
+
+    The value is only the rest of that line. Whitespace must not cross into the
+    next field: an empty ``PICTURES:`` would otherwise capture ``VIDEOS:`` or
+    ``AUDIOS: 1`` and turn a blank still list into some other slot.
+    """
 
     match = re.search(
-        rf"^\s*{re.escape(field_name)}\s*:\s*(.*?)\s*$",
+        rf"(?im)^[^\S\n]*{re.escape(field_name)}[^\S\n]*:[^\S\n]*([^\n]*)",
         header,
-        flags=re.IGNORECASE | re.MULTILINE,
     )
     if not match:
         return []
@@ -1567,7 +1573,13 @@ def _select_director_segment_assets(
     *,
     anchor_all_pictures: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Validate model-selected slots.  R2V honors per-segment pictures unless full-anchor is on."""
+    """Validate model-selected slots.
+
+    R2V honors per-segment pictures and standalone audios. An empty or missing
+    list attaches nothing. ``anchor_all_pictures`` is the only path that forces
+    every connected still onto the group. Shot-contract tags and voice-mapped
+    speakers fill ``audios`` before this check; connected pins alone do not.
+    """
 
     if raw_assets is None:
         raw_assets = {}
@@ -1575,24 +1587,27 @@ def _select_director_segment_assets(
         raise PromptRefinerError(f"Director plan segment {index} assets must be a JSON object.")
     if mode != DIRECTOR_LONG_R2V_MODE:
         return (), (), (), ()
+    # Empty or missing PICTURES means this group carries no stills. Do not
+    # expand it to every connected reference_image_*. anchor_all_pictures
+    # below is the only force-all path.
     pictures = _plan_slot_list(
         raw_assets.get("pictures"),
         image_slots,
         "pictures",
-        fallback_when_empty=True,
+        fallback_when_empty=False,
     )
     if anchor_all_pictures:
         pictures = tuple(sorted(set(image_slots)))
     videos = _plan_slot_list(raw_assets.get("videos"), video_slots, "videos")
     paired = _plan_slot_list(raw_assets.get("video_audios"), video_audio_slots, "video_audios")
-    # Same empty-list rescue as pictures: Qwen-VL cannot hear audio, so structure
-    # cards / coverage knife often emit audios:[]. Without this, connected
-    # reference_audio_* never reach ui_specs or materialized Group ref_audio pins.
+    # Empty or missing AUDIOS means this group carries no standalone voice ref.
+    # Do not expand it to every connected reference_audio_*. A previous beat
+    # pack can leave those pins wired after the new brief stops using them.
     audios = _plan_slot_list(
         raw_assets.get("audios"),
         audio_slots,
         "audios",
-        fallback_when_empty=True,
+        fallback_when_empty=False,
     )
     if any(slot not in videos for slot in paired):
         raise PromptRefinerError(
@@ -1653,69 +1668,135 @@ def _decorate_full_reference_prompt(
     return _ensure_full_reference_picture_labels(prompt, picture_slots)
 
 
+_SPEAKER_ID_PREFIX = re.compile(r"^(?:[(（]\s*S\d+\s*[)）]\s*)+", flags=re.IGNORECASE)
+_ASSIGNED_D_WRAPPER = re.compile(
+    r"^\s*<d>\s*(?:\[[^\]\n]+\]\s*)?(.*?)\s*</d>\s*$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _unwrap_assigned_spoken_line(line: str) -> str:
+    """Reduce one assigned line to spoken words, without speaker ids or <d> wrappers."""
+
+    text = (line or "").strip()
+    for _ in range(8):
+        if not text:
+            break
+        stripped = _SPEAKER_ID_PREFIX.sub("", text).strip()
+        wrapped = _ASSIGNED_D_WRAPPER.fullmatch(stripped)
+        if wrapped:
+            text = wrapped.group(1).strip()
+            continue
+        if stripped != text:
+            text = stripped
+            continue
+        break
+    return text.strip()
+
+
+def _dialogue_tag_spans(text: str) -> list[tuple[int, int, str]]:
+    """Outermost ``<d>`` spans, so a nested ``<d>…<d>…</d></d>`` is one span."""
+
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    while cursor < len(text):
+        match = re.search(r"<d\b[^>]*>", text[cursor:], flags=re.IGNORECASE)
+        if not match:
+            break
+        start = cursor + match.start()
+        open_end = cursor + match.end()
+        depth = 1
+        pos = open_end
+        end: int | None = None
+        while pos < len(text) and depth:
+            nxt = re.search(r"</d>|<d\b[^>]*>", text[pos:], flags=re.IGNORECASE)
+            if not nxt:
+                break
+            token = nxt.group(0)
+            at = pos + nxt.start()
+            if token.lower().startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    end = pos + nxt.end()
+                    break
+                pos = pos + nxt.end()
+            else:
+                depth += 1
+                pos = pos + nxt.end()
+        if end is None:
+            cursor = open_end
+            continue
+        body = text[open_end : end - len("</d>")]
+        lang_match = re.match(r"\s*\[([^\]]+)\]", body)
+        lang = lang_match.group(1).strip() if lang_match else ""
+        spans.append((start, end, lang))
+        cursor = end
+    return spans
+
+
+def _strip_unassigned_spoken_lines(prompt: str) -> str:
+    """Drop spoken ``<d>`` spans when this group was assigned no dialogue."""
+
+    spans = _dialogue_tag_spans(prompt or "")
+    if not spans:
+        return prompt
+    out = prompt
+    for start, end, _lang in reversed(spans):
+        out = out[:start] + out[end:]
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r" +([,.;:!?，。！？])", r"\1", out)
+    return re.sub(r"\n{3,}", "\n\n", out)
+
+
+def _spoken_tag(line: str, lang: str = "") -> str:
+    language = lang or ("Chinese" if _CJK_SPEECH_CHAR.search(line) else "English")
+    return f"<d>[{language}] {line}</d>"
+
+
 def _force_assigned_dialogue_in_prompt(prompt: str, dialogue: str) -> str:
     """Replace refined <d> bodies with structure-assigned DIALOGUE (no brief restart).
 
     Structure partition may split one spoken line across adjacent groups as
     prefix|remainder. Refine still sees the full line in the project brief and
     can restart it. When DIALOGUE is pre-assigned, pin <d> contents to that
-    assignment so adjacent groups never re-speak a shared prefix.
+    assignment so adjacent groups never re-speak a shared prefix. An empty
+    assignment removes spoken <d> lines. Assigned text is unwrapped first so a
+    line that already contains ``(S1)`` / ``<d>`` cannot nest inside another tag.
     """
 
+    if not (prompt or "").strip():
+        return prompt
     cleaned = _clean_structure_dialogue(dialogue)
-    if not cleaned or not (prompt or "").strip():
-        return prompt
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    lines = [
+        _unwrap_assigned_spoken_line(line)
+        for line in cleaned.splitlines()
+        if _unwrap_assigned_spoken_line(line)
+    ]
     if not lines:
-        return prompt
-    pattern = re.compile(
-        r"(<d>\s*\[[^\]\n]+\]\s*)(.*?)(</d>)",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    matches = list(pattern.finditer(prompt))
-    if not matches:
-        first = lines[0]
-        lang0 = "Chinese" if _CJK_SPEECH_CHAR.search(first) else "English"
-        injection = f"<d>[{lang0}] {first}</d>"
-        for more in lines[1:]:
-            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
-            injection += f"\n<d>[{lang}] {more}</d>"
+        return _strip_unassigned_spoken_lines(prompt)
+    spans = _dialogue_tag_spans(prompt)
+    if not spans:
+        injection = "\n".join(_spoken_tag(line) for line in lines)
         anchor = re.search(r"(?im)^overall_soundscape\s*:", prompt)
         if anchor:
             return prompt[: anchor.start()].rstrip() + "\n" + injection + "\n" + prompt[anchor.start() :]
         return prompt.rstrip() + "\n" + injection
 
     out = prompt
-    if len(lines) == 1:
-        first = matches[0]
-        replacement = f"{first.group(1)}{lines[0]}{first.group(3)}"
-        pieces: list[tuple[int, int, str]] = [(first.start(), first.end(), replacement)]
-        for match in matches[1:]:
-            pieces.append((match.start(), match.end(), ""))
-        for start_i, end_i, repl in reversed(pieces):
-            out = out[:start_i] + repl + out[end_i:]
-        out = re.sub(r"\n{3,}", "\n\n", out)
-        return out
-
-    for index, match in reversed(list(enumerate(matches))):
+    for index, (start, end, lang) in reversed(list(enumerate(spans))):
         if index < len(lines):
-            repl = f"{match.group(1)}{lines[index]}{match.group(3)}"
+            repl = _spoken_tag(lines[index], lang)
         else:
             repl = ""
-        out = out[: match.start()] + repl + out[match.end() :]
-    if len(lines) > len(matches):
-        extras = []
-        for more in lines[len(matches) :]:
-            lang = "Chinese" if _CJK_SPEECH_CHAR.search(more) else "English"
-            extras.append(f"<d>[{lang}] {more}</d>")
-        block = "\n".join(extras)
+        out = out[:start] + repl + out[end:]
+    if len(lines) > len(spans):
+        extras = "\n".join(_spoken_tag(line) for line in lines[len(spans) :])
         anchor = re.search(r"(?im)^overall_soundscape\s*:", out)
         if anchor:
-            out = out[: anchor.start()].rstrip() + "\n" + block + "\n" + out[anchor.start() :]
+            out = out[: anchor.start()].rstrip() + "\n" + extras + "\n" + out[anchor.start() :]
         else:
-            out = out.rstrip() + "\n" + block
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out
+            out = out.rstrip() + "\n" + extras
+    return re.sub(r"\n{3,}", "\n\n", out)
 
 
 def _finalize_director_segment_prompt(
@@ -1823,11 +1904,12 @@ def _segment_visual_references(
 ) -> tuple[list[tuple[int, str]], list[_DirectorVideoFrames]]:
     """Limit a refine call to the frames that belong to this group.
 
-    R2V attaches only the picture slots selected for this group (or every
-    connected still when anchor-all / empty-selection fallback filled them).
-    FL2V sends the first frame only to group 1, the last frame only to the
-    final group, and supplemental pictures 3–9 to planning.  Video batches
-    are attached only when the structure pass assigned them.
+    R2V attaches only the picture slots listed for this group. An empty
+    selection attaches no stills. ``anchor_all_pictures`` fills every
+    connected still before this filter runs. FL2V sends the first frame only
+    to group 1, the last frame only to the final group, and supplemental
+    pictures 3–9 to planning. Video batches are attached only when the
+    structure pass assigned them.
     """
 
     images = list(image_references)
@@ -2725,8 +2807,7 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     raw = text or ""
     found: list[str] = []
     for match in _KEY_DIALOGUE_LINE.finditer(raw):
-        for part in re.split(r"[;；|/／]", match.group(1)):
-            token = part.strip()
+        for token in _split_landmark_list(match.group(1)):
             if len(token) >= 2:
                 found.append(token)
     for match in _DIALOGUE_QUOTE.finditer(raw):
@@ -2738,7 +2819,7 @@ def _extract_dialogue_landmarks(text: str, *, limit: int = 3) -> tuple[str, ...]
     selected: list[str] = []
     norms: list[str] = []
     for token in ranked:
-        if _is_placeholder_landmark(token) or _is_speaker_only_landmark(token):
+        if _is_non_dialogue_landmark(token):
             continue
         norm = _normalize_dialogue_needle(token)
         if len(norm) < 2:
@@ -2780,9 +2861,7 @@ def _story_beat_from_fields(
     keys = tuple(
         item.strip()
         for item in (key_dialogue or ())
-        if str(item).strip()
-        and not _is_placeholder_landmark(str(item))
-        and not _is_speaker_only_landmark(str(item))
+        if str(item).strip() and not _is_non_dialogue_landmark(str(item))
     )
     if not keys:
         keys = _extract_dialogue_landmarks(body)
@@ -2811,7 +2890,7 @@ def _parse_story_beats_block(brief: str) -> list[_StoryBeatSpec]:
             continue
         shot_start, shot_end = _parse_shot_range_token(row.group("shots"))
         keys_raw = row.group("keys") or ""
-        keys = [part.strip() for part in re.split(r"[;；|/／]", keys_raw) if part.strip()]
+        keys = _split_landmark_list(keys_raw)
         beats.append(
             _story_beat_from_fields(
                 int(row.group(1)),
@@ -3088,6 +3167,166 @@ def _picture_label_aliases(label: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+_AT_PICTURE_LABEL = re.compile(
+    r"@reference_image_(?P<slot>\d+)\b[ \t]*(?P<label>[^@\n,，;；]*)",
+    flags=re.IGNORECASE,
+)
+# Place words, not character names. A label matches when it names a space.
+_SCENE_PICTURE_LABEL = re.compile(
+    r"(?:"
+    r"办公室|室内|室外|内景|外景|场景|走廊|房间|客厅|卧室|厨房|门口|村口|"
+    r"[\u4e00-\u9fff]{0,12}(?:室|厅|房|屋|廊|景)"
+    r"|office|interior|exterior|indoors?|outdoors?|room|scene|hallway|corridor|lobby"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_scene_picture_label(label: str) -> bool:
+    """True when a global still label names a place rather than a person."""
+
+    text = re.sub(r"\s+", "", label or "")
+    if len(text) < 2:
+        return False
+    return bool(_SCENE_PICTURE_LABEL.search(text))
+
+
+def _picture_description_labels(brief: str) -> dict[int, str]:
+    """Map still slots to the global label after ``<Picture N>`` or ``@reference_image_N``."""
+
+    labels: dict[int, str] = {}
+
+    def _keep(slot: int, raw: str) -> None:
+        cleaned = (raw or "").strip().strip("。.;；:：,，")
+        if not cleaned:
+            return
+        previous = labels.get(slot, "")
+        if len(cleaned) >= len(previous):
+            labels[slot] = cleaned
+
+    for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    for match in _AT_PICTURE_LABEL.finditer(brief or ""):
+        _keep(int(match.group("slot")), match.group("label"))
+    return labels
+
+
+def _picture_descriptions_from_brief(brief: str) -> dict[int, tuple[str, ...]]:
+    """Aliases for global still labels, including NV ``@reference_image_N`` lines."""
+
+    return {
+        slot: _picture_label_aliases(label)
+        for slot, label in _picture_description_labels(brief).items()
+        if _picture_label_aliases(label)
+    }
+
+
+def _alias_matched_picture_slots(
+    text: str,
+    brief: str,
+    connected: Iterable[int],
+) -> tuple[int, ...]:
+    """Slots whose global label appears in this shot or group text."""
+
+    allowed = {int(slot) for slot in connected}
+    found: list[int] = []
+    for slot, aliases in _picture_descriptions_from_brief(brief).items():
+        if slot not in allowed:
+            continue
+        if any(alias and alias in (text or "") for alias in aliases):
+            found.append(slot)
+    return tuple(sorted(found))
+
+
+def _scene_slots_for_bare_environment(
+    prompt: str,
+    context_text: str,
+    brief: str,
+    connected: Iterable[int],
+    already: Iterable[int],
+) -> tuple[int, ...]:
+    """Bind one uncited scene still when ``<Environment>`` names no picture.
+
+    Several scene stills attach only when their own label appears in the group
+    text. A single uncited scene still is the source of a bare Environment line.
+    Character labels are not scene stills and are never added here.
+    """
+
+    bare = False
+    for match in _ENVIRONMENT_LINE.finditer(prompt or ""):
+        if not re.search(r"<Picture\s+\d+>", match.group(2) or "", flags=re.IGNORECASE):
+            bare = True
+            break
+    if not bare:
+        return ()
+    allowed = {int(slot) for slot in connected}
+    owned = {int(slot) for slot in already}
+    labels = _picture_description_labels(brief)
+    scene_slots = [
+        slot
+        for slot, label in labels.items()
+        if slot in allowed and slot not in owned and _is_scene_picture_label(label)
+    ]
+    if not scene_slots:
+        return ()
+    descriptions = _picture_descriptions_from_brief(brief)
+    haystack = f"{context_text or ''}\n{prompt or ''}"
+    mentioned = [
+        slot
+        for slot in scene_slots
+        if any(alias and alias in haystack for alias in descriptions.get(slot, ()))
+    ]
+    if mentioned:
+        return tuple(sorted(mentioned))
+    if len(scene_slots) == 1:
+        return (scene_slots[0],)
+    return ()
+
+
+def _picture_slots_named_in_text(text: str) -> frozenset[int]:
+    """Return still slots named as ``<Picture N>`` or ``@reference_image_N``."""
+
+    raw = text or ""
+    return frozenset(
+        int(slot) for slot in re.findall(r"<Picture\s+(\d+)>", raw, flags=re.IGNORECASE)
+    ) | frozenset(
+        int(slot) for slot in re.findall(r"@reference_image_(\d+)\b", raw, flags=re.IGNORECASE)
+    )
+
+
+def _picture_slots_for_materialize(
+    picture_slots: Iterable[int],
+    prompt: str,
+    connected: Iterable[int],
+) -> tuple[int, ...]:
+    """Keep shot-contract stills and any picture the finished prompt actually names.
+
+    A connected ``reference_image_N`` is hung when the authoritative list or the
+    segment prompt cites it. Citations of slots that are not linked are ignored.
+    An empty list with no citation stays empty.
+    """
+
+    allowed = {int(slot) for slot in connected}
+    selected = {int(slot) for slot in picture_slots if int(slot) in allowed}
+    cited = {slot for slot in _picture_slots_named_in_text(prompt) if slot in allowed}
+    return tuple(sorted(selected | cited))
+
+
+def _audio_slots_named_in_text(text: str) -> frozenset[int]:
+    """Return standalone audio slots named in this text.
+
+    ``@reference_audio_N`` and ``<Audio N>`` count. A connected Comfy pin with
+    no tag in the text does not.
+    """
+
+    raw = text or ""
+    return frozenset(
+        int(slot) for slot in re.findall(r"@reference_audio_(\d+)\b", raw, flags=re.IGNORECASE)
+    ) | frozenset(
+        int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", raw, flags=re.IGNORECASE)
+    )
+
+
 def _apply_story_shot_contract(
     cards: list[dict[str, Any]], brief: str, plan: _CoverageKnifePlan | None,
 ) -> list[dict[str, Any]]:
@@ -3112,18 +3351,12 @@ def _apply_story_shot_contract(
         for speaker in (_speaker_from_audio_label(label),)
         if speaker
     }
-    # NV beat packs declare standalone audio as Global @reference_audio_N filename
-    # (no <Audio N> ... voice-line). Keep those slots available when a shot
-    # does not retarget audio explicitly.
-    global_audios = sorted({
-        int(slot) for slot in re.findall(r"@reference_audio_(\d+)\b", brief or "", flags=re.IGNORECASE)
-    } | {
-        int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", brief or "", flags=re.IGNORECASE)
-    })
-    picture_descriptions = {
-        int(match.group("slot")): _picture_label_aliases(match.group("label"))
-        for match in _PICTURE_DESCRIPTION_MAPPING.finditer(brief or "")
-    }
+    # An explicit Global @reference_audio_N / <Audio N> line is a brief tag.
+    # Shots that do not name their own slot still receive those tags. Connected
+    # reference_audio_* pins that the brief never names are not included.
+    global_audios = sorted(_audio_slots_named_in_text(brief))
+    # <Picture N> label and NV @reference_image_N label share one alias table.
+    picture_descriptions = _picture_descriptions_from_brief(brief)
     for beat_position, beat in enumerate(active.beats, start=1):
         if beat.shot_start is None or beat.shot_end is None:
             continue
@@ -3152,9 +3385,9 @@ def _apply_story_shot_contract(
                 if exact_dialogue_units
                 else exact
             )
-            pictures = sorted({
-                int(slot) for slot in re.findall(r"<Picture\s+(\d+)>", exact, flags=re.IGNORECASE)
-            })
+            # 使用参考 may say <Picture N> or @reference_image_N. An empty line
+            # names neither, so it does not inherit every connected still.
+            pictures = sorted(_picture_slots_named_in_text(exact))
             # Global scene references often are not repeated on every
             # “分镜N使用参考” line. Attach them only when their descriptive
             # location appears in this exact shot slice.
@@ -3165,13 +3398,7 @@ def _apply_story_shot_contract(
             # Prefer explicit <Audio N> / @reference_audio_N tags in the shot
             # (parity with <Picture N>). Also bind voice-mapped speakers that
             # have an actual quoted line in the assigned shot slice.
-            audios = sorted({
-                int(slot) for slot in re.findall(r"<Audio\s+(\d+)>", exact, flags=re.IGNORECASE)
-            } | {
-                int(slot) for slot in re.findall(
-                    r"@reference_audio_(\d+)\b", exact, flags=re.IGNORECASE
-                )
-            } | {
+            audios = sorted(_audio_slots_named_in_text(exact) | {
                 slot for name, slot in voices.items()
                 if name and re.search(re.escape(name) + r"\s*[「『\"]", exact)
             })
@@ -3184,13 +3411,10 @@ def _apply_story_shot_contract(
             ordered[card_position] = {
                 **card,
                 "beat": exact_beat,
-                # Exact shot dialogue is authoritative. Lift it into DIALOGUE
-                # and remove the matching quote span from BEAT so it is counted
-                # once. If this shot slice contains no quoted line, retain the
-                # structure pass dialogue instead of silently deleting it.
-                "dialogue": exact_dialogue or _clean_structure_dialogue(
-                    str(card.get("dialogue") or "")
-                ),
+                # The assigned shot slice is authoritative. A slice with no
+                # quoted speech is empty dialogue, even when the structure pass
+                # left the previous group's line on this card.
+                "dialogue": exact_dialogue,
                 "assets": assets,
             }
     return ordered
@@ -3273,6 +3497,107 @@ def _cards_coverage_blob(cards: Iterable[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _split_landmark_list(text: str) -> list[str]:
+    """Split a landmark list on ``;；|/／`` without cutting inside brackets or quotes.
+
+    ``角色甲（画外;平静）;请往前走`` stays a direction cue plus one spoken line.
+    A naive split would turn the parenthetical semicolon into fragments.
+    """
+
+    raw = text or ""
+    if not raw.strip():
+        return []
+    closers = {"(": ")", "（": "）", "「": "」", "『": "』", "“": "”", "‘": "’"}
+    separators = set(";；|/／")
+    parts: list[str] = []
+    buf: list[str] = []
+    stack: list[str] = []
+    for char in raw:
+        if stack and char == stack[-1]:
+            stack.pop()
+            buf.append(char)
+            continue
+        if char in closers:
+            stack.append(closers[char])
+            buf.append(char)
+            continue
+        if char in separators and not stack:
+            token = "".join(buf).strip()
+            if token:
+                parts.append(token)
+            buf = []
+            continue
+        buf.append(char)
+    token = "".join(buf).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+
+def _landmark_brackets_balanced(text: str) -> bool:
+    """False when parentheses or quotes were cut apart by a list split."""
+
+    closers = {"(": ")", "（": "）", "「": "」", "『": "』", "“": "”", "‘": "’"}
+    closer_chars = set(closers.values())
+    stack: list[str] = []
+    ascii_quote = False
+    for char in text or "":
+        if char == '"':
+            ascii_quote = not ascii_quote
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            continue
+        if char in closers:
+            stack.append(closers[char])
+            continue
+        if char in closer_chars:
+            return False
+    return not stack and not ascii_quote
+
+
+_DIRECTION_ONLY_LANDMARK = re.compile(
+    r"^(?:画外音?|旁白|内心(?:独白)?|独白|对白|os|vo|"
+    r"平静|冷静|低声|高声|轻声|小声|大声|耳语|呢喃)$",
+    flags=re.IGNORECASE,
+)
+_AMBIENT_SFX_LANDMARK = re.compile(
+    r"^[\u4e00-\u9fff]{0,8}(?:笑声|哭声|脚步声|环境音|风声|雨声|蝉鸣|掌声|"
+    r"喧哗声|嘈杂声|呼吸声|喘息声|敲门声|铃声|吱呀声|"
+    r"呻吟|娇喘|浪叫|闷哼|低吟|吟叫|尖叫|抽泣|呜咽)$"
+)
+# A short cue such as 你别呻吟 is speech; 赵凤红呻吟 is a performance label.
+_VOCAL_CUE_PREFIX_IS_SPEECH = re.compile(r"[不别请要让把被]")
+
+
+def _is_non_dialogue_landmark(landmark: str) -> bool:
+    """Drop fragments, delivery cues, and ambient labels. Keep spoken lines."""
+
+    raw = (landmark or "").strip()
+    if not raw:
+        return True
+    if not _landmark_brackets_balanced(raw):
+        return True
+    if _is_placeholder_landmark(raw) or _is_speaker_only_landmark(raw):
+        return True
+    stripped = raw.strip("\"'“”‘’「」『』")
+    if _DIRECTION_ONLY_LANDMARK.fullmatch(re.sub(r"\s+", "", stripped)):
+        return True
+    if (
+        not re.search(r"[。！？!?，,说问道喊叫]", stripped)
+        and _AMBIENT_SFX_LANDMARK.fullmatch(stripped)
+        and not _VOCAL_CUE_PREFIX_IS_SPEECH.search(stripped)
+    ):
+        return True
+    if re.search(r"[（(）)]", raw):
+        without = re.sub(r"[（(][^）)]*[）)]", "", raw).strip().strip("\"'“”‘’")
+        if not without or re.fullmatch(r"[\u4e00-\u9fffA-Za-z·・]{1,8}", without):
+            return True
+        if _DIRECTION_ONLY_LANDMARK.fullmatch(re.sub(r"\s+", "", without)):
+            return True
+    return False
+
+
 def _is_placeholder_landmark(landmark: str) -> bool:
     """Skip NV-style placeholders such as （露骨台词） / (explicit ...) / empty."""
 
@@ -3345,7 +3670,7 @@ def _validate_structure_coverage(
         # only records lines that are absent from the whole plan.
         global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
-            if _is_placeholder_landmark(landmark) or _is_speaker_only_landmark(landmark):
+            if _is_non_dialogue_landmark(landmark):
                 continue
             needle = _normalize_dialogue_needle(landmark)
             if len(needle) < 2:
@@ -3551,6 +3876,10 @@ def _segments_from_structure_cards(
             audio_slots,
             anchor_all_pictures=anchor_all_pictures,
         )
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            # The shot text is authoritative even if a later card rewrite left
+            # assets.pictures short. Still do not invent slots the shot never named.
+            pictures = _picture_slots_for_materialize(pictures, beat, image_slots)
         segments.append(
             _DirectorLongSegment(
                 index=index,
@@ -3886,8 +4215,8 @@ def _build_long_director_segment_request(
         dialogue_body = segment.dialogue
     else:
         dialogue_rule = (
-            "No dialogue was pre-assigned. Use a spoken line from the project brief only when it belongs to this "
-            "beat; otherwise write no dialogue."
+            "No dialogue was pre-assigned to this group. Do not write any <d> spoken line, and do not repeat a line "
+            "already spoken in another group. Continue action, camera, and sound only."
         )
         dialogue_body = "NONE"
     if previous is None:
@@ -3982,13 +4311,18 @@ def _single_group_structure_segment(
     """A one-group project has nothing to split, so refine the brief directly."""
 
     duration = round(float(tuple(schedule)[0]), 3)
+    # One group has no structure card. Hang only the audio slots the brief
+    # actually names; connected reference_audio_* pins are not a selection.
+    named_audios = [
+        slot for slot in audio_slots if slot in _audio_slots_named_in_text(brief)
+    ]
     pictures, videos, paired, audios = _select_director_segment_assets(
         mode,
         {
             "pictures": list(image_slots),
             "videos": list(video_slots),
             "video_audios": list(video_audio_slots),
-            "audios": list(audio_slots),
+            "audios": named_audios,
         },
         1,
         image_slots,
@@ -4755,6 +5089,10 @@ def _repair_structure_duration_cards(
         coverage_plan = replace(coverage_plan, group_count=len(result),
                                 card_counts=tuple(result_beats.count(i + 1) for i in range(len(coverage_plan.beats))),
                                 segment_to_beat=tuple(result_beats))
+        # Soft misses stay a returned list before repair. After a duration split,
+        # a real spoken landmark that disappeared still aborts. Direction cues,
+        # cut-off parentheses, and ambient SFX are not landmarks, so they cannot
+        # fail this check.
         misses = _validate_structure_coverage(result, coverage_plan)
         if misses:
             raise PromptRefinerError("Repaired structure has missing dialogue landmarks: " + "; ".join(misses))
@@ -4940,10 +5278,15 @@ def _plan_director_with_independent_segment_refine(
             text = complete(messages, refine_max_tokens, completion_seed)
             try:
                 audio_labels = _extract_audio_voice_labels(brief)
+                authoritative_pictures = segment.picture_slots
+                if mode == DIRECTOR_LONG_R2V_MODE:
+                    authoritative_pictures = _picture_slots_for_materialize(
+                        segment.picture_slots, segment.beat, image_slots
+                    )
                 prompt = _finalize_director_segment_prompt(
                     text or "",
                     engine=engine,
-                    picture_slots=segment.picture_slots,
+                    picture_slots=authoritative_pictures,
                     lora_triggers=lora_triggers,
                     index=segment.index,
                     required_shot_ids=_assigned_brief_shot_ids(segment.beat),
@@ -4951,8 +5294,10 @@ def _plan_director_with_independent_segment_refine(
                     audio_slots=segment.audio_slots,
                     audio_labels=audio_labels,
                 )
-                if segment.dialogue:
+                if _clean_structure_dialogue(segment.dialogue):
                     prompt = _force_assigned_dialogue_in_prompt(prompt, segment.dialogue)
+                else:
+                    prompt = _strip_unassigned_spoken_lines(prompt)
                 prompt = _ensure_full_reference_audio_voice_labels(
                     prompt,
                     segment.audio_slots,
@@ -4979,13 +5324,29 @@ def _plan_director_with_independent_segment_refine(
             raise PromptRefinerError(
                 f"Director segment {segment.index} prompt refinement failed after 2 attempts. {last_error}"
             ) from last_error
-        refined.append(replace(segment, prompt=prompt))
+        picture_slots = segment.picture_slots
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            picture_slots = _picture_slots_for_materialize(
+                _picture_slots_for_materialize(picture_slots, segment.beat, image_slots),
+                prompt,
+                image_slots,
+            )
+            picture_slots = tuple(sorted(set(picture_slots) | set(
+                _alias_matched_picture_slots(f"{segment.beat}\n{prompt}", brief, image_slots)
+            )))
+            scene_slots = _scene_slots_for_bare_environment(
+                prompt, segment.beat, brief, image_slots, picture_slots,
+            )
+            if scene_slots:
+                picture_slots = tuple(sorted(set(picture_slots) | set(scene_slots)))
+                prompt = _ensure_full_reference_picture_labels(prompt, picture_slots)
+        refined.append(replace(segment, prompt=prompt, picture_slots=picture_slots))
         passes.append(
             {
                 "index": segment.index,
                 "attempts": attempts,
                 "continuity_from_prev": segment.continuity_from_prev,
-                "pictures": list(segment.picture_slots),
+                "pictures": list(picture_slots),
                 "videos": list(segment.video_slots),
                 "video_audios": list(segment.video_audio_slots),
                 "audios": list(segment.audio_slots),
@@ -5081,11 +5442,17 @@ def _plan_slot_list(
     *,
     fallback_when_empty: bool = False,
 ) -> tuple[int, ...]:
-    """Validate a model-selected one-based asset list against actual connected slots."""
+    """Validate a model-selected one-based asset list against actual connected slots.
+
+    A missing value (``None``) and an empty list both mean "no slots" unless
+    ``fallback_when_empty`` is set, in which case every connected slot is used.
+    """
 
     connected_slots = set(connected)
-    if raw is None or (fallback_when_empty and raw == []):
-        return tuple(sorted(connected_slots))
+    if raw is None or raw == []:
+        if fallback_when_empty:
+            return tuple(sorted(connected_slots))
+        return ()
     if not isinstance(raw, list):
         raise PromptRefinerError(f"Director plan field assets.{field_name} must be a JSON list of slot numbers.")
     selected: list[int] = []
@@ -5215,30 +5582,97 @@ def _ensure_full_reference_audio_voice_labels(
     return head + body + tail
 
 
-def _ensure_full_reference_picture_labels(prompt: str, picture_slots: Iterable[int]) -> str:
-    """Guarantee that Director-bound image references are visible in the H3 text."""
+_ENVIRONMENT_LINE = re.compile(r"(?im)^([ \t]*<Environment>)([^\n]*)$")
 
-    missing = [
-        slot for slot in sorted(set(picture_slots)) if f"<Picture {slot}>" not in prompt
-    ]
-    if not missing:
+
+def _h3_field_body(prompt: str, field_name: str) -> str:
+    """Return the body of one H3 field, stopping at the next known field label."""
+
+    start = prompt.find(field_name)
+    if start < 0:
+        return ""
+    rest = prompt[start + len(field_name) :]
+    next_names = (
+        "\nsubject_definitions:",
+        "\nsummary:",
+        "\nretention_analysis:",
+        "\ndetailed_description:",
+        "\nintegrated_multimodal_description:",
+        "\noverall_soundscape:",
+        "\nnon_diegetic_music:",
+    )
+    end = len(rest)
+    lowered = rest.lower()
+    for name in next_names:
+        found = lowered.find(name)
+        if found >= 0:
+            end = min(end, found)
+    return rest[:end]
+
+
+def _bind_environment_picture_sources(prompt: str, slots: list[int]) -> str:
+    """Point a bare ``<Environment>`` line at the stills the model omitted.
+
+    MiniMax keeps the scene label as ``<Environment>``. The missing source is
+    inserted into that line; person/prop ``<Subject N>`` lines are left alone.
+    """
+
+    if not slots:
         return prompt
-    prompt = _insert_after_h3_field(
-        prompt,
-        "subject_definitions:",
-        [
-            f"<Picture {slot}> is the authoritative visual reference for its depicted subject or environment, fully_preserved."
-            for slot in missing
-        ],
-    )
-    return _insert_after_h3_field(
-        prompt,
-        "retention_analysis:",
-        [
-            f"<Picture {slot}>: fully_preserved; retain the connected reference identity, wardrobe, and visual design."
-            for slot in missing
-        ],
-    )
+    remaining = list(slots)
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal remaining
+        body = match.group(2)
+        if not remaining or re.search(r"<Picture\s+\d+>", body, flags=re.IGNORECASE):
+            return match.group(0)
+        labels = ", ".join(f"<Picture {slot}>" for slot in remaining)
+        remaining = []
+        if not body.strip():
+            return f"{match.group(1)} identified from {labels}"
+        if body.startswith(" "):
+            return f"{match.group(1)} identified from {labels},{body}"
+        return f"{match.group(1)} identified from {labels}, {body}"
+
+    return _ENVIRONMENT_LINE.sub(repl, prompt)
+
+
+def _ensure_full_reference_picture_labels(prompt: str, picture_slots: Iterable[int]) -> str:
+    """Guarantee that Director-bound image references are visible in the H3 text.
+
+    Slots already chosen for the segment stay even when the refine pass writes a
+    bare ``<Environment>`` and never says ``<Picture N>``. Empty slot lists add
+    nothing.
+    """
+
+    slots = sorted({int(slot) for slot in picture_slots})
+    if not slots:
+        return prompt
+    missing = [slot for slot in slots if f"<Picture {slot}>" not in prompt]
+    if missing:
+        prompt = _bind_environment_picture_sources(prompt, missing)
+        still_missing = [slot for slot in missing if f"<Picture {slot}>" not in prompt]
+        if still_missing:
+            prompt = _insert_after_h3_field(
+                prompt,
+                "subject_definitions:",
+                [
+                    f"<Picture {slot}> is the authoritative visual reference for its depicted subject or environment, fully_preserved."
+                    for slot in still_missing
+                ],
+            )
+    retention = _h3_field_body(prompt, "retention_analysis:")
+    retention_missing = [slot for slot in slots if f"<Picture {slot}>" not in retention]
+    if retention_missing:
+        prompt = _insert_after_h3_field(
+            prompt,
+            "retention_analysis:",
+            [
+                f"<Picture {slot}>: fully_preserved; retain the connected reference identity, wardrobe, and visual design."
+                for slot in retention_missing
+            ],
+        )
+    return prompt
 
 
 def _plan_continuity_flag(value: Any, default: bool) -> bool:
@@ -5387,9 +5821,9 @@ def _validate_long_director_plan(
             raise PromptRefinerError(
                 f"Director plan segment {index} is missing required H3 field(s): {', '.join(missing)}."
             )
-        # Honor per-segment PICTURES/AUDIOS by default.  Empty/missing falls back
-        # to every connected still / standalone audio.  anchor_all_pictures
-        # restores the old force-all still set.  FL2V ignores asset lists.
+        # Empty or missing PICTURES / AUDIOS attaches nothing. Explicit lists are
+        # validated against connected slots. anchor_all_pictures forces every
+        # connected still onto the group. FL2V ignores asset lists.
         pictures, videos, paired, audios = _select_director_segment_assets(
             mode,
             raw.get("assets", {}),
@@ -5402,6 +5836,8 @@ def _validate_long_director_plan(
         )
         prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
         prompt = _ensure_full_reference_audio_voice_labels(prompt, audios)
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            pictures = _picture_slots_for_materialize(pictures, prompt, image_slots)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
         continuity = _plan_continuity_flag(raw_continuity, index > 1) if index > 1 else False
         segments.append(
@@ -6589,9 +7025,9 @@ class Qwen38LongVideoDirectorPlanner:
                         "default": False,
                         "label": "Anchor all pictures",
                         "tooltip": (
-                            "Default off (tighten): each R2V group only carries the pictures that segment listed "
-                            "(empty selection falls back to all connected stills). Turn on (全挂锚图) to restore "
-                            "the old behavior that attaches every connected picture to every R2V group."
+                            "Default off: each R2V group carries only the pictures that segment listed. "
+                            "An empty or missing PICTURES list attaches no stills (空＝不挂图). "
+                            "Turn on (全挂锚图) to attach every connected picture to every R2V group."
                         ),
                     },
                 ),
