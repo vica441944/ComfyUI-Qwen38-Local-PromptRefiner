@@ -3693,6 +3693,10 @@ def _segments_from_structure_cards(
             audio_slots,
             anchor_all_pictures=anchor_all_pictures,
         )
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            # The shot text is authoritative even if a later card rewrite left
+            # assets.pictures short. Still do not invent slots the shot never named.
+            pictures = _picture_slots_for_materialize(pictures, beat, image_slots)
         segments.append(
             _DirectorLongSegment(
                 index=index,
@@ -5091,10 +5095,15 @@ def _plan_director_with_independent_segment_refine(
             text = complete(messages, refine_max_tokens, completion_seed)
             try:
                 audio_labels = _extract_audio_voice_labels(brief)
+                authoritative_pictures = segment.picture_slots
+                if mode == DIRECTOR_LONG_R2V_MODE:
+                    authoritative_pictures = _picture_slots_for_materialize(
+                        segment.picture_slots, segment.beat, image_slots
+                    )
                 prompt = _finalize_director_segment_prompt(
                     text or "",
                     engine=engine,
-                    picture_slots=segment.picture_slots,
+                    picture_slots=authoritative_pictures,
                     lora_triggers=lora_triggers,
                     index=segment.index,
                     required_shot_ids=_assigned_brief_shot_ids(segment.beat),
@@ -5132,7 +5141,11 @@ def _plan_director_with_independent_segment_refine(
             ) from last_error
         picture_slots = segment.picture_slots
         if mode == DIRECTOR_LONG_R2V_MODE:
-            picture_slots = _picture_slots_for_materialize(picture_slots, prompt, image_slots)
+            picture_slots = _picture_slots_for_materialize(
+                _picture_slots_for_materialize(picture_slots, segment.beat, image_slots),
+                prompt,
+                image_slots,
+            )
         refined.append(replace(segment, prompt=prompt, picture_slots=picture_slots))
         passes.append(
             {
@@ -5375,30 +5388,97 @@ def _ensure_full_reference_audio_voice_labels(
     return head + body + tail
 
 
-def _ensure_full_reference_picture_labels(prompt: str, picture_slots: Iterable[int]) -> str:
-    """Guarantee that Director-bound image references are visible in the H3 text."""
+_ENVIRONMENT_LINE = re.compile(r"(?im)^([ \t]*<Environment>)([^\n]*)$")
 
-    missing = [
-        slot for slot in sorted(set(picture_slots)) if f"<Picture {slot}>" not in prompt
-    ]
-    if not missing:
+
+def _h3_field_body(prompt: str, field_name: str) -> str:
+    """Return the body of one H3 field, stopping at the next known field label."""
+
+    start = prompt.find(field_name)
+    if start < 0:
+        return ""
+    rest = prompt[start + len(field_name) :]
+    next_names = (
+        "\nsubject_definitions:",
+        "\nsummary:",
+        "\nretention_analysis:",
+        "\ndetailed_description:",
+        "\nintegrated_multimodal_description:",
+        "\noverall_soundscape:",
+        "\nnon_diegetic_music:",
+    )
+    end = len(rest)
+    lowered = rest.lower()
+    for name in next_names:
+        found = lowered.find(name)
+        if found >= 0:
+            end = min(end, found)
+    return rest[:end]
+
+
+def _bind_environment_picture_sources(prompt: str, slots: list[int]) -> str:
+    """Point a bare ``<Environment>`` line at the stills the model omitted.
+
+    MiniMax keeps the scene label as ``<Environment>``. The missing source is
+    inserted into that line; person/prop ``<Subject N>`` lines are left alone.
+    """
+
+    if not slots:
         return prompt
-    prompt = _insert_after_h3_field(
-        prompt,
-        "subject_definitions:",
-        [
-            f"<Picture {slot}> is the authoritative visual reference for its depicted subject or environment, fully_preserved."
-            for slot in missing
-        ],
-    )
-    return _insert_after_h3_field(
-        prompt,
-        "retention_analysis:",
-        [
-            f"<Picture {slot}>: fully_preserved; retain the connected reference identity, wardrobe, and visual design."
-            for slot in missing
-        ],
-    )
+    remaining = list(slots)
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal remaining
+        body = match.group(2)
+        if not remaining or re.search(r"<Picture\s+\d+>", body, flags=re.IGNORECASE):
+            return match.group(0)
+        labels = ", ".join(f"<Picture {slot}>" for slot in remaining)
+        remaining = []
+        if not body.strip():
+            return f"{match.group(1)} identified from {labels}"
+        if body.startswith(" "):
+            return f"{match.group(1)} identified from {labels},{body}"
+        return f"{match.group(1)} identified from {labels}, {body}"
+
+    return _ENVIRONMENT_LINE.sub(repl, prompt)
+
+
+def _ensure_full_reference_picture_labels(prompt: str, picture_slots: Iterable[int]) -> str:
+    """Guarantee that Director-bound image references are visible in the H3 text.
+
+    Slots already chosen for the segment stay even when the refine pass writes a
+    bare ``<Environment>`` and never says ``<Picture N>``. Empty slot lists add
+    nothing.
+    """
+
+    slots = sorted({int(slot) for slot in picture_slots})
+    if not slots:
+        return prompt
+    missing = [slot for slot in slots if f"<Picture {slot}>" not in prompt]
+    if missing:
+        prompt = _bind_environment_picture_sources(prompt, missing)
+        still_missing = [slot for slot in missing if f"<Picture {slot}>" not in prompt]
+        if still_missing:
+            prompt = _insert_after_h3_field(
+                prompt,
+                "subject_definitions:",
+                [
+                    f"<Picture {slot}> is the authoritative visual reference for its depicted subject or environment, fully_preserved."
+                    for slot in still_missing
+                ],
+            )
+    retention = _h3_field_body(prompt, "retention_analysis:")
+    retention_missing = [slot for slot in slots if f"<Picture {slot}>" not in retention]
+    if retention_missing:
+        prompt = _insert_after_h3_field(
+            prompt,
+            "retention_analysis:",
+            [
+                f"<Picture {slot}>: fully_preserved; retain the connected reference identity, wardrobe, and visual design."
+                for slot in retention_missing
+            ],
+        )
+    return prompt
 
 
 def _plan_continuity_flag(value: Any, default: bool) -> bool:

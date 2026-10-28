@@ -1857,6 +1857,94 @@ PROMPT:
         specs = nodes._director_ui_group_specs(R2V, segments)
         self.assertEqual(specs[0]["pictures"], [1, 2])
 
+    def test_omitted_environment_picture_is_injected_and_wired(self) -> None:
+        prompt = (
+            "subject_definitions:\n"
+            "<Subject 1> Hero, identified from <Picture 1>, must retain her face.\n"
+            "<Environment> Interior office space, implied by the lighting and context.\n"
+            "summary:\n"
+            "The face stays close, then the action shifts.\n"
+            "retention_analysis:\n"
+            "<Picture 1>: Preserves the hero.\n"
+            "detailed_description:\n"
+            "[Shot 1] The camera holds a close-up.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+        final = nodes._finalize_director_segment_prompt(
+            prompt,
+            engine=nodes.FULL_REFERENCE_ENGINE,
+            picture_slots=(1, 2),
+            lora_triggers=(),
+            index=2,
+        )
+        environment = next(line for line in final.splitlines() if "<Environment>" in line)
+        self.assertIn("<Picture 2>", environment)
+        self.assertIn("<Environment>", environment)
+        self.assertNotRegex(environment, r"<Subject\s+2>")
+        retention = nodes._h3_field_body(final, "retention_analysis:")
+        definitions = nodes._h3_field_body(final, "subject_definitions:")
+        self.assertIn("<Picture 2>", definitions)
+        self.assertIn("<Picture 2>", retention)
+        slots = nodes._picture_slots_for_materialize((1, 2), final, (1, 2))
+        self.assertEqual(slots, (1, 2))
+        segment = nodes._DirectorLongSegment(
+            index=2,
+            duration_seconds=8.0,
+            prompt=final,
+            picture_slots=slots,
+            video_slots=(),
+            video_audio_slots=(),
+            audio_slots=(),
+            continuity_from_prev=True,
+        )
+        groups, _packer = nodes._pack_director_long_groups(
+            R2V, [segment], {1: "image-1", 2: "image-2"}, {}, {}, {},
+        )
+        self.assertEqual(set(groups[0]["ref_images"]), {0, 1})
+        specs = nodes._director_ui_group_specs(R2V, [segment])
+        self.assertEqual(specs[0]["pictures"], [1, 2])
+
+        bare = (
+            "subject_definitions:\n"
+            "<Environment> Interior office space.\n"
+            "summary:\n"
+            "Holds.\n"
+            "retention_analysis:\n"
+            "No still was assigned.\n"
+            "detailed_description:\n"
+            "[Shot 1] The camera holds.\n"
+            "overall_soundscape:\n"
+            "Room tone.\n"
+            "non_diegetic_music:\n"
+            "N/A"
+        )
+        untouched = nodes._finalize_director_segment_prompt(
+            bare,
+            engine=nodes.FULL_REFERENCE_ENGINE,
+            picture_slots=(),
+            lora_triggers=(),
+            index=1,
+        )
+        self.assertNotIn("<Picture", untouched)
+        self.assertEqual(nodes._picture_slots_for_materialize((), untouched, (1, 2)), ())
+
+        card = {
+            "index": 1,
+            "duration_raw": "8",
+            "continuity_raw": "false",
+            "beat": "分镜1使用参考: <Picture 1>, <Picture 2>\n人物在办公室。",
+            "dialogue": "",
+            "handoff": "end",
+            "assets": {"pictures": [1], "videos": [], "video_audios": [], "audios": []},
+        }
+        segments, _rebalanced, _misses = nodes._segments_from_structure_cards(
+            [card], R2V, (8.0,), (1, 2), (), (), (),
+        )
+        self.assertEqual(segments[0].picture_slots, (1, 2))
+
     def test_anchor_all_pictures_forces_every_connected_still(self) -> None:
         pictures, _videos, _paired, _audios = nodes._select_director_segment_assets(
             R2V,
