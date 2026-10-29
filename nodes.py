@@ -2858,11 +2858,12 @@ def _story_beat_from_fields(
     key_dialogue: Iterable[str] | None = None,
 ) -> _StoryBeatSpec:
     est = max(float(estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS)
-    keys = tuple(
-        item.strip()
-        for item in (key_dialogue or ())
-        if str(item).strip() and not _is_non_dialogue_landmark(str(item))
-    )
+    keys_list: list[str] = []
+    for item in key_dialogue or ():
+        for core in _landmark_spoken_cores(str(item)):
+            if core and not _is_non_dialogue_landmark(core) and core not in keys_list:
+                keys_list.append(core)
+    keys = tuple(keys_list)
     if not keys:
         keys = _extract_dialogue_landmarks(body)
     return _StoryBeatSpec(
@@ -3570,6 +3571,45 @@ _AMBIENT_SFX_LANDMARK = re.compile(
 _VOCAL_CUE_PREFIX_IS_SPEECH = re.compile(r"[不别请要让把被]")
 
 
+_NARRATION_FRAME = re.compile(
+    r"^(?:[\u4e00-\u9fffA-Za-z·・]{0,8})?(?:又)?"
+    r"(?:浪叫|呻吟|娇喘|喘息|说|道|喊|问|叫)"
+    r"\s*['\"“”‘’「『]\s*"
+)
+
+
+def _peel_narration_frame(text: str) -> str:
+    """Drop a leading ``谁说'`` / ``又浪叫'`` frame. Leave a plain line unchanged."""
+
+    raw = (text or "").strip()
+    match = _NARRATION_FRAME.match(raw)
+    if not match:
+        return raw.strip("\"'“”‘’「」『』")
+    return raw[match.end() :].strip().strip("\"'“”‘’「」『』")
+
+
+def _landmark_spoken_cores(landmark: str) -> tuple[str, ...]:
+    """Spoken text inside a beat-pack landmark, after narration and SFX frames.
+
+    ``赵大娘说'郎哥哥太坏了`` and ``又浪叫'水水流了满地`` keep the words that
+    actually have to appear. A cue with no words left is omitted. A plain line
+    is returned unchanged.
+    """
+
+    found: list[str] = []
+    tokens = _split_landmark_list(landmark)
+    if not tokens and (landmark or "").strip():
+        tokens = [(landmark or "").strip()]
+    for token in tokens:
+        peeled = _peel_narration_frame(token)
+        comparable = token.strip().strip("\"'“”‘’「」『』")
+        if peeled and peeled != comparable:
+            found.extend(_landmark_spoken_cores(peeled))
+        elif peeled:
+            found.append(peeled)
+    return tuple(dict.fromkeys(found))
+
+
 def _is_non_dialogue_landmark(landmark: str) -> bool:
     """Drop fragments, delivery cues, and ambient labels. Keep spoken lines."""
 
@@ -3670,18 +3710,27 @@ def _validate_structure_coverage(
         # only records lines that are absent from the whole plan.
         global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
-            if _is_non_dialogue_landmark(landmark):
+            cores = _landmark_spoken_cores(landmark)
+            if not cores:
                 continue
-            needle = _normalize_dialogue_needle(landmark)
-            if len(needle) < 2:
-                continue
-            if needle in blob or needle in global_blob:
-                continue
-            # Soft match: require a long distinctive core (≥4 chars) as substring.
-            core = needle[: max(4, min(12, len(needle)))]
-            if core and (core in blob or core in global_blob):
-                continue
-            soft_misses.append(f"beat{beat.index}:{landmark}")
+            unmatched = False
+            saw_spoken = False
+            for core in cores:
+                if _is_non_dialogue_landmark(core):
+                    continue
+                saw_spoken = True
+                needle = _normalize_dialogue_needle(core)
+                if len(needle) < 2:
+                    continue
+                if needle in blob or needle in global_blob:
+                    continue
+                # Soft match: a long distinctive core (≥4 chars) still counts.
+                core_key = needle[: max(4, min(12, len(needle)))]
+                if core_key and (core_key in blob or core_key in global_blob):
+                    continue
+                unmatched = True
+            if saw_spoken and unmatched:
+                soft_misses.append(f"beat{beat.index}:{landmark}")
     if hard_missing:
         raise PromptRefinerError(
             "Coverage knife rejected the structure plan (beat / card coverage). "
@@ -4758,6 +4807,23 @@ def _apply_empty_origin_beat_quote_dialogues(
         # If stripping would empty the beat, keep narrative (quotes still in DIALOGUE).
 
 
+def _dialogue_line_needles(cards: Iterable[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    """Spoken structure lines as ``(display, normalized needle)``."""
+
+    needles: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for card in cards:
+        text = _clean_structure_dialogue(str(card.get("dialogue") or ""))
+        for line in text.splitlines():
+            display = line.strip()
+            needle = _normalize_dialogue_needle(display)
+            if len(needle) < 2 or needle in seen:
+                continue
+            seen.add(needle)
+            needles.append((display, needle))
+    return tuple(needles)
+
+
 def _repair_structure_duration_cards(
     cards: list[dict[str, Any]], schedule: tuple[float, ...],
     coverage_plan: _CoverageKnifePlan | None, complete: Callable, max_tokens: int, seed: int,
@@ -4781,6 +4847,9 @@ def _repair_structure_duration_cards(
     _require_compatible_director_segment_count(len(cards), len(schedule))
     _require_coherent_segment_indexes([int(c["index"]) for c in cards], len(cards))
     ordered = sorted(cards, key=lambda c: int(c["index"]))
+    # Only lines already in this structure dialogue are mandatory after a split.
+    # Beat-pack shells that never appeared here stay soft misses.
+    source_dialogue_needles = _dialogue_line_needles(ordered)
     # Preserve the existing ±1-card tolerance with a new host schedule.
     if len(ordered) != len(schedule):
         each = sum(schedule) / len(ordered)
@@ -5089,13 +5158,18 @@ def _repair_structure_duration_cards(
         coverage_plan = replace(coverage_plan, group_count=len(result),
                                 card_counts=tuple(result_beats.count(i + 1) for i in range(len(coverage_plan.beats))),
                                 segment_to_beat=tuple(result_beats))
-        # Soft misses stay a returned list before repair. After a duration split,
-        # a real spoken landmark that disappeared still aborts. Direction cues,
-        # cut-off parentheses, and ambient SFX are not landmarks, so they cannot
-        # fail this check.
-        misses = _validate_structure_coverage(result, coverage_plan)
-        if misses:
-            raise PromptRefinerError("Repaired structure has missing dialogue landmarks: " + "; ".join(misses))
+    # Beat-pack key_dialogue is not a hard gate. Abort only when a spoken
+    # line that this repair started with is absent from the repaired dialogue.
+    result_dialogue = _normalize_dialogue_needle(_cards_dialogue_blob(result))
+    lost = [
+        display
+        for display, needle in source_dialogue_needles
+        if needle not in result_dialogue
+    ]
+    if lost:
+        raise PromptRefinerError(
+            "Repaired structure has missing dialogue landmarks: " + "; ".join(lost)
+        )
     if abs(sum(result_times) - total) > 0.002:
         raise PromptRefinerError(f"Local repair failed total duration conservation: {sum(result_times)} vs {total}.")
     for i, value in enumerate(result_times, 1):
