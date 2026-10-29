@@ -2910,6 +2910,85 @@ Still at the doorway.
         spoken = " ".join(str(card.get("dialogue") or "") for card in repaired)
         self.assertIn("请往前走", spoken)
 
+    def test_narration_wrappers_match_spoken_cores_after_repair(self) -> None:
+        landmarks = ("赵大娘说'郎哥哥太坏了", "又浪叫'水水流了满地")
+        self.assertEqual(
+            nodes._landmark_spoken_cores(landmarks[0]),
+            ("郎哥哥太坏了",),
+        )
+        self.assertEqual(
+            nodes._landmark_spoken_cores(landmarks[1]),
+            ("水水流了满地",),
+        )
+        brief = (
+            "[STORY_BEATS]\n"
+            "1|15|1-4|talk|赵大娘说'郎哥哥太坏了;又浪叫'水水流了满地\n"
+            "[/STORY_BEATS]\n"
+        )
+        beats = nodes._parse_story_beats_block(brief)
+        self.assertEqual(beats[0].key_dialogue, ("郎哥哥太坏了", "水水流了满地"))
+        dialogue = (
+            "郎哥哥太坏了……先别玩了，今天还有正事呢。\n"
+            "啊～水水流了满地～一会儿我还要带郎哥哥实地考察的～"
+        )
+        cards = [
+            {
+                "index": 1,
+                "duration_raw": "8",
+                "continuity_raw": "false",
+                "beat": "She pushes his hand away. Water spreads across the hem.",
+                "dialogue": dialogue,
+                "handoff": "end",
+                "assets": {"pictures": [], "videos": [], "video_audios": [], "audios": []},
+            }
+        ]
+        beat = nodes._StoryBeatSpec(
+            index=1,
+            estimated_seconds=8.0,
+            shot_start=None,
+            shot_end=None,
+            label="talk",
+            body="",
+            key_dialogue=landmarks,
+        )
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=8.0,
+            group_count=1,
+            estimated_sum=8.0,
+            compressed=False,
+            allocations=(8.0,),
+            card_counts=(1,),
+            segment_to_beat=(1,),
+        )
+        self.assertEqual(nodes._validate_structure_coverage(cards, plan), [])
+        audit: dict = {"schedule": (8.0,), "outputs": [], "repairs": []}
+
+        def complete(_messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {
+                        "beat": "She pushes his hand away.",
+                        "dialogue": "郎哥哥太坏了……先别玩了，今天还有正事呢。",
+                        "handoff": "Pause.",
+                    },
+                    {
+                        "beat": "Water spreads across the hem.",
+                        "dialogue": "啊～水水流了满地～一会儿我还要带郎哥哥实地考察的～",
+                        "handoff": "end",
+                    },
+                ]
+            })
+
+        # 12s forces a split so the post-repair landmark check actually runs.
+        overflowing = [{**cards[0], "duration_raw": "12"}]
+        repaired, _resolved, _out = nodes._repair_structure_duration_cards(
+            overflowing, (12.0,), plan, complete, 1024, 0, audit, max_segment_seconds=10.0,
+        )
+        self.assertGreaterEqual(len(repaired), 2)
+        self.assertIn("郎哥哥太坏了", repaired[0]["dialogue"])
+        self.assertIn("水水流了满地", repaired[1]["dialogue"])
+
     def test_structure_allocates_cards_and_keeps_trailing_duration_floor(self) -> None:
         plan = nodes._build_coverage_knife_plan(
             self._story_beats_brief(),

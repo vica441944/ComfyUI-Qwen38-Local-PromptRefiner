@@ -2858,11 +2858,12 @@ def _story_beat_from_fields(
     key_dialogue: Iterable[str] | None = None,
 ) -> _StoryBeatSpec:
     est = max(float(estimated_seconds), MIN_DIRECTOR_SEGMENT_SECONDS)
-    keys = tuple(
-        item.strip()
-        for item in (key_dialogue or ())
-        if str(item).strip() and not _is_non_dialogue_landmark(str(item))
-    )
+    keys_list: list[str] = []
+    for item in key_dialogue or ():
+        for core in _landmark_spoken_cores(str(item)):
+            if core and not _is_non_dialogue_landmark(core) and core not in keys_list:
+                keys_list.append(core)
+    keys = tuple(keys_list)
     if not keys:
         keys = _extract_dialogue_landmarks(body)
     return _StoryBeatSpec(
@@ -3570,6 +3571,45 @@ _AMBIENT_SFX_LANDMARK = re.compile(
 _VOCAL_CUE_PREFIX_IS_SPEECH = re.compile(r"[不别请要让把被]")
 
 
+_NARRATION_FRAME = re.compile(
+    r"^(?:[\u4e00-\u9fffA-Za-z·・]{0,8})?(?:又)?"
+    r"(?:浪叫|呻吟|娇喘|喘息|说|道|喊|问|叫)"
+    r"\s*['\"“”‘’「『]\s*"
+)
+
+
+def _peel_narration_frame(text: str) -> str:
+    """Drop a leading ``谁说'`` / ``又浪叫'`` frame. Leave a plain line unchanged."""
+
+    raw = (text or "").strip()
+    match = _NARRATION_FRAME.match(raw)
+    if not match:
+        return raw.strip("\"'“”‘’「」『』")
+    return raw[match.end() :].strip().strip("\"'“”‘’「」『』")
+
+
+def _landmark_spoken_cores(landmark: str) -> tuple[str, ...]:
+    """Spoken text inside a beat-pack landmark, after narration and SFX frames.
+
+    ``赵大娘说'郎哥哥太坏了`` and ``又浪叫'水水流了满地`` keep the words that
+    actually have to appear. A cue with no words left is omitted. A plain line
+    is returned unchanged.
+    """
+
+    found: list[str] = []
+    tokens = _split_landmark_list(landmark)
+    if not tokens and (landmark or "").strip():
+        tokens = [(landmark or "").strip()]
+    for token in tokens:
+        peeled = _peel_narration_frame(token)
+        comparable = token.strip().strip("\"'“”‘’「」『』")
+        if peeled and peeled != comparable:
+            found.extend(_landmark_spoken_cores(peeled))
+        elif peeled:
+            found.append(peeled)
+    return tuple(dict.fromkeys(found))
+
+
 def _is_non_dialogue_landmark(landmark: str) -> bool:
     """Drop fragments, delivery cues, and ambient labels. Keep spoken lines."""
 
@@ -3670,18 +3710,27 @@ def _validate_structure_coverage(
         # only records lines that are absent from the whole plan.
         global_blob = _normalize_dialogue_needle(_cards_coverage_blob(ordered))
         for landmark in beat.key_dialogue:
-            if _is_non_dialogue_landmark(landmark):
+            cores = _landmark_spoken_cores(landmark)
+            if not cores:
                 continue
-            needle = _normalize_dialogue_needle(landmark)
-            if len(needle) < 2:
-                continue
-            if needle in blob or needle in global_blob:
-                continue
-            # Soft match: require a long distinctive core (≥4 chars) as substring.
-            core = needle[: max(4, min(12, len(needle)))]
-            if core and (core in blob or core in global_blob):
-                continue
-            soft_misses.append(f"beat{beat.index}:{landmark}")
+            unmatched = False
+            saw_spoken = False
+            for core in cores:
+                if _is_non_dialogue_landmark(core):
+                    continue
+                saw_spoken = True
+                needle = _normalize_dialogue_needle(core)
+                if len(needle) < 2:
+                    continue
+                if needle in blob or needle in global_blob:
+                    continue
+                # Soft match: a long distinctive core (≥4 chars) still counts.
+                core_key = needle[: max(4, min(12, len(needle)))]
+                if core_key and (core_key in blob or core_key in global_blob):
+                    continue
+                unmatched = True
+            if saw_spoken and unmatched:
+                soft_misses.append(f"beat{beat.index}:{landmark}")
     if hard_missing:
         raise PromptRefinerError(
             "Coverage knife rejected the structure plan (beat / card coverage). "
