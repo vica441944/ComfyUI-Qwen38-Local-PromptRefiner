@@ -2879,6 +2879,73 @@ Still at the doorway.
             max_segment_seconds=10.0,
         )
 
+    def _repair_two_cards_dropping_source_line(self, spoken: str):
+        beat = nodes._StoryBeatSpec(
+            index=1,
+            estimated_seconds=20.0,
+            shot_start=1,
+            shot_end=2,
+            label="arrival",
+            body="",
+            key_dialogue=(spoken,),
+        )
+        plan = nodes._CoverageKnifePlan(
+            beats=(beat,),
+            budget_seconds=20.0,
+            group_count=2,
+            estimated_sum=20.0,
+            compressed=False,
+            allocations=(10.0, 10.0),
+            card_counts=(2,),
+            segment_to_beat=(1, 1),
+        )
+        structure = f"""
+TITLE: Dropped source line
+=== SEGMENT 1 ===
+DURATION_SECONDS: 12
+CONTINUITY_FROM_PREV: false
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Alpha action. Beta action.
+DIALOGUE:
+{spoken}
+HANDOFF:
+Hold at the doorway.
+=== END SEGMENT ===
+=== SEGMENT 2 ===
+DURATION_SECONDS: 8
+CONTINUITY_FROM_PREV: true
+PICTURES:
+VIDEOS:
+VIDEO_AUDIOS:
+AUDIOS:
+BEAT:
+Second card holds.
+DIALOGUE:
+NONE
+HANDOFF:
+Still at the doorway.
+=== END SEGMENT ===
+""".strip()
+        _title, cards = nodes._parse_director_structure_output(structure)
+        audit: dict = {"schedule": (10.0, 10.0), "outputs": [], "repairs": []}
+
+        def complete(_messages, _max_tokens, _seed):
+            return json.dumps({
+                "parts": [
+                    {"beat": "Alpha action.", "dialogue": "", "handoff": "Between actions."},
+                    {"beat": "Beta action.", "dialogue": "", "handoff": "Hold at the doorway."},
+                ]
+            })
+
+        return nodes._repair_structure_duration_cards(
+            cards, (10.0, 10.0), plan, complete, 1024, 0, audit,
+            max_segment_seconds=10.0,
+        )
+
     def test_repaired_structure_ignores_direction_fragments(self) -> None:
         fragments = ("角色甲（画外", "平静）", '"人群笑声')
         repaired, resolved, _plan = self._repair_two_cards(fragments)
@@ -2888,8 +2955,37 @@ Still at the doorway.
         self.assertEqual(misses, [])
 
     def test_repaired_structure_still_requires_real_landmarks(self) -> None:
-        with self.assertRaisesRegex(nodes.PromptRefinerError, "missing dialogue landmarks: beat1:MUST_KEEP_LINE_ZX9"):
-            self._repair_two_cards(("MUST_KEEP_LINE_ZX9",))
+        # A beat-pack token that was never in the structure dialogue is soft.
+        repaired, resolved, _plan = self._repair_two_cards(("MUST_KEEP_LINE_ZX9",))
+        self.assertEqual(len(repaired), 3)
+        self.assertAlmostEqual(sum(resolved), 20.0, places=3)
+        self.assertIn("请往前走", " ".join(str(card.get("dialogue") or "") for card in repaired))
+
+    def test_beat_pack_shells_absent_from_source_dialogue_do_not_abort_repair(self) -> None:
+        landmarks = (
+            "赵大娘解释'是春雨了",
+            "但不是春天的意思",
+            "是你昨晚表现好得来的赏赐",
+            "好弟弟你可真优秀",
+        )
+        repaired, resolved, _plan = self._repair_two_cards(landmarks)
+        self.assertEqual(len(repaired), 3)
+        self.assertAlmostEqual(sum(resolved), 20.0, places=3)
+        spoken = " ".join(str(card.get("dialogue") or "") for card in repaired)
+        self.assertIn("请往前走", spoken)
+        self.assertNotIn("春雨", spoken)
+
+    def test_repair_raises_when_source_dialogue_line_is_dropped(self) -> None:
+        real_check = nodes._validate_verbatim_partition
+        nodes._validate_verbatim_partition = lambda *_args, **_kwargs: None
+        try:
+            with self.assertRaisesRegex(
+                nodes.PromptRefinerError,
+                "missing dialogue landmarks: MUST_KEEP_LINE_ZX9",
+            ):
+                self._repair_two_cards_dropping_source_line("MUST_KEEP_LINE_ZX9")
+        finally:
+            nodes._validate_verbatim_partition = real_check
 
     def test_moan_label_does_not_abort_repaired_structure(self) -> None:
         self.assertTrue(nodes._is_non_dialogue_landmark("赵凤红呻吟"))

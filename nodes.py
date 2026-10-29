@@ -4807,6 +4807,23 @@ def _apply_empty_origin_beat_quote_dialogues(
         # If stripping would empty the beat, keep narrative (quotes still in DIALOGUE).
 
 
+def _dialogue_line_needles(cards: Iterable[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    """Spoken structure lines as ``(display, normalized needle)``."""
+
+    needles: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for card in cards:
+        text = _clean_structure_dialogue(str(card.get("dialogue") or ""))
+        for line in text.splitlines():
+            display = line.strip()
+            needle = _normalize_dialogue_needle(display)
+            if len(needle) < 2 or needle in seen:
+                continue
+            seen.add(needle)
+            needles.append((display, needle))
+    return tuple(needles)
+
+
 def _repair_structure_duration_cards(
     cards: list[dict[str, Any]], schedule: tuple[float, ...],
     coverage_plan: _CoverageKnifePlan | None, complete: Callable, max_tokens: int, seed: int,
@@ -4830,6 +4847,9 @@ def _repair_structure_duration_cards(
     _require_compatible_director_segment_count(len(cards), len(schedule))
     _require_coherent_segment_indexes([int(c["index"]) for c in cards], len(cards))
     ordered = sorted(cards, key=lambda c: int(c["index"]))
+    # Only lines already in this structure dialogue are mandatory after a split.
+    # Beat-pack shells that never appeared here stay soft misses.
+    source_dialogue_needles = _dialogue_line_needles(ordered)
     # Preserve the existing ±1-card tolerance with a new host schedule.
     if len(ordered) != len(schedule):
         each = sum(schedule) / len(ordered)
@@ -5138,13 +5158,18 @@ def _repair_structure_duration_cards(
         coverage_plan = replace(coverage_plan, group_count=len(result),
                                 card_counts=tuple(result_beats.count(i + 1) for i in range(len(coverage_plan.beats))),
                                 segment_to_beat=tuple(result_beats))
-        # Soft misses stay a returned list before repair. After a duration split,
-        # a real spoken landmark that disappeared still aborts. Direction cues,
-        # cut-off parentheses, and ambient SFX are not landmarks, so they cannot
-        # fail this check.
-        misses = _validate_structure_coverage(result, coverage_plan)
-        if misses:
-            raise PromptRefinerError("Repaired structure has missing dialogue landmarks: " + "; ".join(misses))
+    # Beat-pack key_dialogue is not a hard gate. Abort only when a spoken
+    # line that this repair started with is absent from the repaired dialogue.
+    result_dialogue = _normalize_dialogue_needle(_cards_dialogue_blob(result))
+    lost = [
+        display
+        for display, needle in source_dialogue_needles
+        if needle not in result_dialogue
+    ]
+    if lost:
+        raise PromptRefinerError(
+            "Repaired structure has missing dialogue landmarks: " + "; ".join(lost)
+        )
     if abs(sum(result_times) - total) > 0.002:
         raise PromptRefinerError(f"Local repair failed total duration conservation: {sum(result_times)} vs {total}.")
     for i, value in enumerate(result_times, 1):
