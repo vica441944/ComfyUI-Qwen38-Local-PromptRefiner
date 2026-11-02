@@ -1,5 +1,6 @@
 """Host duration contracts and lossless local repair, without a model/GPU."""
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,163 @@ def split_reply(messages, _tokens, _seed):
 
 
 class DurationContractTests(unittest.TestCase):
+    def test_expanded_repair_updates_coverage_budget_and_allocations(self):
+        # nb_xoh0t shape: reserve 8s, then fit a speech-heavy first part into
+        # 4.889 + 4 + 4 seconds, retaining the ordinary 5s card.
+        for beat_count in (1, 2):
+            with self.subTest(beat_count=beat_count):
+                brief = "[STORY_BEATS]\n1|10|1-2|entry|\n"
+                if beat_count == 2:
+                    brief += "2|10|3-4|exit|\n"
+                brief += "[/STORY_BEATS]"
+                plan = nodes._build_coverage_knife_plan(brief, budget_seconds=10, group_count=2)
+                source = cards([4.5, 5])
+                source[0]["beat"] = "entry. Continue."
+                source[1]["beat"] = "exit."
+                source[0]["dialogue"] = " ".join(["word"] * 11) + "; " + " ".join(["tail"] * 6)
+                source[1]["dialogue"] = ""
+
+                def complete(messages, _tokens, _seed):
+                    payload = json.loads(messages[1]["content"])
+                    self.assertEqual(payload["durations"], [4, 4])
+                    return json.dumps({"parts": [
+                        dict(beat="entry.", dialogue=payload["dialogue"], handoff="Hold."),
+                        dict(beat="Continue.", dialogue="", handoff=payload["handoff"]),
+                    ]})
+
+                audit = {"repairs": []}
+                fixed, durations, updated = nodes._repair_structure_duration_cards(
+                    source, (5, 5), plan, complete, 4096, 7, audit,
+                    max_segment_seconds=5, allow_duration_overrun=True,
+                )
+                self.assertEqual(durations, (4.889, 4, 4, 5))
+                self.assertEqual(audit["overflow_budget_expand_detail"]["reason"],
+                                 "repaired_dialogue_requires_more_time")
+                self.assertAlmostEqual(updated.budget_seconds, 17.889)
+                self.assertAlmostEqual(sum(updated.allocations), sum(durations))
+                self.assertEqual(updated.group_count, 4)
+                self.assertEqual(updated.card_counts, (4,) if beat_count == 1 else (3, 1))
+                self.assertEqual(updated.allocations, (17.889,) if beat_count == 1 else (12.889, 5))
+                self.assertEqual(updated.compressed, beat_count == 2)
+                nodes._validate_verbatim_partition(source[0]["dialogue"],
+                                                  [c["dialogue"] for c in fixed[:3]], "dialogue")
+                segments, _, _ = nodes._segments_from_structure_cards(
+                    fixed, R2V, durations, (1,), (1,), (1,), (),
+                    coverage_plan=updated, max_segment_seconds=5,
+                )
+                self.assertAlmostEqual(sum(s.duration_seconds for s in segments), sum(durations))
+                self.assertTrue(all(4 <= s.duration_seconds <= 5 for s in segments))
+                # A subsequent repair with no overflow must also reconcile an
+                # already-expanded schedule with a stale incoming budget.
+                stale = nodes.replace(updated, budget_seconds=10)
+                _, again, reconciled = nodes._repair_structure_duration_cards(
+                    fixed, durations, stale, complete, 4096, 7, {"repairs": []},
+                    max_segment_seconds=5, allow_duration_overrun=True,
+                )
+                self.assertAlmostEqual(reconciled.budget_seconds, sum(again))
+
+    def test_soft_overrun_packs_speech_dead_zones_without_truncation(self):
+        for word_count, group_count in ((17, 2), (25, 3)):
+            with self.subTest(word_count=word_count):
+                source = cards([5, 5])
+                source[0]["dialogue"] = " ".join(f"word{i}" for i in range(word_count))
+                source[0]["beat"] = " ".join(f"Action{i}." for i in range(group_count))
+                audit = {"repairs": []}
+
+                def complete(messages, _tokens, _seed):
+                    payload = json.loads(messages[1]["content"])
+                    self.assertEqual(payload["durations"], [4.0] * group_count)
+                    words = payload["dialogue"].split()
+                    beats = payload["beat"].split()
+                    return json.dumps({"parts": [
+                        dict(beat=beats[i], dialogue=" ".join(
+                            words[i * word_count // group_count:(i + 1) * word_count // group_count]
+                        ), handoff=payload["handoff"])
+                        for i in range(group_count)
+                    ]})
+
+                fixed, durations, _ = nodes._repair_structure_duration_cards(
+                    source, (5, 5), None, complete, 4096, 7, audit,
+                    max_segment_seconds=5, allow_duration_overrun=True,
+                )
+                self.assertEqual(durations, (4.0,) * group_count + (5.0,))
+                self.assertEqual(" ".join(c["dialogue"] for c in fixed[:-1]), source[0]["dialogue"])
+                self.assertEqual(fixed[-1]["dialogue"], source[1]["dialogue"])
+                self.assertEqual(audit["expanded_total_seconds"], sum(durations))
+                self.assertEqual(audit["overflow_budget_expand_detail"]["expanded_total_seconds"], sum(durations))
+
+    def test_chinese_contract_bad_model_partition_falls_back_losslessly(self):
+        for repeat, embedded in ((1, False), (2, False), (1, True)):
+            with self.subTest(repeat=repeat, embedded=embedded):
+                source = cards([5, 5])
+                source[0]["beat"] = (
+                    "分镜1使用参考<Picture 1>,<Picture 2>\n"
+                    "分镜1: 中景｜小程、同伴｜中景固定。小程在画面中央，正对镜头，"
+                    "目光从左侧扫向右侧再收回。同伴在画面左侧，微微前倾。"
+                    "水面在画面下方三分之一处，暮光碎成金与青的鳞光，涟漪缓缓荡开。"
+                    "｜小程｜<Picture 1> 小程 小程 <Picture 2> 同伴 同伴"
+                )
+                source[0]["dialogue"] = (
+                    "你们两个说说，谁看过远方的森林，谁的旅行经历最有趣，谁说得好，我就把最后一点奖励给她。"
+                ) * repeat
+                original_dialogue = source[0]["dialogue"]
+                if embedded:
+                    source[0]["beat"] += ' 小程说："' + original_dialogue + '"'
+                    source[0]["dialogue"] = ""
+                calls = []
+
+                def complete(messages, _tokens, _seed):
+                    payload = json.loads(messages[1]["content"])
+                    calls.append(payload)
+                    return json.dumps({"parts": [dict(
+                        beat=payload["beat"].replace("小程 小程", "小程"),
+                        dialogue=payload["dialogue"], handoff=payload["handoff"],
+                    )]})
+
+                audit = {"repairs": []}
+                fixed, durations, _ = nodes._repair_structure_duration_cards(
+                    source, (5, 5), None, complete, 4096, 7, audit,
+                    max_segment_seconds=5, allow_duration_overrun=True,
+                )
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(audit["repairs"][0]["host_fallback"])
+                self.assertGreaterEqual(len(fixed[:-1]), 2 if repeat == 1 else 3)
+                expected_beat = source[0]["beat"]
+                if embedded:
+                    # The existing quote-lift path removes speech from BEAT.
+                    expected_beat = expected_beat.replace('"' + original_dialogue + '"', '')
+                for field in ("beat", "dialogue"):
+                    nodes._validate_verbatim_partition(
+                        original_dialogue if field == "dialogue" else expected_beat,
+                        [c[field] for c in fixed[:-1]], field,
+                    )
+                self.assertEqual(fixed[-2]["handoff"], source[0]["handoff"])
+                self.assertEqual(fixed[-1]["beat"], source[1]["beat"])
+                self.assertTrue(all(4 <= d <= 5 for d in durations))
+                for card, duration in zip(fixed, durations):
+                    self.assertLessEqual(nodes._speech_seconds_of_text(card["dialogue"]), duration + 0.02)
+                self.assertAlmostEqual(sum(durations), audit["expanded_total_seconds"])
+                self.assertLessEqual(sum(durations), nodes.MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS)
+
+    def test_packable_director_duration_uses_smallest_legal_total(self):
+        for seconds, expected in ((5, 5), (7.556, 8), (8, 8), (10, 10), (11, 12), (12, 12)):
+            with self.subTest(seconds=seconds):
+                actual = nodes._packable_director_duration(seconds, 5)
+                self.assertEqual(actual, expected)
+                self.assertTrue(all(4 <= d <= 5 for d in nodes._director_duration_schedule(actual, 5)))
+
+    def test_speech_packing_gap_preserves_strict_budget_and_expansion_ceiling(self):
+        source = cards([5, 5])
+        source[0]["dialogue"] = " ".join(["word"] * 17)
+        for soft, ceiling in ((False, 600), (True, 12)):
+            with self.subTest(soft=soft), patch.object(nodes, "MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS", ceiling):
+                with self.assertRaises(nodes.PromptRefinerError):
+                    nodes._repair_structure_duration_cards(
+                        source, (5, 5), None, lambda *a: self.fail("Unexpected split"),
+                        4096, 7, {"repairs": []}, max_segment_seconds=5,
+                        allow_duration_overrun=soft,
+                    )
+
     def repair(self, items, schedule, complete=split_reply, coverage=None):
         audit = {"outputs": [marked(items)], "repairs": []}
         result = nodes._repair_structure_duration_cards(items, tuple(schedule), coverage, complete, 4096, 7, audit)
@@ -66,10 +224,15 @@ class DurationContractTests(unittest.TestCase):
             nodes._director_duration_schedule(260, 10)
 
     def test_schedule_does_not_make_an_under_four_second_tail(self):
-        self.assertEqual(nodes._director_duration_schedule(7, 4), (7,))
+        with self.assertRaisesRegex(nodes.PromptRefinerError, "cannot be divided"):
+            nodes._director_duration_schedule(7, 4)
         for total in (4, 7.999, 16, 30.001, 180.123, 239.999, 240):
             for average in (4, 7, 10, 15):
                 with self.subTest(total=total, average=average):
+                    if math.ceil(total / average) > math.floor(total / 4):
+                        with self.assertRaisesRegex(nodes.PromptRefinerError, "cannot be divided"):
+                            nodes._director_duration_schedule(total, average)
+                        continue
                     self.assert_valid(nodes._director_duration_schedule(total, average), total)
 
     def test_story_beats_choose_group_count_and_max_is_only_a_ceiling(self):
@@ -152,8 +315,38 @@ class DurationContractTests(unittest.TestCase):
         self.assertEqual(result[2]["assets"]["pictures"], [1, 2, 7])
         self.assertEqual(result[1]["assets"]["audios"], [2])
         self.assertEqual(result[2]["assets"]["audios"], [1])
-        self.assertTrue(all(card["dialogue"] == "" for card in result))
-        self.assertIn("这里不会无聊", result[2]["beat"])
+        self.assertEqual([card["dialogue"] for card in result],
+                         ["开始走吧。", "今天到此为止。", "这里不会无聊。"])
+        self.assertNotIn("这里不会无聊", result[2]["beat"])
+
+    def test_duration_split_continues_last_shot_without_repeating_dialogue(self):
+        for shot_count, group_count in ((1, 2), (2, 4)):
+            with self.subTest(shots=shot_count, groups=group_count):
+                total = group_count * 5
+                brief = (
+                    f"[STORY_BEATS]\n1|{total}|1-{shot_count}|arrival|\n[/STORY_BEATS]\n"
+                    + "\n".join(
+                        f'分镜{shot}使用参考：<Picture {shot}>, <Audio {shot}>\n'
+                        f'分镜{shot}: Action {shot}. She says, "Line {shot}."'
+                        for shot in range(1, shot_count + 1)
+                    )
+                )
+                schedule, plan = nodes._story_duration_schedule(
+                    brief, budget_seconds=5, max_segment_seconds=5,
+                    allow_duration_overrun=True,
+                )
+                self.assertEqual(schedule, (5,) * group_count)
+                result = nodes._apply_story_shot_contract(cards(schedule), brief, plan)
+                for position, card in enumerate(result):
+                    shot = min(position + 1, shot_count)
+                    self.assertIn(f"Action {shot}.", card["beat"])
+                    self.assertNotIn("Line", card["beat"])
+                    self.assertEqual(card["assets"]["pictures"], [shot])
+                    self.assertEqual(card["assets"]["audios"], [shot])
+                    self.assertEqual(card["dialogue"], f"Line {shot}." if position < shot_count else "")
+                    if position >= shot_count:
+                        self.assertEqual(card["beat"], result[shot_count - 1]["beat"])
+                        self.assertEqual(card["assets"], result[shot_count - 1]["assets"])
 
     def test_declared_missing_shot_fails_with_diagnostic(self):
         brief = "[STORY_BEATS]\n1|10|57-58|ending|\n[/STORY_BEATS]\n分镜57使用参考:<Picture 1>\n分镜57: only"
@@ -228,8 +421,12 @@ class DurationContractTests(unittest.TestCase):
     def test_speech_overflow_with_a_legal_duration_is_detected(self):
         source = cards([10, 10, 10])
         source[0]["dialogue"] = " ".join(["word"] * 36)
-        with self.assertRaisesRegex(nodes.PromptRefinerError, "Local repair failed for segment 1, 16.000s"):
-            self.repair(source, (10, 10, 10), lambda *a: '{"parts":[]}')
+        fixed, durations, _, audit = self.repair(source, (10, 10, 10), lambda *a: '{"parts":[]}')
+        self.assert_valid(durations, 30)
+        self.assertTrue(audit["repairs"][0]["host_fallback"])
+        nodes._validate_verbatim_partition(
+            source[0]["dialogue"], [c["dialogue"] for c in fixed[:-2]], "dialogue",
+        )
 
     def test_21_seconds_split_without_shortening_or_content_loss(self):
         source = cards([21, 9, 10])
@@ -286,7 +483,49 @@ class DurationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(nodes.PromptRefinerError, "dialogue would not fit"):
             self.repair(source, (10, 10, 10), lambda *a: self.fail("Infeasible speech budget"))
 
-    def test_bad_partitions_rejected_with_two_local_attempts(self):
+    def test_dump_redistribution_soft_overrun_preserves_dialogue(self):
+        dump = json.loads((Path(__file__).parent / "fixtures" / "duration_redistribution.json").read_text(encoding="utf-8"))
+        _, source = nodes._parse_director_structure_output(dump["outputs"][0])
+        # The current CJK estimator counts this dump more compactly. Retain its
+        # recorded overflow reservation to reproduce the failing 4.111s remainder.
+        source[1]["duration_raw"] = "20.889"
+
+        def complete(messages, _tokens, _seed):
+            payload = json.loads(messages[1]["content"])
+            before, after = payload["beat"].split("Cut to close-up", 1)
+            lines = payload["dialogue"].splitlines()
+            self.assertEqual(len(lines), 2)
+            return json.dumps({"parts": [
+                dict(beat=before.strip(), dialogue=lines[0], handoff="Hold the conversation."),
+                dict(beat="Cut to close-up" + after, dialogue=lines[1], handoff=payload["handoff"]),
+            ]})
+
+        for embedded in (False, True):
+            with self.subTest(embedded_speech=embedded):
+                items = [dict(card) for card in source]
+                if embedded:
+                    items[0]["beat"] += ' She says, "' + " ".join(["word"] * 20) + '".'
+                    items[0]["dialogue"] = ""
+                audit = {"repairs": []}
+                fixed, durations, _ = nodes._repair_structure_duration_cards(
+                    items, tuple(dump["schedule"]), None, complete, 4096, 7, audit,
+                    allow_duration_overrun=True,
+                )
+                self.assertGreater(len(fixed), len(items))
+                self.assertGreater(sum(durations), sum(dump["schedule"]))
+                self.assert_valid(durations, audit["expanded_total_seconds"])
+                self.assertEqual(fixed[0]["beat"], items[0]["beat"])
+                self.assertEqual(fixed[0]["dialogue"], items[0]["dialogue"])
+                for field in ("beat", "dialogue"):
+                    self.assertEqual(
+                        " ".join(" ".join(card[field] for card in fixed).split()),
+                        " ".join(" ".join(card[field] for card in items).split()),
+                    )
+                for card, duration in zip(fixed, durations):
+                    self.assertLessEqual(nodes._structure_card_speech_seconds(
+                        card["dialogue"], card["beat"]), duration + 0.02)
+
+    def test_bad_partitions_use_host_fallback_after_two_local_attempts(self):
         for bad in ("drop", "duplicate", "reorder"):
             calls = []
             def complete(messages, tokens, seed):
@@ -299,8 +538,15 @@ class DurationContractTests(unittest.TestCase):
                     reply["parts"].reverse()
                 calls.append(messages)
                 return json.dumps(reply)
-            with self.subTest(bad=bad), self.assertRaisesRegex(nodes.PromptRefinerError, "segment 1, 21.000s"):
-                self.repair(cards([21, 9, 10]), (15, 12, 13), complete)
+            with self.subTest(bad=bad):
+                source = cards([21, 9, 10])
+                fixed, durations, _, audit = self.repair(source, (15, 12, 13), complete)
+                self.assert_valid(durations, 40)
+                self.assertTrue(audit["repairs"][0]["host_fallback"])
+                for field in ("beat", "dialogue"):
+                    nodes._validate_verbatim_partition(
+                        source[0][field], [c[field] for c in fixed[:-2]], field,
+                    )
             self.assertEqual(len(calls), 2)
 
     def test_coverage_membership_preserved_after_split(self):
@@ -326,7 +572,7 @@ class DurationContractTests(unittest.TestCase):
             system = messages[0]["content"]
             calls.append(system)
             if "STRUCTURE mode" in system:
-                self.assertIn("LOCKED DURATION SCHEDULE", system)
+                self.assertIn("total project duration of 40.000 seconds and exactly 3 groups", system)
                 return marked(cards([21, 9, 10]))
             if "Repair only" in system:
                 return split_reply(messages, tokens, seed)
@@ -369,6 +615,34 @@ class DurationContractTests(unittest.TestCase):
             self.assertIn("DURATION_SECONDS: 21", saved["outputs"][0])
             self.assertIn("segment 1", saved["error"])
 
+
+    def test_soft_overrun_aligned_beats_split_by_segment_ceiling(self):
+        """D2: STORY_BEATS sum == external_total; ceiling 15 => >=2 groups, sum ~19."""
+        brief = "[STORY_BEATS]\n1|19|1-5|pond|line\n[/STORY_BEATS]"
+        schedule, plan = nodes._story_duration_schedule(
+            brief,
+            budget_seconds=19.0,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertGreaterEqual(len(schedule), 2)
+        self.assertAlmostEqual(sum(schedule), 19.0, places=2)
+        self.assertTrue(all(4.0 <= seconds <= 15.0 for seconds in schedule))
+        self.assertIsNotNone(plan)
+        self.assertAlmostEqual(plan.budget_seconds, 19.0, places=2)
+
+    def test_soft_overrun_mismatched_beat_sum_follows_beats_not_external(self):
+        """D1 current Refiner behavior: soft overrun uses beat sum (NV must export aligned)."""
+        brief = "[STORY_BEATS]\n1|12|1-5|pond|line\n[/STORY_BEATS]"
+        schedule, plan = nodes._story_duration_schedule(
+            brief,
+            budget_seconds=19.0,
+            max_segment_seconds=15.0,
+            allow_duration_overrun=True,
+        )
+        self.assertEqual(len(schedule), 1)
+        self.assertAlmostEqual(sum(schedule), 12.0, places=2)
+        self.assertAlmostEqual(plan.budget_seconds, 12.0, places=2)
 
 if __name__ == "__main__":
     unittest.main()

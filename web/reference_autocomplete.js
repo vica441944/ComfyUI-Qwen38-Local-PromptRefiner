@@ -681,17 +681,35 @@ function qwen38AudioSlotsMentionedInText(text) {
   return qwen38PositiveSlots(slots, 9);
 }
 
-/** NV packs use Global `@reference_audio_N file` without `<Audio N> …声线`, so
- *  structure cards often keep audios:[]. Mirror picture empty-list rescue:
- *  use tagged slots when present, else every LoadAudio wired into Planner. */
+function qwen38PictureSlotsMentionedInText(text) {
+  const raw = String(text ?? "");
+  const slots = [];
+  for (const match of raw.matchAll(/@reference_image_(\d+)\b/gi)) {
+    slots.push(Number(match[1]));
+  }
+  for (const match of raw.matchAll(/<Picture\s+(\d+)>/gi)) {
+    slots.push(Number(match[1]));
+  }
+  return qwen38PositiveSlots(slots, 9);
+}
+
+/** Shot-contract pictures plus any still the segment prompt actually names.
+ *  An empty list with no <Picture N> / @reference_image_N stays empty. */
+function qwen38ResolveMaterializePictureSlots(spec) {
+  return qwen38PositiveSlots(
+    [...qwen38PositiveSlots(spec?.pictures, 9), ...qwen38PictureSlotsMentionedInText(spec?.prompt)],
+    9,
+  );
+}
+
+/** Hang standalone audio only when the spec or the prompt names it.
+ *  Linked LoadAudio pins are not a fallback. */
 function qwen38ResolveMaterializeAudioSlots(graph, planner, spec) {
-  const explicit = qwen38PositiveSlots(spec?.audios, 9);
-  if (explicit.length) return explicit;
-  const tagged = qwen38AudioSlotsMentionedInText(spec?.prompt);
   const linked = qwen38LinkedReferenceAudioSlots(graph, planner);
-  const taggedLinked = tagged.filter((slot) => linked.includes(slot));
-  if (taggedLinked.length) return taggedLinked;
-  return linked;
+  const explicit = qwen38PositiveSlots(spec?.audios, 9);
+  if (explicit.length) return explicit.filter((slot) => linked.includes(slot));
+  const tagged = qwen38AudioSlotsMentionedInText(spec?.prompt);
+  return tagged.filter((slot) => linked.includes(slot));
 }
 
 function qwen38MaterializeR2vGroup(graph, planner, spec, position) {
@@ -708,7 +726,10 @@ function qwen38MaterializeR2vGroup(graph, planner, spec, position) {
     ["video_audios", "reference_video_audio_", "ref_video_audios.ref_video_audio_", "AUDIO"],
   ];
   for (const [specKey, plannerPrefix, groupPrefix, type] of assignments) {
-    for (const slot of qwen38PositiveSlots(spec?.[specKey], 9)) {
+    const slots = specKey === "pictures"
+      ? qwen38ResolveMaterializePictureSlots(spec)
+      : qwen38PositiveSlots(spec?.[specKey], 9);
+    for (const slot of slots) {
       const source = qwen38InputSource(graph, planner, `${plannerPrefix}${slot}`);
       if (!source) continue;
       qwen38ConnectSource(graph, source, group, `${groupPrefix}${slot - 1}`, type);
