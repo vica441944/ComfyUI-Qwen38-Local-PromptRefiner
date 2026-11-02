@@ -1121,6 +1121,17 @@ def _director_mode_engine(mode: str) -> str:
     raise PromptRefinerError(f"Unsupported Director long-plan mode: {mode!r}.")
 
 
+def _packable_director_duration(seconds: float, max_segment_seconds: float) -> float:
+    """Raise a reservation to the smallest total that fits legal H3 groups.
+
+    The ceiling requires at least ceil(seconds / max) groups; their combined
+    minimum is the next feasible total when seconds falls into a packing gap.
+    Callers validate the segment ceiling and enforce the host total budget.
+    """
+    count = max(1, int(np.ceil(seconds / max_segment_seconds)))
+    return max(seconds, count * MIN_DIRECTOR_SEGMENT_SECONDS)
+
+
 def _director_duration_schedule(
     total_seconds: float, max_segment_seconds: float, *,
     max_total_seconds: float = MAX_DIRECTOR_TOTAL_SECONDS,
@@ -3331,7 +3342,7 @@ def _audio_slots_named_in_text(text: str) -> frozenset[int]:
 def _apply_story_shot_contract(
     cards: list[dict[str, Any]], brief: str, plan: _CoverageKnifePlan | None,
 ) -> list[dict[str, Any]]:
-    """Bind every explicit brief shot to one structure card before refinement.
+    """Bind every explicit brief shot to structure cards before refinement.
 
     The LLM still decides continuity and handoff, but it cannot summarize away
     late shots. Exact shot text also supplies authoritative per-card picture and
@@ -3371,16 +3382,24 @@ def _apply_story_shot_contract(
         card_positions = [
             index for index, owner in enumerate(active.segment_to_beat) if owner == beat_position
         ]
-        partitions = _partition_ordered(shot_ids, len(card_positions))
+        partitions = _partition_ordered(shot_ids, min(len(shot_ids), len(card_positions)))
         if not partitions:
             raise PromptRefinerError(
                 f"Story beat {beat.index} has {len(shot_ids)} explicit shots but "
                 f"{len(card_positions)} groups; lossless shot assignment is impossible."
             )
+        # Duration splits may need more groups than explicit shots. Continue
+        # the final shot after every shot has received its first group.
+        partitions.extend([[shot_ids[-1]] for _ in range(len(card_positions) - len(partitions))])
+        dialogue_emitted: set[int] = set()
         for card_position, assigned_shots in zip(card_positions, partitions):
             exact = "\n\n".join(blocks[shot] for shot in assigned_shots)
             exact_dialogue_units = _beat_quoted_speech_units(exact)
-            exact_dialogue = "\n".join(exact_dialogue_units).strip()
+            dialogue_source = "\n\n".join(
+                blocks[shot] for shot in assigned_shots if shot not in dialogue_emitted
+            )
+            exact_dialogue = "\n".join(_beat_quoted_speech_units(dialogue_source)).strip()
+            dialogue_emitted.update(assigned_shots)
             exact_beat = (
                 _strip_beat_quote_spans(exact, set(exact_dialogue_units))
                 if exact_dialogue_units
@@ -4618,6 +4637,10 @@ def _split_beat_text_near_ratio(beat: str, ratio: float) -> tuple[str, str]:
         if raw[i - 1] in preferred:
             chosen = i
             break
+    while (chosen < len(raw) and raw[chosen - 1].isascii()
+           and raw[chosen - 1].isalnum() and raw[chosen].isascii()
+           and raw[chosen].isalnum()):
+        chosen += 1
     head = raw[:chosen].rstrip()
     tail = raw[chosen:].lstrip()
     if not head:
@@ -4664,6 +4687,29 @@ def _force_split_speech_within_max(text: str, effective_max: float) -> tuple[str
     head = _join_speech_pieces(taken)
     tail = _join_speech_pieces(pieces[len(taken) :])
     return head, tail
+
+
+def _deterministic_repair_parts(
+    beat: str, dialogue: str, handoff: str, split_times: tuple[float, ...],
+) -> list[dict[str, str]]:
+    """Partition source text in order when model repair cannot preserve it."""
+    parts = []
+    remaining_beat, remaining_dialogue = beat, dialogue
+    for index, duration in enumerate(split_times):
+        if index == len(split_times) - 1:
+            beat_head, dialogue_head = remaining_beat, remaining_dialogue
+        else:
+            ratio = duration / sum(split_times[index:])
+            beat_head, remaining_beat = _split_beat_text_near_ratio(remaining_beat, ratio)
+            dialogue_head, remaining_dialogue = _force_split_speech_within_max(
+                remaining_dialogue, duration,
+            )
+        parts.append({
+            "beat": beat_head,
+            "dialogue": dialogue_head,
+            "handoff": handoff if index == len(split_times) - 1 else "Action continues.",
+        })
+    return parts
 
 
 def _ensure_repair_parts_fit_dialogue(
@@ -4824,6 +4870,26 @@ def _dialogue_line_needles(cards: Iterable[dict[str, Any]]) -> tuple[tuple[str, 
     return tuple(needles)
 
 
+def _coverage_plan_for_resolved_schedule(
+    plan: _CoverageKnifePlan | None, schedule: Iterable[float],
+) -> _CoverageKnifePlan | None:
+    """Carry a changed host budget into coverage without reallocating split cards."""
+    if plan is None:
+        return None
+    durations = tuple(schedule)
+    budget = round(sum(durations), 3)
+    if abs(plan.budget_seconds - budget) <= 0.002:
+        return plan
+    allocations = [0.0] * len(plan.beats)
+    for duration, beat_id in zip(durations, plan.segment_to_beat):
+        allocations[beat_id - 1] += duration
+    return replace(
+        plan, budget_seconds=budget,
+        allocations=tuple(round(value, 3) for value in allocations),
+        compressed=budget < plan.estimated_sum,
+    )
+
+
 def _repair_structure_duration_cards(
     cards: list[dict[str, Any]], schedule: tuple[float, ...],
     coverage_plan: _CoverageKnifePlan | None, complete: Callable, max_tokens: int, seed: int,
@@ -4838,8 +4904,8 @@ def _repair_structure_duration_cards(
     schedule. The host reserves that budget and deterministically redistributes
     the remaining time, or refuses if there is no feasible 4s floor.
 
-    When ``allow_duration_overrun`` is on (soft target) and speech overflows alone
-    exceed the schedule total, expand the host target up to
+    When ``allow_duration_overrun`` is on (soft target) and speech overflows or
+    redistributed ordinary speech exceed the schedule total, expand the host target up to
     ``MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS`` so ordinary groups still fit
     ``[MIN, effective_max]`` and overflowing cards can split without truncation.
     """
@@ -4865,6 +4931,7 @@ def _repair_structure_duration_cards(
             if MIN_DIRECTOR_SEGMENT_SECONDS <= each <= effective_max
             else tuple(replacement)
         )
+    coverage_plan = _coverage_plan_for_resolved_schedule(coverage_plan, schedule)
     overflows: dict[int, float] = {}
     for pos, card in enumerate(ordered):
         if not str(card.get("beat") or "").strip():
@@ -4910,14 +4977,21 @@ def _repair_structure_duration_cards(
         ):
             return ordered, tuple(round(value, 3) for value in card_times), coverage_plan
         return ordered, schedule, coverage_plan
-    details = "; ".join(f"segment {p + 1}: {d:.3f}s" for p, d in overflows.items())
     total = float(sum(schedule))
+    soft_overrun = bool(allow_duration_overrun) or total > MAX_DIRECTOR_TOTAL_SECONDS
+    if soft_overrun:
+        # Reserve legal split totals before redistributing the host budget so
+        # packing-gap bumps participate in expansion audits and safety checks.
+        overflows = {
+            pos: _packable_director_duration(seconds, effective_max)
+            for pos, seconds in overflows.items()
+        }
+    details = "; ".join(f"segment {p + 1}: {d:.3f}s" for p, d in overflows.items())
     overflow_sum = float(sum(overflows.values()))
     remaining = round(total - overflow_sum, 3)
     ordinary = [p for p in range(len(ordered)) if p not in overflows]
     ordinary_min = len(ordinary) * MIN_DIRECTOR_SEGMENT_SECONDS
     ordinary_max = len(ordinary) * effective_max
-    soft_overrun = bool(allow_duration_overrun) or total > MAX_DIRECTOR_TOTAL_SECONDS
     if not (ordinary_min <= remaining <= ordinary_max):
         # Soft overrun: widget total is an estimate. Speech overflows may exceed it;
         # expand the host target so overflowing cards keep full speech and ordinary
@@ -4964,11 +5038,37 @@ def _repair_structure_duration_cards(
     ]))
     for pos, duration in ordinary_times.items():
         dialogue = _clean_structure_dialogue(str(ordered[pos].get("dialogue") or ""))
-        if _dialogue_speech_units(dialogue) / _DIALOGUE_WORDS_PER_SECOND > duration + 0.02:
+        speech_seconds = _structure_card_speech_seconds(
+            dialogue, str(ordered[pos].get("beat") or "")
+        )
+        if speech_seconds > duration + 0.02:
+            if soft_overrun:
+                # This card already fits the per-group ceiling; only redistribution
+                # starved it. Keep its action/dialogue together and restore speech
+                # time before sending the overflowing cards through local splitting.
+                ordinary_times[pos] = round(speech_seconds, 3)
+                continue
             raise PromptRefinerError(
                 f"Cannot safely repair {details}: segment {pos + 1} dialogue would not fit "
                 f"its redistributed {duration:.3f}s. Content was not truncated."
             )
+    restored_total = round(overflow_sum + sum(ordinary_times.values()), 3)
+    if restored_total > total + 0.002:
+        if restored_total > MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:
+            raise PromptRefinerError(
+                f"Cannot safely repair {details}: preserving redistributed speech needs "
+                f"{restored_total:.3f}s but exceeds the safety ceiling of "
+                f"{MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS:.0f}s. Content was not truncated."
+            )
+        total = restored_total
+        audit["expanded_total_seconds"] = total
+        audit["overflow_budget_expand"] = True
+        audit["overflow_budget_expand_detail"] = {
+            "reason": "redistributed_dialogue_requires_more_time",
+            "original_total_seconds": round(sum(schedule), 3),
+            "expanded_total_seconds": total,
+            "overflow_segments": [pos + 1 for pos in sorted(overflows)],
+        }
     result: list[dict[str, Any]] = []
     result_times: list[float] = []
     result_beats: list[int] = []
@@ -5034,10 +5134,16 @@ def _repair_structure_duration_cards(
                 "handoff": card.get("handoff", ""),
             }, ensure_ascii=False)},
         ]
-        for attempt in (1, 2):
-            raw = complete(messages, max_tokens, seed)
-            repair["attempts"].append(raw)
+        for attempt in (1, 2, 3):
             try:
+                if attempt == 3:
+                    repair["host_fallback"] = True
+                    raw = json.dumps({"parts": _deterministic_repair_parts(
+                        original_beat, original_dialogue, str(card.get("handoff") or ""), split_times,
+                    )}, ensure_ascii=False)
+                else:
+                    raw = complete(messages, max_tokens, seed)
+                    repair["attempts"].append(raw)
                 clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", _strip_reasoning(raw).strip())
                 parts = json.loads(clean)["parts"]
                 if not isinstance(parts, list) or not parts:
@@ -5129,10 +5235,12 @@ def _repair_structure_duration_cards(
                 break
             except (ValueError, KeyError, TypeError, PromptRefinerError) as error:
                 repair["error"] = str(error)
-                if attempt == 2:
+                if attempt == 3:
                     raise PromptRefinerError(
                         f"Local repair failed for segment {pos + 1}, {seconds:.3f}s: {error}"
                     ) from error
+                if attempt == 2:
+                    continue
                 retry_hint = (
                     " Cut BEAT across parts as contiguous verbatim slices that cover the original "
                     "(no drop, no paraphrase). "
@@ -5174,6 +5282,7 @@ def _repair_structure_duration_cards(
         raise PromptRefinerError(f"Local repair failed total duration conservation: {sum(result_times)} vs {total}.")
     for i, value in enumerate(result_times, 1):
         _parse_duration_token(str(value), i, max_segment_seconds=effective_max)
+    coverage_plan = _coverage_plan_for_resolved_schedule(coverage_plan, result_times)
     return result, tuple(result_times), coverage_plan
 
 
