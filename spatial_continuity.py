@@ -90,9 +90,38 @@ _MAPPING_KEYS = frozenset({
 })
 _ID_KEYS = frozenset({"id", "shot_id", "index", "shot", "分镜"})
 _EMPTY_TOKEN = re.compile(r"(?i)^(none|n/?a|null|nil|无|-|—)$")
-_SPATIAL_BLOCK = re.compile(
-    r"\[\s*SPATIAL_CONTINUITY\s*\](.*?)\[\s*/\s*SPATIAL_CONTINUITY\s*\]",
-    flags=re.IGNORECASE | re.DOTALL,
+_SPATIAL_OPEN = re.compile(r"\[\s*SPATIAL_CONTINUITY\s*\]", flags=re.IGNORECASE)
+_SPATIAL_CLOSE = re.compile(r"\[\s*/\s*SPATIAL_CONTINUITY\s*\]", flags=re.IGNORECASE)
+_NEXT_SHOT_HEADER = re.compile(r"\n\s*分镜\s*\d+\s*使用参考", flags=re.IGNORECASE)
+# Lines that are schema keys, not spoken dialogue. A DIALOGUE field that leads
+# with these (NV's flattened scene_blocking / shot dump) is metadata.
+SPATIAL_METADATA_KEYS = frozenset({
+    "anchors",
+    "axis",
+    "axis_cross_shots",
+    "axis_side",
+    "camera_vs_axis",
+    "characters_relative",
+    "default_screen_left_right",
+    "depth",
+    "enter_side",
+    "exit_side",
+    "eyeline_to",
+    "facing",
+    "handoff_out",
+    "inherits_axis",
+    "motion_vector",
+    "receiver_in",
+    "scene_blocking",
+    "screen_left_right",
+    "spatial_anchor",
+    "spatial_bridge",
+    "working_side",
+})
+_SPATIAL_KEY_LINE = re.compile(
+    r"^(?:(?:scene_blocking|shot|分镜)\b[\w\s.:#-]*?)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:[:=：]\s*\S.*)?$",
+    flags=re.IGNORECASE,
 )
 _SHOT_HEADER = re.compile(
     r"(?im)^\s*分镜\s*(?P<index>\d+)\s*使用参考\s*[=:：]\s*(?P<references>[^\n]*)\s*$"
@@ -616,6 +645,89 @@ def _parse_lines(catalog: SpatialCatalog, text: str, default_shot_id: int | None
         )
 
 
+def _spatial_spans(text: str) -> list[tuple[int, int, str]]:
+    """Closed blocks, or an unclosed marker running until the next shot or EOF.
+
+    NV sometimes appends ``[SPATIAL_CONTINUITY]`` to the last ``分镜`` with no
+    closer. That tail is still spatial metadata, not the shot's spoken lines.
+    """
+
+    spans: list[tuple[int, int, str]] = []
+    source = text or ""
+    cursor = 0
+    while cursor < len(source):
+        match = _SPATIAL_OPEN.search(source, cursor)
+        if not match:
+            break
+        rest_start = match.end()
+        rest = source[rest_start:]
+        close = _SPATIAL_CLOSE.search(rest)
+        nxt = _NEXT_SHOT_HEADER.search(rest)
+        if close and (nxt is None or close.start() <= nxt.start()):
+            body_end = rest_start + close.start()
+            end = rest_start + close.end()
+        elif nxt is not None:
+            body_end = rest_start + nxt.start()
+            end = body_end
+        else:
+            body_end = len(source)
+            end = len(source)
+        spans.append((match.start(), end, source[rest_start:body_end]))
+        cursor = max(end, match.end())
+    return spans
+
+
+def strip_spatial_continuity_text(text: str) -> str:
+    """Drop spatial blocks so shot prose and DIALOGUE cannot absorb the schema."""
+
+    source = text or ""
+    spans = _spatial_spans(source)
+    if not spans:
+        return source
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, _body in spans:
+        pieces.append(source[cursor:start])
+        cursor = end
+    pieces.append(source[cursor:])
+    return "".join(pieces)
+
+
+def _is_spatial_key_line(line: str) -> bool:
+    match = _SPATIAL_KEY_LINE.match((line or "").strip())
+    if not match:
+        return False
+    return match.group(1).lower() in SPATIAL_METADATA_KEYS
+
+
+def dialogue_is_spatial_metadata(text: str) -> bool:
+    """True when a DIALOGUE field is a spatial schema dump, not spoken lines.
+
+    NV's flattened export puts keys such as ``anchors`` / ``axis`` /
+    ``screen_left_right`` / ``spatial_anchor`` on their own lines. That text
+    must not be budgeted or verbatim-partitioned as speech.
+    """
+
+    raw = strip_spatial_continuity_text(text or "").strip()
+    if not raw:
+        return bool(_SPATIAL_OPEN.search(text or ""))
+    if _SPATIAL_OPEN.search(raw):
+        return True
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if _is_spatial_key_line(lines[0]):
+        return True
+    hits = 0
+    for line in lines:
+        if not _is_spatial_key_line(line):
+            continue
+        hits += 1
+        if hits >= 3:
+            return True
+    return False
+
+
 def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
     if not spans:
         return text
@@ -638,9 +750,9 @@ def parse_spatial_continuity(brief: str) -> SpatialCatalog:
     text = brief or ""
     if not text.strip():
         return catalog
-    marker_spans = [(match.start(), match.end()) for match in _SPATIAL_BLOCK.finditer(text)]
-    for match in _SPATIAL_BLOCK.finditer(text):
-        body = match.group(1)
+    spatial_spans = _spatial_spans(text)
+    marker_spans = [(start, end) for start, end, _body in spatial_spans]
+    for _start, _end, body in spatial_spans:
         _ingest_text_json(catalog, body)
         _parse_lines(catalog, body, default_shot_id=None)
     shot_spans: list[tuple[int, int]] = []
@@ -654,7 +766,7 @@ def parse_spatial_continuity(brief: str) -> SpatialCatalog:
     _ingest_text_json(catalog, outside)
     _parse_lines(catalog, outside, default_shot_id=None)
     for shot_id, block in shot_blocks:
-        local = _SPATIAL_BLOCK.sub(" ", block)
+        local = strip_spatial_continuity_text(block)
         _parse_lines(catalog, local, default_shot_id=shot_id)
         _ingest_text_json(catalog, local, forced_shot_id=shot_id)
     return catalog

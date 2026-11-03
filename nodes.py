@@ -29,11 +29,13 @@ import folder_paths
 from spatial_continuity import (
     CONTINUITY_OPENING_RULE,
     HANDOFF_SPATIAL_RULE,
+    dialogue_is_spatial_metadata,
     format_spatial_brief,
     locks_for_text,
     parse_spatial_continuity,
     repair_continuity_opening,
     repair_handoff,
+    strip_spatial_continuity_text,
 )
 
 
@@ -1981,8 +1983,17 @@ def _clip_text(text: str, limit: int) -> str:
 
 
 def _clean_structure_dialogue(value: str) -> str:
-    text = (value or "").strip()
+    """Spoken structure lines only. Spatial schema dumps count as no dialogue.
+
+    An empty result takes the same path as ``NONE``: speech seconds fall
+    through to real BEAT quotes, and local repair does not verbatim-partition
+    the schema text.
+    """
+
+    text = strip_spatial_continuity_text(value or "").strip()
     if not text or _STRUCTURE_EMPTY_TEXT.fullmatch(text):
+        return ""
+    if dialogue_is_spatial_metadata(text):
         return ""
     return text
 
@@ -2066,8 +2077,8 @@ def _parse_director_structure_output(text: str) -> tuple[str, list[dict[str, Any
     cards: list[dict[str, Any]] = []
     for index, block, unfinished in blocks:
         fields = _marked_plan_fields(block)
-        beat = fields.get("BEAT", "").strip()
-        dialogue = fields.get("DIALOGUE", "").strip()
+        beat = strip_spatial_continuity_text(fields.get("BEAT", "")).strip()
+        dialogue = strip_spatial_continuity_text(fields.get("DIALOGUE", "")).strip()
         handoff = fields.get("HANDOFF", "").strip()
         prompt = fields.get("PROMPT", "").strip()
         if not beat and prompt:
@@ -2232,9 +2243,16 @@ def _iter_beat_quote_matches(beat: str) -> list[re.Match[str]]:
 
 
 def _beat_quoted_speech_units(beat: str) -> list[str]:
-    """Ordered spoken inners from BEAT quotes (NV empty-DIALOGUE case)."""
+    """Ordered spoken inners from BEAT quotes (NV empty-DIALOGUE case).
 
-    return [match.group(1).strip() for match in _iter_beat_quote_matches(beat)]
+    ``[SPATIAL_CONTINUITY]`` is removed first so quoted schema keys and values
+    are not lifted into DIALOGUE or counted as speech.
+    """
+
+    return [
+        match.group(1).strip()
+        for match in _iter_beat_quote_matches(strip_spatial_continuity_text(beat or ""))
+    ]
 
 
 def _beat_quoted_speech_text(beat: str) -> str:
@@ -3151,7 +3169,7 @@ def _brief_shot_blocks(brief: str) -> dict[int, str]:
     for position, match in enumerate(matches):
         index = int(match.group("index"))
         end = matches[position + 1].start() if position + 1 < len(matches) else len(brief)
-        block = (brief[match.start():end]).strip()
+        block = strip_spatial_continuity_text(brief[match.start():end]).strip()
         if block:
             blocks[index] = block
     return blocks
@@ -3449,7 +3467,7 @@ def _apply_story_shot_contract(
                 # The assigned shot slice is authoritative. A slice with no
                 # quoted speech is empty dialogue, even when the structure pass
                 # left the previous group's line on this card.
-                "dialogue": exact_dialogue,
+                "dialogue": _clean_structure_dialogue(exact_dialogue),
                 "assets": assets,
             }
     return ordered

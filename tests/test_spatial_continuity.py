@@ -440,5 +440,238 @@ Eyes stay on the window.
         )
 
 
+# Shape of uploads/qwen38-director-structure-o2710nqd.json: the structure card's
+# DIALOGUE was a flattened spatial schema, and BEAT carried a mangled block.
+_SCHEMA_DIALOGUE = """anchors
+房门
+走廊尽头右侧，半开状态，月光从门缝透出
+走廊
+青石板地面，上方瓦檐漏下冷月光
+axis
+小六面向房门，房门为轴心点
+axis_cross_shots
+characters_relative
+小六
+站在房门前，面向门（画面右侧），四分之三侧面朝向镜头
+柳二姐
+门内炕上侧卧，画外，头朝炕里
+default_screen_left_right
+小六
+left
+房门
+right
+working_side
+走廊侧，镜头在小六身后偏左
+screen_left_right
+小六
+left
+房门
+right
+axis_side
+走廊侧
+inherits_axis
+exit_side
+none
+enter_side
+none
+spatial_anchor
+房门
+""".strip()
+
+_REAL_LINE = "(S1) <d>[Chinese] 男人就没一个好玩意</d>"
+
+
+class SpatialDumpIsNotSpeechTests(unittest.TestCase):
+    def test_schema_dump_is_empty_dialogue_and_real_lines_stay(self) -> None:
+        self.assertEqual(nodes._clean_structure_dialogue(_SCHEMA_DIALOGUE), "")
+        self.assertEqual(nodes._clean_structure_dialogue("NONE"), "")
+        self.assertEqual(nodes._clean_structure_dialogue(_REAL_LINE), _REAL_LINE)
+        self.assertGreater(nodes._structure_card_speech_seconds(_REAL_LINE, ""), 0.5)
+
+    def test_marker_in_beat_does_not_count_schema_quotes_as_speech(self) -> None:
+        beat = (
+            "分镜3使用参考:<Picture 1>\n"
+            "分镜3: 小六关门并侧身闪入。「请往前走」\n"
+            "[SPATIAL_CONTINUITY]\n"
+            "For HANDOFF and CONTINUITY_FROM_PREV, first restate screen_left_right, "
+            "axis_side and spatial_anchor.\n"
+            'shot 3: {"receiver_in": "", "facing": "侧面对镜头", "spatial_anchor": "房门"}\n'
+        )
+        schema_only = (
+            "[SPATIAL_CONTINUITY]\n"
+            'shot 3: {"facing": "侧面对镜头", "receiver_in": "从门口"}\n'
+        )
+        self.assertEqual(nodes._beat_quoted_speech_text(schema_only), "")
+        self.assertEqual(nodes._structure_card_speech_seconds("", schema_only), 0.0)
+        spoken = nodes._structure_card_speech_seconds(_SCHEMA_DIALOGUE, beat)
+        quote_only = nodes._structure_card_speech_seconds("", "「请往前走」")
+        self.assertAlmostEqual(spoken, quote_only, places=3)
+        self.assertLess(spoken, 3.0)
+        self.assertNotIn("侧面对镜头", nodes._beat_quoted_speech_text(beat))
+
+    def test_shot_blocks_keep_prose_and_locks_and_drop_the_schema(self) -> None:
+        brief = """[STORY_BEATS]
+1 | 8.5s | 1-2 | corridor | 男人就没一个好玩意
+2 | 8.5s | 3-4 | room | 请往前走
+[/STORY_BEATS]
+分镜1使用参考: @reference_image_1
+分镜1: 走廊听门。「男人就没一个好玩意」
+分镜2使用参考: @reference_image_1
+分镜2: 小六侧耳。
+分镜3使用参考: @reference_image_1
+分镜3: 小六关门并侧身闪入。「请往前走」
+分镜4使用参考: @reference_image_1
+分镜4: 小六进入卧室。
+[SPATIAL_CONTINUITY]
+scene_blocking.anchors: 房门=走廊尽头右侧
+scene_blocking.axis: 小六面向房门
+scene_blocking.working_side: 走廊侧
+scene_blocking.default_screen_left_right: 小六=left; 房门=right
+shot.3.screen_left_right: 小六=left
+shot.3.axis_side: 走廊侧
+shot.3.spatial_anchor: 房门
+[/SPATIAL_CONTINUITY]
+"""
+        blocks = nodes._brief_shot_blocks(brief)
+        self.assertNotIn("[SPATIAL_CONTINUITY]", blocks[4])
+        self.assertNotIn("anchors", blocks[4])
+        self.assertIn("小六进入卧室", blocks[4])
+        self.assertIn("请往前走", blocks[3])
+        locks = spatial.locks_for_text(spatial.parse_spatial_continuity(brief), "分镜3使用参考", end=True)
+        assert locks is not None
+        self.assertIn("房门", locks.opening_sentence())
+        self.assertIn("走廊侧", locks.opening_sentence())
+        self.assertIn("小六 screen-left", locks.opening_sentence())
+
+        plan = nodes._build_coverage_knife_plan(brief, budget_seconds=17.0, group_count=2)
+        assert plan is not None
+        cards = [
+            dict(
+                index=1, duration_raw="10", continuity_raw="false",
+                assets={"pictures": [], "videos": [], "video_audios": [], "audios": []},
+                beat="Wide corridor.", dialogue=_REAL_LINE, handoff="Smirk.",
+            ),
+            dict(
+                index=2, duration_raw="7", continuity_raw="true",
+                assets={"pictures": [1, 2, 3], "videos": [], "video_audios": [], "audios": []},
+                beat="Close-up.", dialogue="NONE", handoff="Inside the room.",
+            ),
+        ]
+        assigned = nodes._apply_story_shot_contract(cards, brief, plan)
+        later = assigned[1]
+        self.assertNotIn("[SPATIAL_CONTINUITY]", later["beat"])
+        self.assertNotIn("screen_left_right", later["dialogue"])
+        self.assertNotIn("anchors", later["dialogue"])
+        self.assertIn("请往前走", later["dialogue"])
+        self.assertLess(nodes._structure_card_speech_seconds(later["dialogue"], later["beat"]), 3.0)
+
+    def test_diagnostic_card_does_not_expand_budget_or_partition_schema(self) -> None:
+        beat = (
+            "分镜3使用参考:<Picture 1>,<Picture 2>,<Picture 3>\n"
+            "分镜3: 中景。小六在画面左侧，右手伸向房门。「请往前走」\n"
+            "分镜4使用参考:<Picture 2>,<Picture 3>\n"
+            "分镜4: 全景。小六进入卧室。\n"
+            "[SPATIAL_CONTINUITY]\n"
+            "scene_blocking 5e52751b-42c2-44fb-b3b5-8238797a31f1: {:}\n"
+            'shot 4: {"receiver_in": "", "facing": "侧面对镜头", "spatial_anchor": "炕"}\n'
+        )
+        cards = [
+            dict(
+                index=1, duration_raw="10", continuity_raw="false",
+                assets={"pictures": [2], "videos": [], "video_audios": [], "audios": [1]},
+                beat="Wide static shot in a moonlit stone corridor.",
+                dialogue=_REAL_LINE,
+                handoff="Smirk fully formed.",
+            ),
+            dict(
+                index=2, duration_raw="7", continuity_raw="true",
+                assets={"pictures": [1, 2, 3], "videos": [], "video_audios": [], "audios": []},
+                beat=beat,
+                dialogue=_SCHEMA_DIALOGUE,
+                handoff="Xiao Cheng has crossed the threshold into the bedroom.",
+            ),
+        ]
+
+        def complete(*_args):
+            raise AssertionError("spatial schema must not enter local dialogue repair")
+
+        audit: dict = {"repairs": []}
+        fixed, durations, _plan = nodes._repair_structure_duration_cards(
+            cards, (8.5, 8.5), None, complete, 4096, 1, audit,
+            max_segment_seconds=15, allow_duration_overrun=True,
+        )
+        self.assertNotIn("overflow_budget_expand", audit)
+        self.assertEqual(audit["repairs"], [])
+        self.assertEqual(durations, (10.0, 7.0))
+        self.assertEqual(fixed[1]["dialogue"], _SCHEMA_DIALOGUE)
+        self.assertEqual(nodes._clean_structure_dialogue(fixed[1]["dialogue"]), "")
+        self.assertLess(
+            nodes._structure_card_speech_seconds(fixed[1]["dialogue"], fixed[1]["beat"]),
+            3.0,
+        )
+
+    def test_real_spoken_dialogue_still_partitions(self) -> None:
+        spoken = " ".join(["word"] * 40)
+        source = dict(
+            index=1, duration_raw="8", continuity_raw="false",
+            assets={"pictures": [], "videos": [], "video_audios": [], "audios": []},
+            beat="Opens the door. Steps through.",
+            dialogue=spoken,
+            handoff="Inside.",
+        )
+
+        def complete(messages, _tokens, _seed):
+            payload = json.loads(messages[1]["content"])
+            self.assertNotIn("anchors", payload["dialogue"])
+            self.assertIn("word", payload["dialogue"])
+            words = payload["dialogue"].split()
+            mid = len(words) // 2
+            return json.dumps({"parts": [
+                {
+                    "beat": "Opens the door.",
+                    "dialogue": " ".join(words[:mid]),
+                    "handoff": "Pause.",
+                },
+                {
+                    "beat": "Steps through.",
+                    "dialogue": " ".join(words[mid:]),
+                    "handoff": payload["handoff"],
+                },
+            ]})
+
+        audit: dict = {"repairs": []}
+        fixed, durations, _plan = nodes._repair_structure_duration_cards(
+            [source], (8.0,), None, complete, 4096, 1, audit,
+            max_segment_seconds=15, allow_duration_overrun=True,
+        )
+        self.assertTrue(audit["repairs"])
+        joined = " ".join(nodes._clean_structure_dialogue(card["dialogue"]) for card in fixed)
+        self.assertEqual(joined.split(), spoken.split())
+        self.assertGreater(sum(durations), 8.0)
+        self.assertIn("word", joined)
+        self.assertNotIn("spatial_anchor", joined)
+
+    def test_unclosed_spatial_block_still_parses_locks(self) -> None:
+        brief = """分镜3使用参考: @reference_image_1
+分镜3: 关门。「请往前走」
+[SPATIAL_CONTINUITY]
+scene_blocking.anchors: 房门=走廊尽头
+scene_blocking.axis: 小六面向房门
+scene_blocking.working_side: 走廊侧
+scene_blocking.default_screen_left_right: 小六=left
+shot.axis_side: 走廊侧
+shot.spatial_anchor: 房门
+shot.screen_left_right: 小六=left
+"""
+        locks = spatial.parse_spatial_continuity(brief).resolve(3)
+        assert locks is not None
+        self.assertIn("房门", locks.opening_sentence())
+        self.assertIn("走廊侧", locks.opening_sentence())
+        block = nodes._brief_shot_blocks(brief)[3]
+        self.assertIn("请往前走", block)
+        self.assertNotIn("[SPATIAL_CONTINUITY]", block)
+        self.assertNotIn("anchors", block)
+
+
 if __name__ == "__main__":
     unittest.main()
