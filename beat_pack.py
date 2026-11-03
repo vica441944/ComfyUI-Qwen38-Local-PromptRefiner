@@ -60,7 +60,71 @@ def parse_beat_pack_manifest(data: dict) -> dict:
         if not isinstance(ref.get("path"), str) or not ref["path"].strip():
             raise ValueError("Reference path must be a nonempty string")
     result["refs"] = [dict(ref) for ref in refs]
+    result["scene_blocking_by_beat"] = _copy_scene_blocking_by_beat(data.get("scene_blocking_by_beat"))
+    result["suggested_shots"] = _copy_suggested_shots(data.get("suggested_shots"))
+    result["continuity_warnings"] = _copy_continuity_warnings(data.get("continuity_warnings"))
     return result
+
+
+def _json_copy(value):
+    return json.loads(json.dumps(value))
+
+
+def _copy_scene_blocking_by_beat(value):
+    """Keep NV's beat-keyed blocking. Missing on v1 packs becomes an empty object."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("scene_blocking_by_beat must be an object keyed by beat id")
+    copied = {}
+    for key, item in value.items():
+        if isinstance(key, bool) or not str(key).strip():
+            raise ValueError("scene_blocking_by_beat keys must be beat ids")
+        if not isinstance(item, dict):
+            raise ValueError(f"scene_blocking_by_beat[{key}] must be an object")
+        copied[str(key)] = _json_copy(item)
+    return copied
+
+
+def _copy_suggested_shots(value):
+    """Keep suggested_shots, including each item's spatial object."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("suggested_shots must be a list")
+    shots = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"suggested_shots[{index}] must be an object")
+        shot = _json_copy(item)
+        spatial = shot.get("spatial", {})
+        if spatial is None:
+            spatial = {}
+        if not isinstance(spatial, dict):
+            raise ValueError(f"suggested_shots[{index}].spatial must be an object")
+        shot["spatial"] = spatial
+        shots.append(shot)
+    return shots
+
+
+def _copy_continuity_warnings(value):
+    """Optional warning list. Strings and objects are preserved."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("continuity_warnings must be a list")
+    warnings = []
+    for index, item in enumerate(value):
+        if isinstance(item, str):
+            warnings.append(item)
+        elif isinstance(item, dict):
+            warnings.append(_json_copy(item))
+        else:
+            raise ValueError(f"continuity_warnings[{index}] must be a string or object")
+    return warnings
 
 
 def _contained_path(root, relative):

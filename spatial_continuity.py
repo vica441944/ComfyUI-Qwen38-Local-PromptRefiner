@@ -17,13 +17,14 @@ from dataclasses import dataclass, field
 
 
 HANDOFF_SPATIAL_RULE = (
-    "When the brief supplies spatial continuity ([SPATIAL_CONTINUITY], scene_blocking, or per-shot "
-    "spatial fields), HANDOFF must also name screen left/right, the axis or working side, and at least "
-    "one spatial anchor, alongside pose, prop state, camera heading, and audio state. Prefer "
-    "shot.screen_left_right, shot.axis_side, and shot.spatial_anchor; otherwise use "
-    "scene_blocking.default_screen_left_right, scene_blocking.axis or working_side, and one "
-    "scene_blocking.anchors entry. Pass through receiver_in, handoff_out, motion_vector, and "
-    "spatial_bridge when the brief includes them. Do not invent absolute XY/Z coordinates."
+    "When spatial continuity is supplied, HANDOFF must also name screen left/right, the axis or working "
+    "side, and at least one spatial anchor, alongside pose, prop state, camera heading, and audio state. "
+    "Prefer suggested_shots[].spatial screen_left_right, axis_side, and spatial_anchor; otherwise use that "
+    "beat's scene_blocking_by_beat default_screen_left_right, axis or working side, and one anchors entry. "
+    "Legacy scene_blocking / shot fields follow the same shot-over-scene rule. Pass through receiver_in, "
+    "handoff_out, motion_vector, and spatial_bridge when supplied. The [SPATIAL_CONTINUITY] marker is "
+    "instructions only: do not treat that block or spatial keys as dialogue. Do not invent absolute XY/Z "
+    "coordinates."
 )
 
 CONTINUITY_OPENING_RULE = (
@@ -384,28 +385,52 @@ class SpatialLocks:
 
 @dataclass
 class SpatialCatalog:
-    """Scene defaults plus per-shot overrides parsed from one brief."""
+    """Scene defaults plus per-shot overrides.
+
+    ``scenes_by_beat`` is NV's ``scene_blocking_by_beat``. ``shots`` holds
+    ``suggested_shots[].spatial`` (and legacy shot objects). Shot fields win.
+    """
 
     scene: dict = field(default_factory=dict)
+    scenes_by_beat: dict[str, dict] = field(default_factory=dict)
     shots: dict[int, dict] = field(default_factory=dict)
+    shot_beats: dict[int, str] = field(default_factory=dict)
     unscoped: dict = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
-        return not self.scene and not self.shots and not self.unscoped
+        return not self.scene and not self.scenes_by_beat and not self.shots and not self.unscoped
+
+    def _scene_for(self, shot_id: int | None, beat_key: str | None) -> dict:
+        scene = dict(self.scene)
+        chosen: dict | None = None
+        if beat_key and beat_key in self.scenes_by_beat:
+            chosen = self.scenes_by_beat[beat_key]
+        elif beat_key is None and len(self.scenes_by_beat) == 1:
+            chosen = next(iter(self.scenes_by_beat.values()))
+        elif shot_id is not None and beat_key is None and str(shot_id) in self.scenes_by_beat:
+            chosen = self.scenes_by_beat[str(shot_id)]
+        if chosen:
+            scene.update(chosen)
+        return scene
 
     def resolve(self, shot_id: int | None) -> SpatialLocks | None:
         shot: dict = {}
+        beat_key: str | None = None
         if shot_id is not None and shot_id in self.shots:
             shot = dict(self.unscoped)
             shot.update(self.shots[shot_id])
+            beat_key = self.shot_beats.get(shot_id)
         elif shot_id is not None:
             shot = dict(self.unscoped)
+            beat_key = self.shot_beats.get(shot_id)
         elif self.unscoped:
             shot = dict(self.unscoped)
         elif len(self.shots) == 1:
-            shot = dict(next(iter(self.shots.values())))
-        return _locks_from_fields(shot, self.scene)
+            only_id, only_fields = next(iter(self.shots.items()))
+            shot = dict(only_fields)
+            beat_key = self.shot_beats.get(only_id)
+        return _locks_from_fields(shot, self._scene_for(shot_id, beat_key))
 
 
 def _inherits_scene_axis(shot: dict) -> bool:
@@ -527,6 +552,64 @@ def _looks_like_shot(payload: dict) -> bool:
     return any(key in payload and not _is_empty(payload.get(key)) for key in _SHOT_ONLY_KEYS)
 
 
+def _beat_key(value: object) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    text = str(value).strip()
+    return text or None
+
+
+def _ingest_scene_blocking_by_beat(catalog: SpatialCatalog, raw: object) -> None:
+    """Store NV's beat-keyed blocking. A lone scene object is the global default."""
+
+    if not isinstance(raw, dict):
+        return
+    # A scene object uses field names. A beat map uses beat ids and nests those fields.
+    if set(raw) & set(_SCENE_KEYS) and not any(str(key).isdigit() for key in raw):
+        _merge_scene(catalog, raw)
+        return
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        beat_key = _beat_key(key)
+        if not beat_key:
+            continue
+        current = dict(catalog.scenes_by_beat.get(beat_key) or {})
+        scratch = SpatialCatalog()
+        scratch.scene = current
+        _merge_scene(scratch, value)
+        if scratch.scene:
+            catalog.scenes_by_beat[beat_key] = scratch.scene
+
+
+def _ingest_suggested_shots(catalog: SpatialCatalog, raw: object) -> None:
+    """Read ``suggested_shots[].spatial`` over any same-named fields on the shot."""
+
+    if not isinstance(raw, list):
+        return
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        fields = {key: item[key] for key in _SHOT_KEYS if key in item}
+        spatial = item.get("spatial")
+        if isinstance(spatial, dict):
+            fields.update(spatial)
+        shot_id = _shot_id_from(item)
+        if shot_id is None and isinstance(spatial, dict):
+            shot_id = _shot_id_from(spatial)
+        _merge_shot(catalog, shot_id, fields)
+        beat_key = None
+        for key in ("beat_id", "beat", "story_beat", "beat_index"):
+            if key in item:
+                beat_key = _beat_key(item.get(key))
+                if beat_key:
+                    break
+        if shot_id is not None and beat_key:
+            catalog.shot_beats[shot_id] = beat_key
+
+
 def _ingest_object(catalog: SpatialCatalog, payload: dict, forced_shot_id: int | None = None) -> None:
     if not isinstance(payload, dict):
         return
@@ -547,7 +630,14 @@ def _ingest_object(catalog: SpatialCatalog, payload: dict, forced_shot_id: int |
         for value in shots:
             if isinstance(value, dict):
                 _merge_shot(catalog, _shot_id_from(value), value)
-    wrapped = any(key in payload for key in ("scene_blocking", "shot", "shots"))
+    if isinstance(payload.get("scene_blocking_by_beat"), dict):
+        _ingest_scene_blocking_by_beat(catalog, payload.get("scene_blocking_by_beat"))
+    if isinstance(payload.get("suggested_shots"), list):
+        _ingest_suggested_shots(catalog, payload.get("suggested_shots"))
+    wrapped = any(
+        key in payload
+        for key in ("scene_blocking", "shot", "shots", "scene_blocking_by_beat", "suggested_shots")
+    )
     if wrapped:
         return
     if forced_shot_id is not None and (_looks_like_shot(payload) or _looks_like_scene(payload)):
@@ -738,18 +828,54 @@ def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return "".join(chars)
 
 
-def parse_spatial_continuity(brief: str) -> SpatialCatalog:
-    """Read ``[SPATIAL_CONTINUITY]``, embedded shot JSON, and per-shot lines.
+def _coerce_spatial_payload(raw: object, field_name: str) -> object:
+    """Accept a parsed object/list or a JSON string from a Planner socket."""
 
-    Shot-level keys stay separate from ``scene_blocking`` so resolve can prefer
-    the shot and fall back per field. JSON inside a ``分镜`` block stays on that
-    shot instead of becoming the scene-wide default.
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{field_name} must be JSON") from error
+
+
+def parse_spatial_continuity(
+    brief: str,
+    *,
+    scene_blocking_by_beat: object = None,
+    suggested_shots: object = None,
+) -> SpatialCatalog:
+    """Read structured spatial JSON, then legacy scene_blocking / shot fields.
+
+    The ``[SPATIAL_CONTINUITY]`` marker is instructions only. Concrete locks come
+    from ``scene_blocking_by_beat`` and ``suggested_shots[].spatial`` (manifest
+    fields, embedded JSON, or the Planner sockets). Shot spatial wins over the
+    beat's scene defaults. The marker text is not parsed as dialogue.
     """
 
     catalog = SpatialCatalog()
     text = brief or ""
-    if not text.strip():
-        return catalog
+    if text.strip():
+        _parse_spatial_brief_text(catalog, text)
+    blocking = _coerce_spatial_payload(scene_blocking_by_beat, "external_scene_blocking_by_beat")
+    shots = _coerce_spatial_payload(suggested_shots, "external_suggested_shots")
+    if isinstance(blocking, dict):
+        _ingest_scene_blocking_by_beat(catalog, blocking)
+    elif blocking is not None:
+        raise ValueError("external_scene_blocking_by_beat must be a JSON object")
+    if isinstance(shots, list):
+        _ingest_suggested_shots(catalog, shots)
+    elif shots is not None:
+        raise ValueError("external_suggested_shots must be a JSON array")
+    return catalog
+
+
+def _parse_spatial_brief_text(catalog: SpatialCatalog, text: str) -> None:
     spatial_spans = _spatial_spans(text)
     marker_spans = [(start, end) for start, end, _body in spatial_spans]
     for _start, _end, body in spatial_spans:
@@ -769,7 +895,6 @@ def parse_spatial_continuity(brief: str) -> SpatialCatalog:
         local = strip_spatial_continuity_text(block)
         _parse_lines(catalog, local, default_shot_id=shot_id)
         _ingest_text_json(catalog, local, forced_shot_id=shot_id)
-    return catalog
 
 
 def shot_ids_in_text(text: str) -> tuple[int, ...]:
@@ -801,8 +926,13 @@ def format_spatial_brief(catalog: SpatialCatalog) -> str:
     if catalog.is_empty:
         return ""
     lines = [
-        "SPATIAL CONTINUITY (parsed from the brief; shot fields override scene_blocking defaults):",
+        "SPATIAL CONTINUITY (suggested_shots[].spatial overrides scene_blocking_by_beat defaults):",
     ]
+    if catalog.scenes_by_beat:
+        lines.append(
+            "- scene_blocking_by_beat: "
+            + json.dumps(catalog.scenes_by_beat, ensure_ascii=False, sort_keys=True)
+        )
     if catalog.scene:
         lines.append(
             "- scene_blocking: " + json.dumps(catalog.scene, ensure_ascii=False, sort_keys=True)

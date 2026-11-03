@@ -673,5 +673,139 @@ shot.screen_left_right: 小六=left
         self.assertNotIn("anchors", block)
 
 
+_MARKER_ONLY = """[SPATIAL_CONTINUITY]
+Use structured fields scene_blocking_by_beat and suggested_shots[].spatial for HANDOFF/CONTINUITY_FROM_PREV (restate screen_left_right, axis_side, spatial_anchor). Do not treat this block or spatial keys as DIALOGUE.
+[/SPATIAL_CONTINUITY]
+"""
+
+_BEAT_BLOCKING = {
+    "1": {
+        "anchors": {"desk": "center", "door": "north wall"},
+        "axis": "Ivo to Neri",
+        "working_side": "south",
+        "default_screen_left_right": {"Ivo": "left", "Neri": "right"},
+    }
+}
+
+_SHOT_SPATIAL = [{
+    "id": 3,
+    "beat": 1,
+    "spatial": {
+        "screen_left_right": {"Ivo": "left"},
+        "axis_side": "south",
+        "inherits_axis": True,
+        "exit_side": "none",
+        "enter_side": "none",
+        "spatial_anchor": "desk",
+        "receiver_in": "Neri from the door",
+    },
+}]
+
+
+class StructuredSpatialExportTests(unittest.TestCase):
+    def test_marker_only_does_not_invent_locks(self) -> None:
+        catalog = spatial.parse_spatial_continuity(_MARKER_ONLY)
+        self.assertTrue(catalog.is_empty)
+        self.assertIsNone(catalog.resolve(3))
+        system = nodes._long_director_structure_system(R2V, (10.0, 10.0))
+        self.assertIn("screen left/right", system)
+        self.assertIn("spatial anchor", system)
+        self.assertIn("working side", system)
+        self.assertIn("Do not invent absolute XY/Z coordinates.", system)
+        self.assertNotIn("Seedance", system)
+
+    def test_shot_spatial_overrides_beat_blocking_for_handoff_and_opening(self) -> None:
+        catalog = spatial.parse_spatial_continuity(
+            _MARKER_ONLY,
+            scene_blocking_by_beat=json.dumps(_BEAT_BLOCKING),
+            suggested_shots=json.dumps(_SHOT_SPATIAL),
+        )
+        locks = catalog.resolve(3)
+        assert locks is not None
+        sentence = locks.opening_sentence()
+        self.assertIn("Ivo screen-left", sentence)
+        self.assertNotIn("Neri screen-right", sentence)
+        self.assertIn("working side south", sentence)
+        self.assertIn("axis Ivo to Neri", sentence)
+        self.assertIn("spatial anchor: desk", sentence)
+        self.assertIn("receiver_in Neri from the door", spatial.repair_handoff("Cup down.", locks))
+        prompt = (
+            "subject_definitions:\n"
+            "<Subject 1> Ivo, fully_preserved wardrobe.\n\n"
+            "summary:\n"
+            "Continues.\n\n"
+            "retention_analysis:\n"
+            "Keep the look.\n\n"
+            "detailed_description:\n"
+            "[Shot 1] Ivo stays seated.\n\n"
+            "overall_soundscape:\n"
+            "Room tone.\n\n"
+            "non_diegetic_music:\n"
+            "N/A\n"
+        )
+        repaired = spatial.repair_continuity_opening(prompt, locks, continuity=True)
+        self.assertEqual(prompt.split("summary:", 1)[0], repaired.split("summary:", 1)[0])
+        self.assertIn("Ivo screen-left", repaired.split("detailed_description:", 1)[1].split(".", 1)[0])
+        self.assertIn("desk", repaired)
+        self.assertNotRegex(repaired, r"(?i)seedance|\bxyz\b")
+
+        overridden = [{
+            "id": 4,
+            "beat": 1,
+            "spatial": {"axis_side": "north", "spatial_anchor": "door"},
+        }]
+        other = spatial.parse_spatial_continuity(
+            _MARKER_ONLY,
+            scene_blocking_by_beat=_BEAT_BLOCKING,
+            suggested_shots=overridden,
+        ).resolve(4)
+        assert other is not None
+        text = other.opening_sentence()
+        self.assertIn("Ivo screen-left", text)
+        self.assertIn("Neri screen-right", text)
+        self.assertIn("working side north", text)
+        self.assertNotIn("working side south", text)
+        self.assertIn("spatial anchor: door", text)
+
+    def test_planner_request_uses_socket_json_not_the_marker(self) -> None:
+        catalog = spatial.parse_spatial_continuity(
+            _MARKER_ONLY + "\n分镜3使用参考: @reference_image_1\nIvo closes the door.",
+            scene_blocking_by_beat=_BEAT_BLOCKING,
+            suggested_shots=_SHOT_SPATIAL,
+        )
+        opening = nodes._DirectorLongSegment(
+            index=1, duration_seconds=8.0, prompt="", picture_slots=(), video_slots=(),
+            video_audio_slots=(), audio_slots=(), continuity_from_prev=False,
+            beat="分镜1使用参考: open.", dialogue="", handoff="Hold.",
+        )
+        continued = nodes._DirectorLongSegment(
+            index=2, duration_seconds=8.0, prompt="", picture_slots=(), video_slots=(),
+            video_audio_slots=(), audio_slots=(), continuity_from_prev=True,
+            beat="分镜3使用参考: close the door.", dialogue="", handoff="Inside.",
+        )
+        request = nodes._build_long_director_segment_request(
+            R2V, _MARKER_ONLY, "", (opening, continued), continued, (), (), (), None, BALANCED,
+            spatial_catalog=catalog,
+        )
+        user = request[1]["content"][0]["text"]
+        self.assertIn("must restate these spatial locks", user)
+        self.assertIn("Ivo screen-left", user)
+        self.assertIn("spatial anchor: desk", user)
+        self.assertIn("working side south", user)
+        optional = nodes.Qwen38LongVideoDirectorPlanner.INPUT_TYPES()["optional"]
+        for name in ("external_scene_blocking_by_beat", "external_suggested_shots"):
+            self.assertEqual(optional[name][0], "STRING")
+            self.assertTrue(optional[name][1]["forceInput"])
+
+    def test_closed_marker_still_strips_and_dump_does_not_expand(self) -> None:
+        brief = _MARKER_ONLY + "分镜3使用参考: @reference_image_1\n关门。「请往前走」\n"
+        block = nodes._brief_shot_blocks(brief)[3]
+        self.assertNotIn("[SPATIAL_CONTINUITY]", block)
+        self.assertNotIn("suggested_shots", block)
+        self.assertIn("请往前走", block)
+        self.assertEqual(nodes._clean_structure_dialogue(_SCHEMA_DIALOGUE), "")
+        self.assertLess(nodes._structure_card_speech_seconds(_SCHEMA_DIALOGUE, brief), 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()

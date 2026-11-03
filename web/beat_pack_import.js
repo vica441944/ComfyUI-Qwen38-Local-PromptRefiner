@@ -220,6 +220,66 @@ function writeBrief(graph, planner, brief) {
   return "brief";
 }
 
+function spatialJsonText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return "";
+  }
+}
+
+function writeLinkedJson(node, text) {
+  return (
+    setNamedWidget(node, "value", text)
+    || setNamedWidget(node, "text", text)
+    || setNamedWidget(node, "string", text)
+  );
+}
+
+function ensureSpatialPrimitive(graph, planner, inputName, text) {
+  // NV comfy-inject should connect these sockets. The local import button fills
+  // a linked string node, or creates a PrimitiveNode when the socket is open.
+  const inputIdx = inputIndex(planner, inputName);
+  if (inputIdx < 0 || !globalThis.LiteGraph?.createNode) return false;
+  let node;
+  try {
+    node = globalThis.LiteGraph.createNode("PrimitiveNode");
+  } catch (_) {
+    return false;
+  }
+  if (!node || !graph?.add) return false;
+  graph.add(node);
+  const origin = Array.isArray(planner.pos) ? planner.pos : [80, 80];
+  const stack = inputName.endsWith("suggested_shots") ? 140 : 0;
+  node.pos = [origin[0] - 340, origin[1] + stack];
+  node.title = inputName;
+  node.properties ??= {};
+  node.properties.qwen38BeatPackSpatial = inputName;
+  try {
+    node.connect?.(0, planner, inputIdx);
+  } catch (_) {
+    graph.remove?.(node);
+    return false;
+  }
+  if (!writeLinkedJson(node, text)) {
+    // Connection can rebuild the primitive widget. Try once more after connect.
+    writeLinkedJson(node, text);
+  }
+  return Boolean(inputSource(graph, planner, inputName));
+}
+
+function writeSpatialSocket(graph, planner, inputName, value) {
+  const text = spatialJsonText(value);
+  if (!text || text === "{}" || text === "[]") return "empty";
+  const linked = inputSource(graph, planner, inputName);
+  if (linked) {
+    return writeLinkedJson(linked, text) ? "linked" : "linked-unwritable";
+  }
+  return ensureSpatialPrimitive(graph, planner, inputName, text) ? "primitive" : "unconnected";
+}
+
 function writeDuration(graph, planner, seconds) {
   const linked = inputSource(graph, planner, "external_total_duration_seconds");
   if (linked) {
@@ -393,6 +453,18 @@ function applyBeatPack(planner, pack, { clearGroups }) {
   if (clearGroups) removed = clearDirectorGroups(graph, planner);
 
   const briefTarget = writeBrief(graph, planner, pack.manifest.brief);
+  const blockingTarget = writeSpatialSocket(
+    graph,
+    planner,
+    "external_scene_blocking_by_beat",
+    pack.manifest.scene_blocking_by_beat,
+  );
+  const shotsTarget = writeSpatialSocket(
+    graph,
+    planner,
+    "external_suggested_shots",
+    pack.manifest.suggested_shots,
+  );
   const durationTarget = writeDuration(
     graph,
     planner,
@@ -413,7 +485,7 @@ function applyBeatPack(planner, pack, { clearGroups }) {
   armPlannerAndRefinersForNewBeat(graph, planner, { clearGroups });
   graph.setDirtyCanvas?.(true, true);
   planner.setDirtyCanvas?.(true, true);
-  return { removed, briefTarget, durationTarget, loaderReport };
+  return { removed, briefTarget, durationTarget, blockingTarget, shotsTarget, loaderReport };
 }
 
 async function importBeatPackForPlanner(planner) {
@@ -432,6 +504,8 @@ async function importBeatPackForPlanner(planner) {
       + `clear_director_groups: ${clearGroups ? "是" : "否"}`
       + (clearGroups ? `（删除 Group/Combine ${result.removed} 个）` : "")
       + `\nbrief → ${result.briefTarget}\n`
+      + `external_scene_blocking_by_beat → ${result.blockingTarget}\n`
+      + `external_suggested_shots → ${result.shotsTarget}\n`
       + `时长 → ${result.durationTarget}\n`
       + `Load* 已填 ${okLoads}/${result.loaderReport.length}`
       + `\nPlanner 已切回 Always（可 Queue 重跑新节拍）`

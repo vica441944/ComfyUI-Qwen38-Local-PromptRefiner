@@ -50,6 +50,51 @@ class BeatPackParseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             beat_pack.parse_beat_pack_manifest(_valid_manifest(segment_duration_seconds=20))
 
+    def test_spatial_fields_default_empty_and_round_trip(self):
+        parsed = beat_pack.parse_beat_pack_manifest(_valid_manifest())
+        self.assertEqual(parsed["scene_blocking_by_beat"], {})
+        self.assertEqual(parsed["suggested_shots"], [])
+        self.assertEqual(parsed["continuity_warnings"], [])
+        blocking = {
+            "1": {
+                "anchors": {"房门": "走廊尽头"},
+                "axis": "小六面向房门",
+                "working_side": "走廊侧",
+                "default_screen_left_right": {"小六": "left", "房门": "right"},
+            }
+        }
+        shots = [{
+            "id": 3,
+            "beat": 1,
+            "spatial": {
+                "screen_left_right": {"小六": "left"},
+                "axis_side": "走廊侧",
+                "spatial_anchor": "房门",
+                "inherits_axis": True,
+            },
+        }]
+        parsed = beat_pack.parse_beat_pack_manifest(_valid_manifest(
+            scene_blocking_by_beat=blocking,
+            suggested_shots=shots,
+            continuity_warnings=["screen side flips on beat 2"],
+        ))
+        self.assertEqual(parsed["scene_blocking_by_beat"], blocking)
+        self.assertEqual(parsed["suggested_shots"], shots)
+        self.assertEqual(parsed["continuity_warnings"], ["screen side flips on beat 2"])
+        self.assertEqual(parsed["brief"], "Hero walks. @reference_image_1")
+
+    def test_spatial_fields_reject_bad_types(self):
+        with self.assertRaises(ValueError):
+            beat_pack.parse_beat_pack_manifest(_valid_manifest(scene_blocking_by_beat=[]))
+        with self.assertRaises(ValueError):
+            beat_pack.parse_beat_pack_manifest(_valid_manifest(suggested_shots={"id": 1}))
+        with self.assertRaises(ValueError):
+            beat_pack.parse_beat_pack_manifest(_valid_manifest(
+                suggested_shots=[{"id": 1, "spatial": "south"}],
+            ))
+        with self.assertRaises(ValueError):
+            beat_pack.parse_beat_pack_manifest(_valid_manifest(continuity_warnings="warn"))
+
     def test_clear_allowlist_exact(self):
         self.assertEqual(
             beat_pack.CLEAR_DIRECTOR_GROUP_CLASS_TYPES,
