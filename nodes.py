@@ -26,6 +26,16 @@ from PIL import Image
 
 import folder_paths
 
+from spatial_continuity import (
+    CONTINUITY_OPENING_RULE,
+    HANDOFF_SPATIAL_RULE,
+    format_spatial_brief,
+    locks_for_text,
+    parse_spatial_continuity,
+    repair_continuity_opening,
+    repair_handoff,
+)
+
 
 NODE_CATEGORY = "LLM/Prompt Refiner"
 LLM_FOLDER_NAME = "LLM"
@@ -1265,6 +1275,8 @@ H3 production contract for every R2V prompt:
    body position, eye line, hand/prop contact, movement path, spatial relationship, lighting source, and visible result.
    For CONTINUITY_FROM_PREV true, the first sentence must start in the prior group’s ending action/camera state rather
    than reintroducing the scene. End with a clear physical pose, prop state, or camera direction for the next group.
+   {HANDOFF_SPATIAL_RULE}
+   {CONTINUITY_OPENING_RULE}
    Give speakers stable (S1), (S2), etc. IDs across the full project. Put every spoken word only in
    <d>[Language] exact dialogue</d>; preserve user wording and language, use one speaker per shot when possible, and
    keep speech below about 2–2.5 words per available second after visible action.
@@ -1329,6 +1341,9 @@ def _build_long_director_request(
             "listed in that segment's assets and named in the segment prompt."
         )
     prompt += _prompt_example_instruction(prompt_example) + _lora_instruction(lora_triggers)
+    spatial_note = format_spatial_brief(parse_spatial_continuity(brief))
+    if spatial_note:
+        prompt += "\n\n" + spatial_note
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     _append_director_visual_content(content, images, videos)
     return [
@@ -3905,6 +3920,7 @@ def _segments_from_structure_cards(
     coverage_plan: _CoverageKnifePlan | None = None,
     locked_durations: bool = False,
     max_segment_seconds: float | None = None,
+    brief: str = "",
 ) -> tuple[list[_DirectorLongSegment], bool, list[str]]:
     """Turn beat cards into duration-safe groups that still need H3 prompts."""
 
@@ -3919,6 +3935,7 @@ def _segments_from_structure_cards(
     landmark_misses: list[str] = []
     if coverage_plan is not None:
         landmark_misses = _validate_structure_coverage(cards, coverage_plan)
+    spatial_catalog = parse_spatial_continuity(brief)
     ordered = sorted(cards, key=lambda card: int(card["index"]))
     segments: list[_DirectorLongSegment] = []
     for card in ordered:
@@ -3960,7 +3977,10 @@ def _segments_from_structure_cards(
                 continuity_from_prev=_parse_structure_continuity(card.get("continuity_raw"), index),
                 beat=beat,
                 dialogue=_clean_structure_dialogue(str(card.get("dialogue") or "")),
-                handoff=_structure_handoff(str(card.get("handoff") or ""), beat),
+                handoff=repair_handoff(
+                    _structure_handoff(str(card.get("handoff") or ""), beat),
+                    locks_for_text(spatial_catalog, beat, end=True) if not spatial_catalog.is_empty else None,
+                ),
             )
         )
     total_seconds = sum(target_schedule)
@@ -4070,7 +4090,7 @@ focused story slice for this group only
 DIALOGUE:
 exact spoken lines assigned to this group, or NONE
 HANDOFF:
-one sentence describing the physical ending state the next group inherits
+one sentence with the physical ending state the next group inherits: pose, prop state, camera heading, audio state, and, when the brief supplies them, screen left/right, axis or working side, and one spatial anchor
 === END SEGMENT ===
 
 {asset_rules}
@@ -4081,6 +4101,7 @@ completed line. Use NONE when the group has no speech. Pace speech at about 2–
 DIALOGUE must be split across adjacent cards if it exceeds their chosen DURATION_SECONDS. Keep the brief's
 original language and wording.
 HANDOFF is the concrete pose, prop state, camera heading, and audio state at the cut. Write it in English.
+{HANDOFF_SPATIAL_RULE}
 Set CONTINUITY_FROM_PREV false for segment 1 and true for later segments unless a deliberate hard scene break is
 explicitly requested. Use true only when the new group continues the same action, shot, place, time, and audio state.
 Use false for a hard cut, new camera setup, time jump, location/subject change, independent insert, or any brief
@@ -4145,7 +4166,7 @@ H3 production contract for this prompt:
    unless the brief explicitly requests a hard cut. Put camera type, direction, speed, and target naturally inside
    the action sentence. Describe only details a viewer can see or hear. When continuity from the previous group is
    true, the first sentence must start in the supplied previous handoff rather than reintroducing the scene. End at
-   the supplied handoff. Give speakers stable (S1), (S2), etc. IDs. Put every spoken word only in
+   the supplied handoff. {CONTINUITY_OPENING_RULE} Give speakers stable (S1), (S2), etc. IDs. Put every spoken word only in
    <d>[Language] exact dialogue</d>; preserve user wording and language, use one speaker per shot when possible, and
    keep speech below about 2–2.5 words per available second after visible action.
 5. overall_soundscape: one to four English sentences describing continuous ambient sound, physical foley, and
@@ -4227,6 +4248,9 @@ def _build_long_director_structure_request(
             "\nThe attached sampled video frames are authoritative. Assign a video or audio reference "
             "only to segments that actually use it."
         )
+    spatial_note = format_spatial_brief(parse_spatial_continuity(brief))
+    if spatial_note:
+        prompt += "\n\n" + spatial_note
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     # Stills are text-only here.  Video-frame samples are not picture refs.
     _append_director_visual_content(content, (), videos)
@@ -4296,6 +4320,12 @@ def _build_long_director_segment_request(
         )
         if segment.continuity_from_prev:
             previous_block += " Start the first sentence in that handoff state."
+            opening_locks = locks_for_text(parse_spatial_continuity(brief), segment.beat, end=False)
+            if opening_locks is not None and opening_locks.opening_sentence():
+                previous_block += (
+                    " That first sentence of the continued shot description must restate these spatial locks: "
+                    + opening_locks.opening_sentence()
+                )
         else:
             previous_block += " This seam is a hard cut. Do not continue the previous action, camera, or audio."
     if following is None:
@@ -4414,7 +4444,10 @@ def _single_group_structure_segment(
         continuity_from_prev=False,
         beat=beat + "\n\n" + brief.strip(),
         dialogue="",
-        handoff="End on a concrete pose, prop state, camera direction, and audio state.",
+        handoff=repair_handoff(
+            "End on a concrete pose, prop state, camera direction, and audio state.",
+            locks_for_text(parse_spatial_continuity(brief), brief, end=True),
+        ),
     )
 
 
@@ -4450,7 +4483,8 @@ def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
         (
             f"- structure {structure_state} | attempts={structure_attempts} | groups={total} | "
             f"durations_rebalanced={str(bool(record.get('durations_rebalanced'))).lower()} | "
-            f"{record.get('coverage_knife') or 'coverage_knife=off'}"
+            f"{record.get('coverage_knife') or 'coverage_knife=off'} | "
+            f"spatial_continuity={record.get('spatial_continuity') or 'off'}"
         ),
     ]
     for step in steps:
@@ -5403,7 +5437,9 @@ def _plan_director_with_independent_segment_refine(
                     coverage_plan=coverage_plan,
                     # Allow dialogue retargeting while coverage allocations remain enforced.
                     locked_durations=False,
-                 max_segment_seconds=max_segment_seconds)
+                    max_segment_seconds=max_segment_seconds,
+                    brief=brief,
+                )
                 durations_rebalanced = durations_rebalanced or (resolved_schedule != target_schedule)
                 if structure_audit["repairs"]:
                     diagnostic_path = _save_structure_diagnostic(structure_audit)
@@ -5437,6 +5473,7 @@ def _plan_director_with_independent_segment_refine(
             ) from last_error
 
     engine = _director_mode_engine(mode)
+    spatial_catalog = parse_spatial_continuity(brief)
     refined: list[_DirectorLongSegment] = []
     passes: list[dict[str, Any]] = []
     for segment in segments:
@@ -5486,6 +5523,11 @@ def _plan_director_with_independent_segment_refine(
                     segment.audio_slots,
                     audio_labels,
                     context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
+                )
+                prompt = repair_continuity_opening(
+                    prompt,
+                    locks_for_text(spatial_catalog, segment.beat or brief, end=False),
+                    continuity=segment.continuity_from_prev,
                 )
                 last_error = None
                 break
@@ -5551,6 +5593,7 @@ def _plan_director_with_independent_segment_refine(
         "coverage_knife": _coverage_knife_debug_summary(
             coverage_plan, landmark_misses=coverage_landmark_misses
         ),
+        "spatial_continuity": "off" if spatial_catalog.is_empty else "on",
         "passes": passes,
     }
     return title, refined, durations_rebalanced, _format_per_segment_refine_debug(record), record
@@ -5953,6 +5996,7 @@ def _validate_long_director_plan(
     lora_triggers: Iterable[str],
     *,
     anchor_all_pictures: bool = False,
+    brief: str = "",
 ) -> tuple[str, list[_DirectorLongSegment], bool]:
     """Turn Qwen's marked plan into safe, beat-paced Director group data."""
 
@@ -5967,6 +6011,7 @@ def _validate_long_director_plan(
     raw_segments = _order_director_plan_segments(raw_segments)
     use_dynamic_durations = bool(payload.get("_marked_dynamic_durations"))
     engine = _director_mode_engine(mode)
+    spatial_catalog = parse_spatial_continuity(brief)
     segments: list[_DirectorLongSegment] = []
     for index, raw in enumerate(raw_segments, start=1):
         if not isinstance(raw, dict):
@@ -6019,10 +6064,16 @@ def _validate_long_director_plan(
         )
         prompt = _decorate_full_reference_prompt(prompt, engine, pictures, lora_triggers)
         prompt = _ensure_full_reference_audio_voice_labels(prompt, audios)
-        if mode == DIRECTOR_LONG_R2V_MODE:
-            pictures = _picture_slots_for_materialize(pictures, prompt, image_slots)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
         continuity = _plan_continuity_flag(raw_continuity, index > 1) if index > 1 else False
+        if continuity:
+            prompt = repair_continuity_opening(
+                prompt,
+                locks_for_text(spatial_catalog, prompt, end=False),
+                continuity=True,
+            )
+        if mode == DIRECTOR_LONG_R2V_MODE:
+            pictures = _picture_slots_for_materialize(pictures, prompt, image_slots)
         segments.append(
             _DirectorLongSegment(
                 index=index,
@@ -7621,6 +7672,7 @@ class Qwen38LongVideoDirectorPlanner:
                     audio_assets,
                     lora_triggers,
                     anchor_all_pictures=bool(anchor_all_pictures),
+                    brief=normalized_brief,
                 )
                 refine_trace = (
                     f"prompt_refinement={DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT} | refine_passes=1"
