@@ -2022,6 +2022,94 @@ def _force_assigned_dialogue_in_prompt(prompt: str, dialogue: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out)
 
 
+_BRIEF_CAMERA_CUE = re.compile(
+    r"特写|中近景|近景|全景|远景|正对镜头|侧面镜头|俯拍|仰拍|推镜头|拉镜头|使用参考"
+)
+_PICTURE_NAME_TAG = re.compile(
+    r"<(?:Picture|Video)\s+\d+>\s*[\u4e00-\u9fffA-Za-z0-9·・]{1,8}",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_shot_compare(text: str) -> str:
+    """Drop reference labels so a pasted brief can be compared with its shot body."""
+
+    cleaned = _SHOT_REFERENCE_LINE.sub("", text or "")
+    cleaned = re.sub(r"(?im)分镜\s*\d+\s*[=:：]\s*", "", cleaned)
+    cleaned = re.sub(r"(?i)</?(?:Picture|Video|Audio|Subject|d|Environment)\b[^>]*>", "", cleaned)
+    return re.sub(r"\s+", "", cleaned)
+
+
+def _shot_body_is_raw_brief_dump(body: str, source_block: str = "") -> bool:
+    """True when a Brief Shot body is the unrefined brief instead of H3 prose.
+
+    A one-line action recovered from the source (``final action``) is not a
+    dump. A picture-name list, a ``分镜…使用参考`` line, or a long paste of the
+    source shot is.
+    """
+
+    text = body or ""
+    if re.search(r"分镜\s*\d+\s*使用参考", text):
+        return True
+    english_words = re.findall(r"[A-Za-z]{3,}", text)
+    name_tags = _PICTURE_NAME_TAG.findall(text)
+    if len(name_tags) >= 3 and len(english_words) < 12:
+        return True
+    pictures = re.findall(r"<(?:Picture|Video)\s+\d+>", text, flags=re.IGNORECASE)
+    if (
+        len(pictures) >= 4
+        and len({item.lower() for item in pictures}) < len(pictures)
+        and len(english_words) < 12
+    ):
+        return True
+    if len(_BRIEF_CAMERA_CUE.findall(text)) >= 2 and len(english_words) < 8:
+        return True
+    source_n = _normalize_shot_compare(source_block)
+    body_n = _normalize_shot_compare(text)
+    if len(source_n) >= 24 and source_n in body_n:
+        extra = len(body_n) - len(source_n)
+        if extra <= max(8, int(len(source_n) * 0.2)):
+            return True
+    return False
+
+
+def _brief_shot_sections(narrative: str) -> dict[int, str]:
+    matches = list(re.finditer(r"\[\s*Brief\s+Shot\s+(\d+)\s*\]", narrative or "", flags=re.IGNORECASE))
+    sections: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(narrative)
+        sections[int(match.group(1))] = narrative[match.end():end].strip()
+    return sections
+
+
+def _raw_brief_shot_dumps(prompt: str, shot_contract_text: str) -> list[int]:
+    """Shot ids whose narrative body is a raw brief dump."""
+
+    narrative = _h3_field_body(prompt, "detailed_description:")
+    if not narrative.strip():
+        narrative = _h3_field_body(prompt, "integrated_multimodal_description:")
+    if re.search(r"分镜\s*\d+\s*使用参考", narrative or ""):
+        sections = _brief_shot_sections(narrative)
+        return sorted(sections) or [0]
+    blocks = _brief_shot_blocks(shot_contract_text)
+    dumped = [
+        shot
+        for shot, body in _brief_shot_sections(narrative).items()
+        if _shot_body_is_raw_brief_dump(body, blocks.get(shot, ""))
+    ]
+    return sorted(dumped)
+
+
+def _raise_raw_brief_shot_dumps(index: int, shots: Iterable[int]) -> None:
+    labels = ", ".join(str(shot) for shot in shots if shot)
+    target = f"brief shot(s) {labels}" if labels else "a brief shot"
+    raise PromptRefinerError(
+        f"Director plan segment {index} left {target} as raw brief text inside the H3 narrative. "
+        "Write each [Brief Shot N] as MiniMax H3 shot prose. Do not paste 分镜/使用参考 lines, "
+        "picture-name lists, or the unrefined brief."
+    )
+
+
 def _finalize_director_segment_prompt(
     text: str,
     *,
@@ -2086,16 +2174,28 @@ def _finalize_director_segment_prompt(
                 f"{', '.join(map(str, missing_shots))}, and the host could not recover their source text."
             )
         ledger: list[str] = []
+        dumped: list[int] = []
         for shot, block in zip(missing_shots, missing_blocks):
             body = _SHOT_REFERENCE_LINE.sub("", block, count=1).strip()
             body = re.sub(rf"(?im)^\s*分镜\s*{shot}\s*[=:：]\s*", "", body, count=1).strip()
+            # A short action line can stand in for a missing marker. A picture-name
+            # pile or the rest of the brief cannot; that is the Group 2 dump.
+            if _shot_body_is_raw_brief_dump(body, block):
+                dumped.append(shot)
+                continue
             ledger.append(f"[Brief Shot {shot}] {body}")
+        if dumped:
+            _raise_raw_brief_shot_dumps(index, dumped)
         anchor = re.search(r"(?im)^overall_soundscape\s*:", prompt)
         insertion = "\n".join(ledger).strip()
-        if anchor:
-            prompt = prompt[:anchor.start()].rstrip() + "\n" + insertion + "\n" + prompt[anchor.start():]
-        else:
-            prompt = prompt.rstrip() + "\n" + insertion
+        if insertion:
+            if anchor:
+                prompt = prompt[:anchor.start()].rstrip() + "\n" + insertion + "\n" + prompt[anchor.start():]
+            else:
+                prompt = prompt.rstrip() + "\n" + insertion
+    dumped_present = _raw_brief_shot_dumps(prompt, shot_contract_text)
+    if dumped_present:
+        _raise_raw_brief_shot_dumps(index, dumped_present)
     prompt = _decorate_full_reference_prompt(prompt, engine, picture_slots, lora_triggers)
     # Audio voice retention is applied by the caller AFTER dialogue forcing, so
     # unused-vs-bound decisions see the final <d> lines. Keep a first-pass here
@@ -4526,7 +4626,7 @@ def _build_long_director_segment_request(
         if segment.index not in (1, len(ordered)):
             keyframe_note = "\nThis intermediate FL2V group has no first or last keyframe of its own."
     prompt = (
-        f"{ENGINE_TAGS[engine]}\n"
+        f"/no_think\n{ENGINE_TAGS[engine]}\n"
         f"Segment {segment.index} of {len(ordered)}. Duration: {segment.duration_seconds:.3f} seconds. "
         f"CONTINUITY_FROM_PREV: {str(segment.continuity_from_prev).lower()}.\n\n"
         "Story slice for this segment only (dramatize this and nothing else):\n"
@@ -4544,9 +4644,11 @@ def _build_long_director_segment_request(
         prompt += (
             "\n\nLOSSLESS SHOT CONTRACT: This group owns the following source shots in this exact order: "
             f"{markers}. Write every marker literally inside detailed_description (or "
-            "integrated_multimodal_description), immediately followed by that source shot's action and dialogue. "
-            "Do not merge, summarize away, renumber, or omit any marker. These are source-shot IDs, independent "
-            "of any local camera-shot numbering."
+            "integrated_multimodal_description). After each marker, write that shot as MiniMax H3 prose: "
+            "camera, action, and timing in English. Preserve spoken words only inside "
+            "<d>[Language] exact dialogue</d>. Do not paste the brief, 分镜/使用参考 lines, or a list of "
+            "<Picture N> names. Do not merge, summarize away, renumber, or omit any marker. These are "
+            "source-shot IDs, independent of any local camera-shot numbering."
         )
     inventory = _director_long_inventory_lines(
         images,
@@ -5711,7 +5813,9 @@ def _plan_director_with_independent_segment_refine(
                         "content": (
                             f"That answer was rejected: {error} "
                             "Return only the corrected H3 prompt for this one segment, starting at the first "
-                            "required field label. Do not add a SEGMENT wrapper or describe any other group."
+                            "required field label. Write every assigned [Brief Shot N] as H3 shot prose. "
+                            "Do not paste the raw brief, 分镜 lines, or picture-name lists. "
+                            "Do not add a SEGMENT wrapper or describe any other group."
                         ),
                     },
                 ]
