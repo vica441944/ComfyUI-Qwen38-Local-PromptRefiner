@@ -8,6 +8,7 @@ are loaded from ComfyUI's ``models/LLM`` directory.
 from __future__ import annotations
 
 import base64
+import difflib
 import gc
 import importlib
 import inspect
@@ -71,6 +72,7 @@ H3_THREE_FIELDS = (
     "overall_soundscape",
     "non_diegetic_music",
 )
+H3_PROMPT_ENGINES = H3_THREE_FIELD_ENGINES | {FULL_REFERENCE_ENGINE}
 DIRECTOR_LONG_FL2V_MODE = "MiniMax H3 Director FL2V (i2v_groups)"
 DIRECTOR_LONG_R2V_MODE = "MiniMax H3 Director R2V (r2v_groups)"
 DIRECTOR_LONG_MODE_CHOICES = [DIRECTOR_LONG_FL2V_MODE, DIRECTOR_LONG_R2V_MODE]
@@ -333,12 +335,222 @@ def _image_to_data_uri(image_tensor: Any) -> str:
     return _array_to_data_uri(array, max_side=STILL_IMAGE_MAX_SIDE)
 
 
-def _strip_reasoning(text: str) -> str:
-    """Hide common reasoning blocks while retaining the model's final prompt."""
+_THINK_OPEN = re.compile(r"<think(?:ing)?\b[^>]*>", re.IGNORECASE)
+_THINK_CLOSE = re.compile(r"</think(?:ing)?\s*>", re.IGNORECASE)
+_ENGINE_LABEL_ONLY = re.compile(
+    r"(?i)\b(?:subject_definitions|summary|retention_analysis|detailed_description|"
+    r"overall_soundscape|non_diegetic_music|integrated_multimodal_description)\s*:?"
+)
 
-    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    cleaned = re.sub(r"<thinking>.*?</thinking>\s*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+def _split_reasoning(text: str) -> tuple[str, list[str]]:
+    """Split a completion into the visible answer and any reasoning bodies.
+
+    Qwen3.8's chat template opens ``<think>`` on the assistant turn whenever
+    ``enable_thinking`` is left unset, and it defaults that switch to on at
+    reasoning effort ``xhigh``. The completion therefore often *starts inside*
+    the block: the first ``</think>`` has no opening tag in the generated
+    text, and everything before it is reasoning. That trace commonly restates
+    the brief. A closed ``<think>`` pair is still removed from the visible
+    answer.
+    """
+
+    source = text or ""
+    thoughts: list[str] = []
+    visible_parts: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        open_match = _THINK_OPEN.search(source, cursor)
+        close_match = _THINK_CLOSE.search(source, cursor)
+        if close_match and (open_match is None or close_match.start() < open_match.start()):
+            thoughts.append(source[cursor:close_match.start()])
+            cursor = close_match.end()
+            cursor += len(re.match(r"\s*", source[cursor:]).group(0))
+            continue
+        if open_match:
+            visible_parts.append(source[cursor:open_match.start()])
+            close_match = _THINK_CLOSE.search(source, open_match.end())
+            if close_match is None:
+                thoughts.append(source[open_match.end():])
+                cursor = len(source)
+                break
+            thoughts.append(source[open_match.end():close_match.start()])
+            cursor = close_match.end()
+            cursor += len(re.match(r"\s*", source[cursor:]).group(0))
+            continue
+        visible_parts.append(source[cursor:])
+        break
+    return "".join(visible_parts).strip(), thoughts
+
+
+def _strip_reasoning(text: str) -> str:
+    """Hide reasoning blocks while retaining the model's visible answer.
+
+    When the template pre-opens ``<think>`` and the model writes the answer
+    after ``</think>``, that answer is kept and the leading restatement is
+    dropped. A think-only trace stays out of this string. The local refiner
+    reads those bodies itself and still rejects one that is only the brief.
+    Director planning therefore does not promote a reasoning draft into a
+    group prompt.
+    """
+
+    visible, _thoughts = _split_reasoning(text)
+    return visible.strip()
+
+
+def _compact_prompt_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\r\n", "\n")).strip()
+
+
+def _echo_needles(*sources: str) -> list[str]:
+    needles: list[str] = []
+    for source in sources:
+        compact = _compact_prompt_text(source)
+        compact = re.sub(r"(?i)^/no_think\s+", "", compact).strip()
+        if not compact:
+            continue
+        body = re.sub(r"^@[\w.+-]+\s+", "", compact).strip()
+        for needle in (compact, body):
+            if needle and needle not in needles:
+                needles.append(needle)
+    return needles
+
+
+def _is_unrefined_echo(prompt: str, *sources: str) -> bool:
+    """True when ``prompt`` is the brief, or almost nothing but the brief.
+
+    A finished engine prompt may quote a line from the brief. It is an echo
+    when the brief (or the whole user turn) is still the document: equal to
+    the output, pasted through with only field labels around it, or a
+    near-copy of about the same length.
+    """
+
+    prompt_c = _compact_prompt_text(prompt)
+    prompt_c = re.sub(r"(?i)^/no_think\s+", "", prompt_c).strip()
+    if not prompt_c:
+        return False
+    for needle in _echo_needles(*sources):
+        if prompt_c == needle:
+            return True
+        if len(needle) >= 24 and needle in prompt_c:
+            leftover = prompt_c.replace(needle, "")
+            leftover = _ENGINE_LABEL_ONLY.sub("", leftover)
+            leftover = re.sub(r"(?i)/no_think", "", leftover)
+            leftover = re.sub(r"@[\w.+-]+", "", leftover)
+            leftover = re.sub(r"[\s:：\-|_*#>`./\\,，。！？!?\"'“”「」]+", "", leftover)
+            if len(leftover) <= max(48, int(len(needle) * 0.12)):
+                return True
+        if len(needle) >= 40 and len(prompt_c) >= 40:
+            shorter = min(len(needle), len(prompt_c))
+            longer = max(len(needle), len(prompt_c))
+            if shorter / longer >= 0.75:
+                ratio = difflib.SequenceMatcher(None, needle, prompt_c).ratio()
+                if ratio >= 0.92:
+                    return True
+    return False
+
+
+def _has_h3_fields(prompt: str, engine: str) -> bool:
+    lowered = (prompt or "").lower()
+    return all(field.lower() in lowered for field in _required_h3_fields(engine))
+
+
+def _missing_h3_fields(prompt: str, engine: str) -> list[str]:
+    lowered = (prompt or "").lower()
+    return [field for field in _required_h3_fields(engine) if field.lower() not in lowered]
+
+
+def _prepare_refined_candidate(text: str, engine: str) -> str:
+    """Drop a leading think-switch or routing tag the model copied from the user turn."""
+
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"(?is)^(?:/no_think\s*)+", "", cleaned).strip()
+    tag = ENGINE_TAGS.get(engine, "")
+    if tag and (cleaned.startswith(tag + "\n") or cleaned.startswith(tag + " ")):
+        cleaned = cleaned[len(tag):].lstrip()
     return cleaned.strip()
+
+
+def _chat_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _completion_message_text(response: Any) -> str:
+    try:
+        content = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise PromptRefinerError("The local model returned no chat message.") from error
+    if isinstance(content, list):
+        return _chat_message_text({"content": content})
+    return str(content or "")
+
+
+def _accept_local_refined_prompt(
+    raw: str,
+    *,
+    brief: str,
+    engine: str,
+    lora_triggers: Iterable[str],
+    user_text: str = "",
+) -> str:
+    """Keep an engine prompt, or raise when the completion is the unrefined brief.
+
+    The visible channel is preferred. A Qwen3.8 trace can leave the real H3
+    prompt inside the pre-opened think block and put the brief after
+    ``</think>``; that inner prompt is used when it is the one that is
+    engine-shaped. The brief itself is never returned as success.
+    """
+
+    visible, thoughts = _split_reasoning(raw or "")
+    ordered = [visible, *reversed(thoughts)]
+    saw_echo = False
+    saw_other = False
+    chosen = ""
+    for candidate in ordered:
+        prepared = _prepare_refined_candidate(candidate, engine)
+        if not prepared:
+            continue
+        if _is_unrefined_echo(prepared, brief, user_text):
+            saw_echo = True
+            continue
+        if engine in H3_PROMPT_ENGINES and not _has_h3_fields(prepared, engine):
+            saw_other = True
+            continue
+        chosen = prepared
+        break
+    if not chosen:
+        if saw_echo:
+            raise PromptRefinerError(
+                "The local model echoed the brief instead of writing an engine prompt. "
+                "The raw brief was not returned as a successful refinement."
+            )
+        if saw_other and engine in H3_PROMPT_ENGINES:
+            sample = next((item for item in ordered if item.strip()), "")
+            missing = _missing_h3_fields(_prepare_refined_candidate(sample, engine), engine)
+            detail = f" Missing {', '.join(missing)}." if missing else ""
+            raise PromptRefinerError(
+                f"The local model did not return a {engine} prompt.{detail} "
+                "The brief was not substituted as the prompt."
+            )
+        raise PromptRefinerError("The local model returned no final prompt.")
+    chosen = _ensure_lora_triggers(chosen, engine, lora_triggers)
+    if _is_unrefined_echo(chosen, brief, user_text):
+        raise PromptRefinerError(
+            "The local model echoed the brief instead of writing an engine prompt. "
+            "The raw brief was not returned as a successful refinement."
+        )
+    return chosen
 
 
 def _effective_brief(widget_brief: Any, external_brief: Any) -> tuple[str, str]:
@@ -6556,7 +6768,9 @@ never describe it as the starting frame. If both are supplied, specify one visua
 transition from <Picture 1> to <Picture 2>. Treat <Picture 3> through <Picture 9> only as supplemental visual
 references. Keep all keyframe labels and user-supplied identity, costume, composition, camera, and dialogue details
 consistent. Use <d>[Language] exact dialogue</d> for spoken dialogue."""
-    prompt = f"{ENGINE_TAGS[engine]}\n{brief.strip()}"
+    # Qwen3 / Qwen3.8 treat a leading /no_think as thinking-off for this turn.
+    # The engine tag stays on the next line so the route profile still matches.
+    prompt = f"/no_think\n{ENGINE_TAGS[engine]}\n{brief.strip()}"
     if reference_lines:
         prompt += f"\n\nReference inventory:\n{reference_lines}"
     prompt += extra + visual_note + _prompt_example_instruction(prompt_example) + _lora_instruction(lora_triggers)
@@ -6833,20 +7047,51 @@ class Qwen38LocalPromptRefiner:
             lora_triggers,
             prompt_example,
         )
+        user_text = _chat_message_text(messages[-1] if messages else {})
 
         try:
-            response = _create_prompt_completion(
-                runtime.llm,
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                seed=seed,
-            )
-            content = response["choices"][0]["message"]["content"]
-            prompt = _ensure_lora_triggers(_strip_reasoning(content or ""), engine, lora_triggers)
-            if not prompt:
-                raise PromptRefinerError("The local model returned no final prompt.")
+            last_error: PromptRefinerError | None = None
+            prompt = ""
+            attempts = 0
+            for attempt in (1, 2):
+                attempts = attempt
+                response = _create_prompt_completion(
+                    runtime.llm,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    seed=int(seed) + attempt - 1,
+                )
+                content = _completion_message_text(response)
+                try:
+                    prompt = _accept_local_refined_prompt(
+                        content,
+                        brief=normalized_brief,
+                        engine=engine,
+                        lora_triggers=lora_triggers,
+                        user_text=user_text,
+                    )
+                    last_error = None
+                    break
+                except PromptRefinerError as error:
+                    last_error = error
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"/no_think\n{error}\n"
+                                f"Return only the final {engine} prompt. "
+                                "Do not copy the brief or the previous answer."
+                            ),
+                        },
+                    ]
+            if last_error is not None or not prompt:
+                raise PromptRefinerError(
+                    f"Local prompt refinement failed after {attempts} attempts. {last_error}"
+                ) from last_error
             debug = (
                 f"local llama.cpp | model={Path(model_path).name} | "
                 f"mmproj={Path(mmproj_path).name if mmproj_path else 'none'} | "
@@ -6856,6 +7101,7 @@ class Qwen38LocalPromptRefiner:
                 f"lora_triggers={len(lora_triggers)} | "
                 f"example={prompt_example.name if prompt_example else 'none'} ({example_adapter_status}) | "
                 f"brief_source={brief_source} | "
+                f"thinking=disabled | refine_attempts={attempts} | "
                 f"cached={keep_model_loaded}"
             )
             return (prompt, debug)
@@ -6864,23 +7110,72 @@ class Qwen38LocalPromptRefiner:
                 _RuntimeCache.unload()
 
 
-def _create_prompt_completion(llm: Any, **kwargs: Any) -> Any:
-    """Generate prompt text with reasoning disabled when the installed API supports it.
+def _install_thinking_disabled_chat_handler(llm: Any) -> None:
+    """Force Qwen3.8's Jinja switch off before the template renders.
 
-    Qwen3-VL's handler already asks the model not to reason, but an abliterated
-    GGUF or alternate chat template can still emit a visible ``<think>`` block.
-    llama.cpp would spend time generating that text even though the node strips
-    it before returning a prompt.  A zero reasoning budget immediately closes
-    such a block.  Older llama-cpp-python builds simply omit this optional API.
+    ``Llama.create_chat_completion`` does not forward ``enable_thinking`` into
+    the GGUF chat template. Left unset, Qwen3.8 treats it as true at effort
+    ``xhigh``, opens ``<think>``, and spends the completion restating the
+    brief. Wrapping the active chat handler passes the flag into that render.
+    Handlers that reject the keyword are called again without it.
     """
 
+    if getattr(llm, "_qwen38_thinking_disabled", False):
+        return
+    original = getattr(llm, "chat_handler", None)
+    if original is None:
+        handlers = getattr(llm, "_chat_handlers", None) or {}
+        chat_format = getattr(llm, "chat_format", None)
+        if chat_format:
+            original = handlers.get(chat_format)
+    if original is None:
+        try:
+            llm._qwen38_thinking_disabled = True
+        except Exception:
+            pass
+        return
+
+    def handler(*args: Any, **kwargs: Any) -> Any:
+        kwargs["enable_thinking"] = False
+        try:
+            return original(*args, **kwargs)
+        except TypeError as error:
+            if "enable_thinking" not in str(error):
+                raise
+            kwargs.pop("enable_thinking", None)
+            return original(*args, **kwargs)
+
+    llm.chat_handler = handler
+    try:
+        llm._qwen38_thinking_disabled = True
+    except Exception:
+        pass
+
+
+def _create_prompt_completion(llm: Any, **kwargs: Any) -> Any:
+    """Generate prompt text with Qwen3.8 thinking disabled when the API allows it.
+
+    The GGUF template, not ``reasoning_budget``, decides whether the assistant
+    turn opens ``<think>``. A zero reasoning budget is still sent when this
+    llama-cpp-python build accepts it. ``enable_thinking=False`` is sent on
+    the completion method when that parameter exists, and always injected into
+    the chat handler that actually renders the template.
+    """
+
+    _install_thinking_disabled_chat_handler(llm)
     completion = llm.create_chat_completion
     try:
-        supports_reasoning_budget = "reasoning_budget" in inspect.signature(completion).parameters
+        parameter_names = set(inspect.signature(completion).parameters)
     except (TypeError, ValueError):
-        supports_reasoning_budget = False
-    if supports_reasoning_budget:
+        parameter_names = set()
+    if "reasoning_budget" in parameter_names:
         kwargs["reasoning_budget"] = 0
+    if "enable_thinking" in parameter_names:
+        kwargs["enable_thinking"] = False
+    if "chat_template_kwargs" in parameter_names:
+        template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        kwargs["chat_template_kwargs"] = template_kwargs
     return completion(**kwargs)
 
 
