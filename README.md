@@ -37,6 +37,7 @@ Add **LLM / Prompt Refiner → Qwen3.8 Local Prompt Refiner (GGUF)**.
 - **external brief** is an optional `STRING` socket for a text/prompt node. A non-empty connected value takes priority over the editable `brief` widget, so you can retain and revise the brief for an earlier shot outside this node. After it is connected, the upstream editable text box receives the same `@` selection menu as this node's own brief widget; its choices are taken from the Qwen node's connected reference ports. The same `@reference_image_1`, `@reference_video_1`, `@reference_video_audio_1`, and `@reference_audio_1` tags are validated and mapped in external text.
 - The `brief` text area has **@ autocomplete**: after connecting assets, type `@` and choose a displayed image, video, video-audio, or standalone audio slot with the mouse, arrow keys + Enter, or Tab. Only connected ports are shown.
 - Leave **keep model loaded** disabled to release VRAM after each queue execution; enable it only when repeatedly prompting with the same model.
+- **output language** defaults to **中文**. Shot prose, summary, and soundscape are written in Simplified Chinese. Choose **English** for the previous cinematic English. Field labels, `<Picture N>` / `<Subject N>`, `[Shot N]` / `[Brief Shot N]`, `HANDOFF` / `CONTINUITY` keys, `fully_preserved`, `N/A`, LoRA triggers, and spoken dialogue stay in the form the contract already requires. Dialogue is copied verbatim and is not translated.
 
 ## Long Video Planner for MiniMax H3 Director
 
@@ -80,6 +81,8 @@ plan.
    The effective token ceiling, whether it applies per segment or to the whole plan, and a context recommendation are
    printed in `debug`. All profiles request zero reasoning tokens from compatible llama.cpp builds, so they return
    final prompts directly rather than spending time on visible `<think>` output.
+
+   **output language** is the same control as on the Local Prompt Refiner. It defaults to **中文**, so `detailed_description` / Brief Shot bodies, `summary`, `overall_soundscape`, and structure-card BEAT / HANDOFF sentences are written in Simplified Chinese. **English** restores the previous cinematic English. Dialogue stays in the brief's language. The `HANDOFF:` label itself stays English.
 
    **prompt refinement** defaults to **Per segment (recommended)**. Planning then has two phases:
 

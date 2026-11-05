@@ -312,13 +312,23 @@ function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
   const savedNameSet = new Set(savedNames);
 
   if (nodeName === "Qwen38LocalPromptRefiner") {
-    const missingCurrentControls = !savedNameSet.has("example_preset");
-    const needsMigration = missingCurrentControls || hasLegacyWidgetValueShift(nodeName, oldValues);
-    if (!needsMigration) return false;
-    const sourceNames = missingCurrentControls ? savedNames : LEGACY_WIDGET_ORDERS[nodeName];
+    const missingExample = !savedNameSet.has("example_preset");
+    const missingOutputLanguage = !savedNameSet.has("output_language");
+    const valuesLookLegacy = hasLegacyWidgetValueShift(nodeName, oldValues);
+    if (!missingExample && !missingOutputLanguage && !valuesLookLegacy) return false;
+    // A workflow saved before output_language keeps its named values. A positional
+    // legacy layout is restored from the old order, then the new combo defaults to 中文.
+    const sourceNames = missingExample || (missingOutputLanguage && !valuesLookLegacy)
+      ? savedNames
+      : LEGACY_WIDGET_ORDERS[nodeName];
     if (!sourceNames) return false;
-    applyNamedWidgetValues(node, sourceNames, oldValues);
-    setWidgetValue(node.widgets?.find((widget) => widget?.name === "example_preset"), "None");
+    const restored = applyNamedWidgetValues(node, sourceNames, oldValues);
+    if (!restored.has("example_preset")) {
+      setWidgetValue(node.widgets?.find((widget) => widget?.name === "example_preset"), "None");
+    }
+    if (!restored.has("output_language")) {
+      setWidgetValue(node.widgets?.find((widget) => widget?.name === "output_language"), "中文");
+    }
     persistMigratedWidgets(node, workflowNode);
     return true;
   }
@@ -327,17 +337,19 @@ function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
 
   const missingNamedControls = !savedNameSet.has("planning_quality") || !savedNameSet.has("director_execution");
   const missingPromptRefinement = !savedNameSet.has("prompt_refinement");
+  const missingOutputLanguage = !savedNameSet.has("output_language");
   const valuesLookLegacy = hasLegacyWidgetValueShift(nodeName, oldValues);
-  if (!missingNamedControls && !missingPromptRefinement && !valuesLookLegacy) return false;
+  if (!missingNamedControls && !missingPromptRefinement && !missingOutputLanguage && !valuesLookLegacy) return false;
 
   // A workflow whose input names already include planning_quality, but whose
   // widget values are still the older positional layout, must be restored from
-  // that older order.  Workflows that merely lack prompt_refinement keep the
-  // names they were saved with, then the new control is reset to its default.
+  // that older order.  Workflows that merely lack prompt_refinement or
+  // output_language keep the names they were saved with, then the new control
+  // is reset to its default.
   let sourceNames;
   if (valuesLookLegacy && savedNameSet.has("planning_quality")) {
     sourceNames = LEGACY_WIDGET_ORDERS[nodeName];
-  } else if (missingNamedControls || missingPromptRefinement) {
+  } else if (missingNamedControls || missingPromptRefinement || missingOutputLanguage) {
     sourceNames = savedNames;
   } else {
     sourceNames = LEGACY_WIDGET_ORDERS[nodeName];
@@ -358,6 +370,9 @@ function migrateLegacyWidgetLayout(node, workflowNode, nodeName) {
       node.widgets?.find((widget) => widget?.name === "prompt_refinement"),
       "Per segment (recommended)",
     );
+  }
+  if (!restored.has("output_language")) {
+    setWidgetValue(node.widgets?.find((widget) => widget?.name === "output_language"), "中文");
   }
   persistMigratedWidgets(node, workflowNode);
   return true;
