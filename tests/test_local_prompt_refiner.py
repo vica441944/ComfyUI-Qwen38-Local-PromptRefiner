@@ -324,7 +324,12 @@ class _FakeLLM:
         return handler(**kwargs)
 
 
-def _refine(brief: str, contents: list[str], external_brief: str = "") -> tuple[str, str]:
+def _refine(
+    brief: str,
+    contents: list[str],
+    external_brief: str = "",
+    output_language: str = "English",
+) -> tuple[str, str]:
     pending = list(contents)
 
     def complete(_llm, **_kwargs):
@@ -353,6 +358,7 @@ def _refine(brief: str, contents: list[str], external_brief: str = "") -> tuple[
             seed=1,
             keep_model_loaded=False,
             external_brief=external_brief,
+            output_language=output_language,
         )
 
 
