@@ -326,6 +326,30 @@ def _output_language_user_reminder(language: str | None) -> str:
     return ""
 
 
+_SUBJECT_BINDING_CONTRACT = (
+    "SUBJECT BINDING: Never use bare 主体 or 主角 (including 该主体, 此主体, 主人公, "
+    "主体人物, and 主角人物) as a person. Refer to a character by the name given in the brief "
+    "or by the <Subject N> already defined for that person, or by an entity_id. "
+    "If a mention is only the bare role word, it is missing: do not guess which person it is, "
+    "do not assign it to Subject 1, and do not copy the bare word into the prompt."
+)
+
+
+def _subject_binding_addon() -> str:
+    """System-prompt rule. Bare 主体/主角 is an unbound field, not a cue to invent Subject 1."""
+
+    return "\n\n" + _SUBJECT_BINDING_CONTRACT
+
+
+def _subject_binding_user_reminder() -> str:
+    """Last user-turn reminder so a refine does not copy an unbound role word."""
+
+    return (
+        "\n\nSUBJECT BINDING: Do not write bare 主体 or 主角 for a person. "
+        "Use the character name or <Subject N> already bound to that person. Do not guess Subject 1."
+    )
+
+
 def _soundscape_sentence_language(language: str | None) -> str:
     if _resolved_output_language(language) == OUTPUT_LANGUAGE_CHINESE:
         return "Chinese"
@@ -615,6 +639,223 @@ def _completion_message_text(response: Any) -> str:
     return str(content or "")
 
 
+# Bare person-role words. A following 甲/A disambiguator (主角甲) is a name, not this role.
+_BARE_ROLE_WORD = re.compile(
+    r"主人公"
+    r"|(?:该|此|本|其)(?:主体|主角)"
+    r"|(?:主体|主角)(?:人物|角色|本人)"
+    r"|(?:主体|主角)们?"
+)
+_ROLE_WORDS = frozenset({
+    "主体", "主角", "主人公", "主体们", "主角们",
+    "该主体", "此主体", "本主体", "其主体",
+    "该主角", "此主角", "本主角", "其主角",
+    "主体人物", "主角人物", "主体角色", "主角角色",
+    "主体本人", "主角本人",
+})
+_ROLE_NAME_SUFFIX = set("甲乙丙丁戊己庚辛壬癸")
+_NAME_STOP = frozenset({
+    "is", "are", "the", "and", "from", "with", "for", "its", "her", "his",
+    "identified", "derived", "must", "retain", "fully", "preserved",
+    "reference", "visual", "authoritative", "depicted", "environment",
+    "subject", "protagonist", "picture", "audio", "video", "heroine",
+    "然后", "于是", "但是", "所以", "因为", "如果", "我们", "他们", "她们",
+    "这个", "那个", "一个", "什么", "怎么", "自己", "对方", "这里", "那里",
+    "画面", "镜头", "人物", "角色", "环境", "道具", "场景", "参考",
+    "开始", "继续", "男人", "女人", "孩子", "少年", "少女",
+})
+_EXPLICIT_BAD_END = set("走看站说进出来说到过着了住叫喊跑坐躺")
+_LIGHT_GLUE = r"[ \t:：=＝/／|｜（）()【】\[\]「」『』\"“”'‘’的是为即叫]{0,8}"
+_SUBJECT_OR_ENTITY = (
+    r"<\s*Subject\s+\d+\s*>"
+    r"|\bsubject[\s_-]*id\s*[=:：]?\s*\d+\b"
+    r"|(?:entity[\s_-]*id|实体\s*id)\s*[=:：]?\s*[A-Za-z0-9_\-]+"
+)
+_NAME_BODY = r"(?:[\u4e00-\u9fff]{2,4}|[A-Za-z][A-Za-z0-9]{1,15})"
+_NAME_DELIM = r"(?=[\s,，。！？；;、：:）)】\]」』\"“”'‘’]|$)"
+_MARK_OR_COPULA = r"(?:叫做|称为|名叫|[:：=＝/／]|是|为|即|叫)"
+_OPEN_MARK = r"[（(【\[]"
+_CLOSE_MARK = r"[）)】\]]"
+_RIGHT_EXPLICIT_NAME = re.compile(
+    rf"^(?:{_OPEN_MARK}\s*(?P<paren>{_NAME_BODY})\s*{_CLOSE_MARK}"
+    rf"|{_MARK_OR_COPULA}\s*(?P<plain>{_NAME_BODY}){_NAME_DELIM})"
+)
+_LEFT_EXPLICIT_NAME = re.compile(
+    rf"(?:{_OPEN_MARK}\s*(?P<paren>{_NAME_BODY})\s*{_CLOSE_MARK}"
+    rf"|(?<![\u4e00-\u9fffA-Za-z0-9])(?P<plain>{_NAME_BODY}){_MARK_OR_COPULA}"
+    rf"|(?<![\u4e00-\u9fffA-Za-z0-9])(?P<before>{_NAME_BODY})\s*{_OPEN_MARK})"
+    rf"[ \t]*\Z"
+)
+_SUBJECT_DEF_NAME = re.compile(
+    r"<\s*Subject\s+\d+\s*>\s*(?:is|为|是|:|：)?\s*"
+    r"(?P<name>[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9·・]{0,15})",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_host_picture_sentence(label: str) -> bool:
+    """True for the host-inserted picture line, which uses 主体 as 'depicted subject'."""
+
+    return bool(re.search(r"authoritative|fully_preserved|depicted|所绘|权威视觉", label or "", flags=re.IGNORECASE))
+
+
+def _known_name_ok(token: str) -> bool:
+    if not token or len(token) < 2 or len(token) > 16:
+        return False
+    if any(mark in token for mark in "<>@[]"):
+        return False
+    if token in _ROLE_WORDS or token.casefold() in _NAME_STOP:
+        return False
+    if _is_host_picture_sentence(token) or _is_scene_picture_label(token):
+        return False
+    return True
+
+
+def _explicit_name_ok(token: str) -> bool:
+    """A gloss in parentheses or after a colon, not a verb the copula swallowed."""
+
+    if not _known_name_ok(token):
+        return False
+    return token[-1] not in _EXPLICIT_BAD_END
+
+
+def _known_character_names(*texts: str) -> tuple[str, ...]:
+    """Names the brief or prompt already bound to a picture, subject, voice, or speaker.
+
+    Bare 主体 is not one of these. A single leftover name is not a guess for 主体.
+    """
+
+    found: list[str] = []
+
+    def add(raw: str) -> None:
+        token = re.sub(r"\s+", "", (raw or "").strip()).strip("。.;；:：,，、")
+        if _known_name_ok(token) and token not in found:
+            found.append(token)
+
+    blob = "\n".join(part for part in texts if part)
+    for _slot, label in _picture_description_labels(blob).items():
+        if _is_host_picture_sentence(label) or _is_scene_picture_label(label):
+            continue
+        for part in re.split(r"[\s/／|｜,，;；。]+", label):
+            if not _is_scene_picture_label(part):
+                add(part)
+    for match in _SUBJECT_DEF_NAME.finditer(blob):
+        add(match.group("name"))
+    for label in _extract_audio_voice_labels(blob).values():
+        add(_speaker_from_audio_label(label))
+    for name in _infer_brief_dialogue_speakers(blob):
+        add(name)
+    return tuple(found)
+
+
+def _mask_role_exemptions(text: str) -> str:
+    """Hide verbatim dialogue and the host '所绘主体' sentence from the role scan."""
+
+    if not text:
+        return ""
+    chars = list(text)
+    for match in re.finditer(r"<d\b[^>]*>.*?</d>", text, flags=re.IGNORECASE | re.DOTALL):
+        for index in range(match.start(), match.end()):
+            chars[index] = " "
+    for match in re.finditer(r"所绘主体", text):
+        for index in range(match.start(), match.end()):
+            chars[index] = " "
+    return "".join(chars)
+
+
+def _explicit_side_name(fragment: str, *, right: bool) -> str:
+    match = (_RIGHT_EXPLICIT_NAME if right else _LEFT_EXPLICIT_NAME).search(fragment)
+    if match is None:
+        return ""
+    return match.group("paren") or match.group("plain") or match.groupdict().get("before") or ""
+
+
+def _role_side_is_bound(fragment: str, names: tuple[str, ...], *, right: bool) -> bool:
+    if not fragment:
+        return False
+    flags = re.IGNORECASE
+    if right:
+        if re.match(rf"{_LIGHT_GLUE}(?:{_SUBJECT_OR_ENTITY})", fragment, flags=flags):
+            return True
+    elif re.search(rf"(?:{_SUBJECT_OR_ENTITY}){_LIGHT_GLUE}\Z", fragment, flags=flags):
+        return True
+    if _explicit_name_ok(_explicit_side_name(fragment, right=right)):
+        return True
+    for name in sorted(names, key=len, reverse=True):
+        if right:
+            # A known name may run straight into the verb: 主体：小程推开门.
+            if re.match(rf"{_LIGHT_GLUE}{re.escape(name)}", fragment):
+                return True
+        elif re.search(rf"(?<![\u4e00-\u9fffA-Za-z0-9]){re.escape(name)}{_LIGHT_GLUE}\Z", fragment):
+            return True
+    return False
+
+
+def _unbound_role_snippets(text: str, names: tuple[str, ...]) -> list[str]:
+    """Snippets where 主体/主角 is the person, with no name, <Subject N>, or entity_id on it."""
+
+    masked = _mask_role_exemptions(text or "")
+    snippets: list[str] = []
+    for match in _BARE_ROLE_WORD.finditer(masked):
+        word = match.group(0)
+        if word in {"主体", "主角"}:
+            nxt = masked[match.end():match.end() + 1]
+            if nxt and (nxt in _ROLE_NAME_SUFFIX or ("A" <= nxt <= "Z") or ("a" <= nxt <= "z")):
+                continue
+            if any(len(name) > len(word) and masked.startswith(name, match.start()) for name in names):
+                continue
+        if _role_side_is_bound(masked[max(0, match.start() - 64):match.start()], names, right=False):
+            continue
+        if _role_side_is_bound(masked[match.end():match.end() + 64], names, right=True):
+            continue
+        snippet = re.sub(r"\s+", " ", text[max(0, match.start() - 8):match.end() + 8]).strip()
+        if snippet and snippet not in snippets:
+            snippets.append(snippet)
+    return snippets
+
+
+def _subject_tags(text: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(re.findall(r"<\s*Subject\s+\d+\s*>", text or "", flags=re.IGNORECASE)))
+
+
+def _require_no_unbound_role_words(text: str, *, context_text: str = "", source: str) -> None:
+    """Reject bare 主体/主角. Do not pick a nearby character or Subject 1 for it."""
+
+    combined = "\n".join(part for part in (context_text, text) if part)
+    names = _known_character_names(combined)
+    snippets = _unbound_role_snippets(text, names)
+    if not snippets:
+        return
+    shown = "、".join(snippets[:3])
+    tags = _subject_tags(combined)
+    listed = "、".join([*tags, *names][:8])
+    if listed:
+        identity = (
+            f" Identities already present ({listed}) may be used only where that same mention "
+            "is already tied to one of them."
+        )
+    else:
+        identity = " No character name, <Subject N>, or entity_id is attached to that word."
+    refusal = " Do not guess which person a bare role word is, and do not map it to Subject 1."
+    if source == "brief":
+        lead = (
+            f"The brief uses unbound 主体/主角 as a person reference ({shown}). "
+            "Name the character or select <Subject N> or an entity_id."
+        )
+    else:
+        lead = (
+            f"The refined prompt uses unbound 主体/主角 as a person reference ({shown}). "
+            "Rewrite each bare mention with the bound character name or <Subject N>."
+        )
+    raise PromptRefinerError(lead + identity + refusal)
+
+
+def _reject_unbound_brief_roles(brief: str) -> None:
+    """Fail a shot brief before refine. External brief text is the caller's effective brief."""
+
+    _require_no_unbound_role_words(brief or "", context_text=brief or "", source="brief")
+
+
 def _accept_local_refined_prompt(
     raw: str,
     *,
@@ -672,6 +913,7 @@ def _accept_local_refined_prompt(
         )
     if _resolved_output_language(output_language) == OUTPUT_LANGUAGE_CHINESE:
         _require_chinese_prompt_bodies(chosen, engine)
+    _require_no_unbound_role_words(chosen, context_text=brief, source="prompt")
     return chosen
 
 
@@ -1628,7 +1870,7 @@ or repeat a character's full appearance unless it changes this beat. Keep each R
 {quality.r2v_detail_words} {_detail_length_unit(output_language)} and each FL2V integrated_multimodal_description to
 approximately {quality.fl2v_detail_words} {_detail_length_unit(output_language)}. This density setting never permits
 omitting a required field, a connected reference label, literal LoRA trigger, or dialogue.
-""".strip() + _output_language_addon(output_language)
+""".strip() + _output_language_addon(output_language) + _subject_binding_addon()
 
 
 def _build_long_director_request(
@@ -1674,6 +1916,7 @@ def _build_long_director_request(
         )
     prompt += _prompt_example_instruction(prompt_example, output_language) + _lora_instruction(lora_triggers)
     prompt += _output_language_user_reminder(output_language)
+    prompt += _subject_binding_user_reminder()
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     _append_director_visual_content(content, images, videos)
     return [
@@ -2269,6 +2512,7 @@ def _finalize_director_segment_prompt(
     audio_slots: Iterable[int] = (),
     audio_labels: dict[int, str] | None = None,
     output_language: str | None = None,
+    context_text: str = "",
 ) -> str:
     """Accept one group's H3 prompt, or raise a segment-specific error for retry."""
 
@@ -2358,6 +2602,11 @@ def _finalize_director_segment_prompt(
     )
     if _resolved_output_language(output_language) == OUTPUT_LANGUAGE_CHINESE:
         _require_chinese_prompt_bodies(prompt, engine)
+    _require_no_unbound_role_words(
+        prompt,
+        context_text="\n".join(part for part in (context_text, shot_contract_text) if part),
+        source="prompt",
+    )
     return prompt
 
 
@@ -4579,6 +4828,7 @@ When a card's DIALOGUE includes a speaker who has a brief voice label (e.g. 小�
 """.strip()
         + coverage_addon
         + _output_language_addon(output_language)
+        + _subject_binding_addon()
     )
 
 
@@ -4650,7 +4900,7 @@ H3 production contract for this prompt:
 Prompt density: {quality.name}. {_director_long_craft_requirement(quality)} Do not expose reasoning or repeat a
 character's full appearance unless it changes in this beat. {density_target} This density setting never permits
 omitting a required field, a connected reference label, a literal LoRA trigger, or assigned dialogue.
-""".strip() + _output_language_addon(output_language)
+""".strip() + _output_language_addon(output_language) + _subject_binding_addon()
 
 
 def _build_long_director_structure_request(
@@ -4721,6 +4971,7 @@ def _build_long_director_structure_request(
             "only to segments that actually use it."
         )
     prompt += _output_language_user_reminder(output_language)
+    prompt += _subject_binding_user_reminder()
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     # Stills are text-only here.  Video-frame samples are not picture refs.
     _append_director_visual_content(content, (), videos)
@@ -4863,6 +5114,7 @@ def _build_long_director_segment_request(
         )
     prompt += _prompt_example_instruction(prompt_example, output_language) + _lora_instruction(lora_triggers)
     prompt += _output_language_user_reminder(output_language)
+    prompt += _subject_binding_user_reminder()
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     _append_director_visual_content(content, images, videos)
     return [
@@ -5830,6 +6082,7 @@ def _plan_director_with_independent_segment_refine(
     cannot dilute later beats by prefixing them with every earlier H3 prompt.
     """
 
+    _reject_unbound_brief_roles(brief)
     target_schedule = tuple(schedule)
     image_slots = [slot for slot, _ in image_references]
     video_slots = [video.slot for video in director_videos]
@@ -6001,6 +6254,7 @@ def _plan_director_with_independent_segment_refine(
                     audio_slots=segment.audio_slots,
                     audio_labels=audio_labels,
                     output_language=output_language,
+                    context_text=brief,
                 )
                 if _clean_structure_dialogue(segment.dialogue):
                     prompt = _force_assigned_dialogue_in_prompt(prompt, segment.dialogue)
@@ -6011,6 +6265,11 @@ def _plan_director_with_independent_segment_refine(
                     segment.audio_slots,
                     audio_labels,
                     context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
+                )
+                _require_no_unbound_role_words(
+                    prompt,
+                    context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
+                    source="prompt",
                 )
                 last_error = None
                 break
@@ -6609,6 +6868,7 @@ def _validate_long_director_plan(
     *,
     anchor_all_pictures: bool = False,
     output_language: str | None = None,
+    context_text: str = "",
 ) -> tuple[str, list[_DirectorLongSegment], bool]:
     """Turn Qwen's marked plan into safe, beat-paced Director group data."""
 
@@ -6679,6 +6939,7 @@ def _validate_long_director_plan(
         prompt = _ensure_full_reference_audio_voice_labels(prompt, audios)
         if _resolved_output_language(output_language) == OUTPUT_LANGUAGE_CHINESE:
             _require_chinese_prompt_bodies(prompt, engine)
+        _require_no_unbound_role_words(prompt, context_text=context_text, source="prompt")
         if mode == DIRECTOR_LONG_R2V_MODE:
             pictures = _picture_slots_for_materialize(pictures, prompt, image_slots)
         raw_continuity = raw.get("continuity_from_prev", index > 1)
@@ -7218,6 +7479,7 @@ transition from <Picture 1> to <Picture 2>. Treat <Picture 3> through <Picture 9
 references. Keep all keyframe labels and user-supplied identity, costume, composition, camera, and dialogue details
 consistent. Use <d>[Language] exact dialogue</d> for spoken dialogue."""
     system += _output_language_addon(output_language)
+    system += _subject_binding_addon()
     # Qwen3 / Qwen3.8 treat a leading /no_think as thinking-off for this turn.
     # The engine tag stays on the next line so the route profile still matches.
     prompt = f"/no_think\n{ENGINE_TAGS[engine]}\n{brief.strip()}"
@@ -7225,6 +7487,7 @@ consistent. Use <d>[Language] exact dialogue</d> for spoken dialogue."""
         prompt += f"\n\nReference inventory:\n{reference_lines}"
     prompt += extra + visual_note + _prompt_example_instruction(prompt_example, output_language) + _lora_instruction(lora_triggers)
     prompt += _output_language_user_reminder(output_language)
+    prompt += _subject_binding_user_reminder()
 
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for index, uri in images:
@@ -7393,6 +7656,7 @@ class Qwen38LocalPromptRefiner:
         effective_brief, brief_source = _effective_brief(brief, external_brief)
         if not effective_brief:
             raise PromptRefinerError("Write a prompt brief before running the node.")
+        _reject_unbound_brief_roles(effective_brief)
 
         prompt_example = _selected_prompt_example(example_preset, engine)
         example_adapter_status = (
@@ -7785,6 +8049,7 @@ Rules:
 - Rewrite natural-language prose into the requested OUTPUT LANGUAGE. Do not leave the previous language in shot prose, summary, or soundscape when the request asks for the other language.
 """
         system += _output_language_addon(language)
+        system += _subject_binding_addon()
         user = f"""/no_think
 REVISION REQUEST:
 {revision_request}
@@ -7799,6 +8064,7 @@ NEXT GROUP CONTEXT:
 {(next_group_context or '').strip() or '[none]'}
 """
         user += _output_language_user_reminder(language)
+        user += _subject_binding_user_reminder()
 
         model_path = _resolve_model_file(model_name)
         key = _RuntimeKey(
@@ -7833,6 +8099,7 @@ NEXT GROUP CONTEXT:
                         lora_triggers=(),
                         index=1,
                         output_language=language,
+                        context_text=f"{current_prompt}\n{revision_request}",
                     )
                     revised_lower = revised.lower()
                     missing_labels = [label for label in original_labels if label not in revised_lower]
@@ -8193,6 +8460,7 @@ class Qwen38LongVideoDirectorPlanner:
         effective_brief, brief_source = _effective_brief(brief, external_brief)
         if not effective_brief:
             raise PromptRefinerError("Write the complete long-video brief before running the Director planner.")
+        _reject_unbound_brief_roles(effective_brief)
         language = _normalize_output_language(output_language)
         effective_total_seconds, duration_source = _effective_total_duration_seconds(
             total_duration_seconds,
@@ -8367,39 +8635,62 @@ class Qwen38LongVideoDirectorPlanner:
                 effective_max_tokens = _long_director_effective_max_tokens(
                     int(max_tokens), director_mode, schedule, quality_profile
                 )
-                content = complete(
-                    _build_long_director_request(
-                        director_mode,
-                        normalized_brief,
-                        reference_text,
-                        schedule,
-                        image_references,
-                        director_videos,
-                        audio_assets,
-                        video_audio_assets,
-                        lora_triggers,
-                        prompt_example,
-                        quality_profile,
-                        anchor_all_pictures=bool(anchor_all_pictures),
-                        output_language=language,
-                    ),
-                    effective_max_tokens,
-                    int(seed),
-                )
-                title, segments, durations_rebalanced = _validate_long_director_plan(
-                    content or "",
+                single_shot_messages = _build_long_director_request(
                     director_mode,
+                    normalized_brief,
+                    reference_text,
                     schedule,
-                    image_assets,
-                    video_assets,
-                    video_audio_assets,
+                    image_references,
+                    director_videos,
                     audio_assets,
+                    video_audio_assets,
                     lora_triggers,
+                    prompt_example,
+                    quality_profile,
                     anchor_all_pictures=bool(anchor_all_pictures),
                     output_language=language,
                 )
+                single_shot_passes = 1
+                for attempt in (1, 2):
+                    single_shot_passes = attempt
+                    content = complete(
+                        single_shot_messages,
+                        effective_max_tokens,
+                        int(seed) + attempt - 1,
+                    )
+                    try:
+                        title, segments, durations_rebalanced = _validate_long_director_plan(
+                            content or "",
+                            director_mode,
+                            schedule,
+                            image_assets,
+                            video_assets,
+                            video_audio_assets,
+                            audio_assets,
+                            lora_triggers,
+                            anchor_all_pictures=bool(anchor_all_pictures),
+                            output_language=language,
+                            context_text=normalized_brief,
+                        )
+                        break
+                    except PromptRefinerError as error:
+                        if "unbound 主体/主角" not in str(error) or attempt == 2:
+                            raise
+                        single_shot_messages = [
+                            *single_shot_messages,
+                            {"role": "assistant", "content": content or ""},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{error}\nReturn only the corrected marked plan. "
+                                    "Replace bare 主体/主角 with the bound character name or <Subject N>. "
+                                    "Do not guess Subject 1."
+                                ),
+                            },
+                        ]
                 refine_trace = (
-                    f"prompt_refinement={DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT} | refine_passes=1"
+                    f"prompt_refinement={DIRECTOR_PROMPT_REFINEMENT_SINGLE_SHOT} | "
+                    f"refine_passes={single_shot_passes}"
                 )
                 token_scope = "whole_plan"
             groups, director_group_packer = _pack_director_long_groups(
