@@ -1,0 +1,41 @@
+{
+  "case_id": "03-rooftop-two-beats",
+  "title": "天台浇水",
+  "comparison": "local_planner_vs_h3_second_segment_only",
+  "long_planner_in_scope_for_h3": false,
+  "language": "zh-CN",
+  "local_output_language": "中文",
+  "h3_rewrite_language": "en",
+  "return_bridge": "en_to_zh_or_bilingual_keep",
+  "engine": "MiniMax H3 full reference",
+  "duration_seconds": 18,
+  "h3_segment_count": 1,
+  "h3_segment_seconds": 10,
+  "dialogue": [],
+  "brief_file": "brief.md",
+  "brief": "总时长：18秒。段长上限按15秒，平均段长按10秒估计。两段都要留下，合计必须是18秒。\n\n[STORY_BEATS]\n1|8|-|走到菜箱\n2|10|-|放下水壶\n[/STORY_BEATS]\n\n<Picture 1> 陈夏\n<Picture 2> 天台菜箱外景\n<Subject 1> 陈夏\n<Environment> 天台菜箱外景\n\n节拍1 时长：8秒\n清晨天台。陈夏提着一把银色浇水壶，从楼梯口走到菜箱前并停下。没有对白。\n衔接：浇水壶还在她右手里，人停在菜箱左侧，镜头对着菜叶。\n\n节拍2 时长：10秒\n她把浇水壶放在菜箱边的木凳上，弯腰看了一眼湿土，再直起身望向远处的楼群。没有对白。没有配乐。环境声是风和远处车流。",
+  "refs": {
+    "pictures": [
+      {
+        "slot": 1,
+        "tag": "<Picture 1>",
+        "binds": "<Subject 1> 陈夏",
+        "asset": null,
+        "note": "Out of band. Do not commit an image."
+      },
+      {
+        "slot": 2,
+        "tag": "<Picture 2>",
+        "binds": "<Environment> 天台菜箱外景",
+        "asset": null,
+        "note": "Out of band. Do not commit an image."
+      }
+    ],
+    "videos": [],
+    "audios": []
+  },
+  "images_in_repo": false,
+  "planner_in_scope_for_local_notes": true,
+  "segment_duration_seconds": 10,
+  "h3_segment_index": 2
+}

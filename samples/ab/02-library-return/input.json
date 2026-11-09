@@ -1,0 +1,49 @@
+{
+  "case_id": "02-library-return",
+  "title": "图书馆还书",
+  "comparison": "local_refiner_vs_h3_short_segment",
+  "long_planner_in_scope_for_h3": false,
+  "language": "zh-CN",
+  "local_output_language": "中文",
+  "h3_rewrite_language": "en",
+  "return_bridge": "en_to_zh_or_bilingual_keep",
+  "engine": "MiniMax H3 full reference",
+  "duration_seconds": 12,
+  "h3_segment_count": 1,
+  "h3_segment_seconds": 12,
+  "dialogue": [
+    "这本书还在。"
+  ],
+  "brief_file": "brief.md",
+  "brief": "目标时长：12秒。单段，仍在4到15秒以内。\n<Picture 1> 林舟\n<Picture 2> 沈宁\n<Subject 1> 林舟\n<Subject 2> 沈宁\n<Audio 1> 沈宁声音参考\n\n傍晚的社区图书馆还书台。林舟把一本深蓝色封面的书推到台面上，书脊朝向沈宁。沈宁坐在柜台后，左手按住书角，看向林舟。\n沈宁「这本书还在。」\n没有配乐。环境声是纸页翻动和空调出风口。声音参考只取沈宁的音色，不复制一段现成音轨。",
+  "refs": {
+    "pictures": [
+      {
+        "slot": 1,
+        "tag": "<Picture 1>",
+        "binds": "<Subject 1> 林舟",
+        "asset": null,
+        "note": "Out of band. Do not commit an image."
+      },
+      {
+        "slot": 2,
+        "tag": "<Picture 2>",
+        "binds": "<Subject 2> 沈宁",
+        "asset": null,
+        "note": "Out of band. Do not commit an image."
+      }
+    ],
+    "videos": [],
+    "audios": [
+      {
+        "slot": 1,
+        "tag": "<Audio 1>",
+        "binds": "沈宁声音参考",
+        "role": "timbre_only",
+        "asset": null,
+        "note": "Out of band. Do not commit audio."
+      }
+    ]
+  },
+  "images_in_repo": false
+}
