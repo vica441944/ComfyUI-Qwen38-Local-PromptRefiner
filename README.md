@@ -323,3 +323,7 @@ corrected layout.
 
 - `prompt`: local model's final prompt with common `<think>` / `<thinking>` blocks removed.
 - `debug`: local execution summary, including model, projector, reference count, paired-video audio count, and cache setting.
+
+## Sample fixtures
+
+Synthetic briefs for comparing this Local Prompt Refiner with an optional MiniMax H3 Prompt Rewriter are in [`samples/ab`](samples/ab/README.md). They are manual review notes. They do not call a model, and they do not replace the Long Video Planner.
