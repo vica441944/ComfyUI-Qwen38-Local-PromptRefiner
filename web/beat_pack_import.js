@@ -88,6 +88,13 @@ function parseManifestClient(data) {
     throw new Error("segment_duration_seconds 须在 4–15");
   }
   const refs = Array.isArray(data.refs) ? data.refs : [];
+  const suggestedShots = Array.isArray(data.suggested_shots) ? data.suggested_shots : [];
+  for (const [index, shot] of suggestedShots.entries()) {
+    const seconds = Number(shot?.suggested_duration_seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 15) {
+      throw new Error(`suggested_shots[${index}].suggested_duration_seconds 须在 0–15 秒`);
+    }
+  }
   return {
     ...data,
     director_execution: data.director_execution || DEFAULT_DIRECTOR_EXECUTION,
@@ -95,6 +102,37 @@ function parseManifestClient(data) {
     allow_duration_overrun: Boolean(data.allow_duration_overrun),
     refs,
   };
+}
+
+function briefWithSuggestedShotDurations(manifest) {
+  const brief = String(manifest?.brief || "");
+  const shots = Array.isArray(manifest?.suggested_shots) ? manifest.suggested_shots : [];
+  if (!shots.length) return brief;
+
+  const headerPattern = /^[ \t]*分镜[ \t]*(\d+)[ \t]*使用参考[ \t]*[=:：][^\r\n]*[ \t]*\r?$/gm;
+  const headers = [...brief.matchAll(headerPattern)];
+  if (headers.length !== shots.length) {
+    throw new Error(
+      `节点包含 ${shots.length} 个 suggested_shots，但 brief 解析到 ${headers.length} 个分镜使用参考块`,
+    );
+  }
+
+  let cursor = 0;
+  const chunks = [];
+  for (let index = 0; index < headers.length; index += 1) {
+    const match = headers[index];
+    const seconds = Number(shots[index].suggested_duration_seconds);
+    chunks.push(brief.slice(cursor, match.index));
+    chunks.push(match[0]);
+    chunks.push(`\n时长:${Number(seconds.toFixed(3))}秒`);
+    cursor = match.index + match[0].length;
+    const existing = brief.slice(cursor).match(
+      /^\r?\n[ \t]*(?:时长|duration(?:_seconds)?)[ \t]*[:：=][ \t]*\d+(?:\.\d+)?[ \t]*(?:秒|s(?:econds?)?)?[ \t]*(?:\r?\n|$)/i,
+    );
+    if (existing) cursor += existing[0].length - (existing[0].endsWith("\n") ? 1 : 0);
+  }
+  chunks.push(brief.slice(cursor));
+  return chunks.join("");
 }
 
 function pickBeatPackFile() {
@@ -392,7 +430,8 @@ function applyBeatPack(planner, pack, { clearGroups }) {
   let removed = 0;
   if (clearGroups) removed = clearDirectorGroups(graph, planner);
 
-  const briefTarget = writeBrief(graph, planner, pack.manifest.brief);
+  const importedBrief = briefWithSuggestedShotDurations(pack.manifest);
+  const briefTarget = writeBrief(graph, planner, importedBrief);
   const durationTarget = writeDuration(
     graph,
     planner,
@@ -432,6 +471,7 @@ async function importBeatPackForPlanner(planner) {
       + `clear_director_groups: ${clearGroups ? "是" : "否"}`
       + (clearGroups ? `（删除 Group/Combine ${result.removed} 个）` : "")
       + `\nbrief → ${result.briefTarget}\n`
+      + `逐镜时长 → ${pack.manifest.suggested_shots?.length || 0} 组\n`
       + `时长 → ${result.durationTarget}\n`
       + `Load* 已填 ${okLoads}/${result.loaderReport.length}`
       + `\nPlanner 已切回 Always（可 Queue 重跑新节拍）`

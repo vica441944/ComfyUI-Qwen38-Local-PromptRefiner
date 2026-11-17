@@ -193,12 +193,12 @@ class PlannerBriefShotDumpTests(unittest.TestCase):
             if len(calls) == 1:
                 return r2v("[Brief Shot 5] At 00:00.000, the camera holds on the man in the doorway.")
             self.assertIn("raw brief", user)
-            return r2v(ENGLISH_SHOTS)
+            return r2v("[Brief Shot 6] At 00:00.000, a medium close-up finds her at the center of the frame.")
 
         _title, segments, _rebalanced, _debug, record = nodes._plan_director_with_independent_segment_refine(
             complete,
             mode=R2V,
-            brief=BRIEF,
+            brief=nodes._brief_shot_blocks(BRIEF)[6],
             reference_text="",
             schedule=(12.0,),
             image_references=((1, "pic-1"), (2, "pic-2")),
@@ -215,7 +215,7 @@ class PlannerBriefShotDumpTests(unittest.TestCase):
         self.assertTrue(calls[0].startswith("/no_think\n"))
         narrative = nodes._h3_field_body(segments[0].prompt, "detailed_description:")
         self.assertIn("[Brief Shot 6]", narrative)
-        self.assertIn("[Brief Shot 8]", narrative)
+        self.assertNotIn("[Brief Shot 8]", narrative)
         self.assertIn("medium close-up", narrative)
         self.assertNotIn(DUMP_MARK, narrative)
         self.assertNotIn("中近景", narrative)

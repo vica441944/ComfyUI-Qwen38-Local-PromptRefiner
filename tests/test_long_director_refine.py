@@ -161,7 +161,7 @@ class LongDirectorRefineTests(unittest.TestCase):
             if "Segment 2 of 3" in user:
                 return r2v_prompt("UNIQUE_PROMPT_TWO")
             if "Segment 3 of 3" in user:
-                return r2v_prompt("UNIQUE_PROMPT_THREE")
+                return r2v_prompt("UNIQUE_PROMPT_THREE", picture=False)
             raise AssertionError(user[:200])
 
         videos = [
@@ -186,7 +186,8 @@ class LongDirectorRefineTests(unittest.TestCase):
         )
 
         self.assertEqual(title, "Night office")
-        self.assertFalse(rebalanced)
+        # The returned 8/12/10 schedule differs from the 10/10/10 input seed.
+        self.assertTrue(rebalanced)
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(call["seed"] == 7 for call in calls))
         self.assertEqual(calls[0]["max_tokens"], max(512 + 3 * 480, 4096))

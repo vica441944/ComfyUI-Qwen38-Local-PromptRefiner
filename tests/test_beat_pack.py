@@ -50,6 +50,42 @@ class BeatPackParseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             beat_pack.parse_beat_pack_manifest(_valid_manifest(segment_duration_seconds=20))
 
+    def test_accepts_per_shot_durations(self):
+        parsed = beat_pack.parse_beat_pack_manifest(_valid_manifest(
+            brief=("分镜1使用参考:<Picture 1>\n分镜1: First action.\n"
+                   "分镜2使用参考:\n分镜2: Second action.\n"
+                   "分镜3使用参考:<Picture 2>\n分镜3: Third action."),
+            suggested_shots=[
+            {"shot_id": "shot-a", "suggested_duration_seconds": 8},
+            {"shot_id": "shot-b", "suggested_duration_seconds": 4},
+            {"shot_id": "shot-c", "suggested_duration_seconds": 6},
+        ]))
+        self.assertEqual(
+            [shot["suggested_duration_seconds"] for shot in parsed["suggested_shots"]],
+            [8, 4, 6],
+        )
+        self.assertIn("分镜1使用参考:<Picture 1>\n时长:8秒", parsed["brief"])
+        self.assertIn("分镜2使用参考:\n时长:4秒", parsed["brief"])
+        self.assertIn("分镜3使用参考:<Picture 2>\n时长:6秒", parsed["brief"])
+
+    def test_replaces_existing_imported_shot_duration(self):
+        brief = "分镜1使用参考:\n时长:5秒\n分镜1: A safe synthetic action."
+        parsed = beat_pack.parse_beat_pack_manifest(_valid_manifest(
+            brief=brief,
+            external_total_duration_seconds=8,
+            suggested_shots=[{"shot_id": "shot-a", "suggested_duration_seconds": 8}],
+        ))
+        self.assertEqual(parsed["brief"].count("时长:"), 1)
+        self.assertIn("时长:8秒", parsed["brief"])
+
+    def test_rejects_invalid_per_shot_duration(self):
+        for seconds in (0, 15.001, float("nan"), "8"):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                beat_pack.parse_beat_pack_manifest(_valid_manifest(suggested_shots=[{
+                    "shot_id": "shot-a",
+                    "suggested_duration_seconds": seconds,
+                }]))
+
     def test_clear_allowlist_exact(self):
         self.assertEqual(
             beat_pack.CLEAR_DIRECTOR_GROUP_CLASS_TYPES,
