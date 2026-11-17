@@ -22,6 +22,41 @@ DIRECTOR_EXECUTION_CHOICES = (
     "Plan and run Director (one queue)",
 )
 
+_SHOT_REFERENCE_HEADER = re.compile(
+    r"(?im)^[ \t]*分镜[ \t]*(\d+)[ \t]*使用参考[ \t]*[=:：][^\r\n]*[ \t]*$"
+)
+_LEADING_SHOT_DURATION = re.compile(
+    r"^\r?\n[ \t]*(?:时长|duration(?:_seconds)?)[ \t]*[:：=][ \t]*"
+    r"\d+(?:\.\d+)?[ \t]*(?:秒|s(?:econds?)?)?[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
+
+def apply_suggested_shot_durations(brief: str, suggested_shots: list[dict]) -> str:
+    """Attach pack shot durations to ordered explicit-shot blocks."""
+    if not suggested_shots:
+        return brief
+    headers = list(_SHOT_REFERENCE_HEADER.finditer(brief))
+    if len(headers) != len(suggested_shots):
+        raise ValueError(
+            f"Pack has {len(suggested_shots)} suggested_shots but brief has "
+            f"{len(headers)} explicit shot reference blocks"
+        )
+    chunks = []
+    cursor = 0
+    for header, shot in zip(headers, suggested_shots):
+        chunks.append(brief[cursor:header.start()])
+        chunks.append(header.group(0))
+        seconds = float(shot["suggested_duration_seconds"])
+        seconds_text = f"{seconds:.3f}".rstrip("0").rstrip(".")
+        chunks.append(f"\n时长:{seconds_text}秒")
+        cursor = header.end()
+        existing = _LEADING_SHOT_DURATION.match(brief[cursor:])
+        if existing:
+            cursor += existing.end() - (1 if existing.group(0).endswith("\n") else 0)
+    chunks.append(brief[cursor:])
+    return "".join(chunks)
+
 
 def parse_beat_pack_manifest(data: dict) -> dict:
     if not isinstance(data, dict) or data.get("format") != BEAT_PACK_FORMAT:
@@ -45,6 +80,19 @@ def parse_beat_pack_manifest(data: dict) -> dict:
         result.setdefault(name, default)
         if type(result[name]) is not bool:
             raise ValueError(f"{name} must be a boolean")
+    suggested_shots = result.get("suggested_shots", [])
+    if not isinstance(suggested_shots, list):
+        raise ValueError("suggested_shots must be a list")
+    for index, shot in enumerate(suggested_shots):
+        if not isinstance(shot, dict):
+            raise ValueError(f"suggested_shots[{index}] must be an object")
+        seconds = shot.get("suggested_duration_seconds")
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 < seconds <= 15:
+            raise ValueError(
+                f"Invalid suggested_shots[{index}].suggested_duration_seconds: expected >0–15 seconds"
+            )
+    result["suggested_shots"] = [dict(shot) for shot in suggested_shots]
+    result["brief"] = apply_suggested_shot_durations(result["brief"], result["suggested_shots"])
     refs = result.get("refs", [])
     if not isinstance(refs, list):
         raise ValueError("refs must be a list")

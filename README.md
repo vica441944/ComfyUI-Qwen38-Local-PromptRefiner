@@ -21,6 +21,21 @@ The Hugging Face download is the compatible Abliterated base GGUF, rather than t
 
 The generic package in `requirements.txt` is a CPU fallback. For NVIDIA CUDA on Windows, install the matching CUDA wheel instead; the `llama-cpp-python` project documents the available CUDA wheel indexes.
 
+## Director 导演包写回 output（独立脚本）
+
+Director 照常点击「导出导演包」，等待浏览器下载完成。在本插件目录打开 PowerShell，运行：
+
+```powershell
+& 'H:\ComfyUI-WorkFisher-V2.7\python\python.exe' .\pack_writeback.py "$env:USERPROFILE\Downloads\实际下载文件名.mmxpack.zip" --original 'F:\NVStudio-output\乡村猎艳1\第10集\乡村猎艳1_第10集_beat003.zip'
+```
+
+把下载路径和 `--original` 换成实际路径。脚本自动覆盖原包，无需手动复制或改名；成功打印完整写回路径，失败打印原因并返回非零退出码。无需启动或重启 ComfyUI，不加载模型，不修改 Director。
+
+- 原包是 UUID/export_id 旧名时，`--original` 指向旧包，并加 `--beat 3`；项目名和集数从 `项目名\第N集` 目录解析，也可用 `--project`、`--episode` 补充。新包写入成功后才删除旧名包。
+- 不提供 `--original` 时，约定文件名自动还原到 `F:\NVStudio-output\项目名\第N集`；output 集目录内的旧名源包原地改名；其他源包按文件名在 output 中唯一匹配。无匹配或多个匹配会报错，不猜测。`--original` 也接受能唯一匹配的原包文件名。
+- `--original` 的约定文件名优先确定身份；旧名包缺少拍号时必须提供 `--beat`。不会根据下载时间或 export_id 猜拍号。
+- 写入仅限 `F:\NVStudio-output` 内，名称为 `项目名_第N集_beatXXX.zip`。脚本先复制到目标目录临时文件并校验 ZIP，再原子替换；Downloads 源包保留。测试通过函数参数注入临时 output 根目录，命令行不开放根目录覆盖。
+
 ## Node usage
 
 Add **LLM / Prompt Refiner → Qwen3.8 Local Prompt Refiner (GGUF)**.

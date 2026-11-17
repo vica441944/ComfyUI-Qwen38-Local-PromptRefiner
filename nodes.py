@@ -3294,7 +3294,7 @@ _KEY_DIALOGUE_LINE = re.compile(
     r"(?im)^\s*(?:KEY_DIALOGUE|关键台词)\s*[=:：]\s*(.+?)\s*$"
 )
 _SHOT_REFERENCE_LINE = re.compile(
-    r"(?im)^\s*分镜\s*(?P<index>\d+)\s*使用参考\s*[=:：]\s*(?P<references>[^\n]*)\s*$"
+    r"(?im)^[ \t]*分镜[ \t]*(?P<index>\d+)[ \t]*使用参考[ \t]*[=:：][ \t]*(?P<references>[^\r\n]*)[ \t]*$"
 )
 _AUDIO_VOICE_MAPPING = re.compile(
     r"<Audio\s+(?P<slot>\d+)>\s*(?P<name>[^,，\n]+?)\s*声线(?:参考)?",
@@ -3854,6 +3854,96 @@ def _brief_shot_blocks(brief: str) -> dict[int, str]:
         if block:
             blocks[index] = block
     return blocks
+
+
+def _explicit_shot_schedule(brief: str, total: float, allow_overrun: bool) -> tuple[float, ...]:
+    """Allocate milliseconds to source shots, never derive shot count from time."""
+    blocks = _brief_shot_blocks(brief)
+    matches = list(_SHOT_REFERENCE_LINE.finditer(brief or ""))
+    if len(matches) != len(blocks):
+        raise PromptRefinerError("Duplicate explicit shot IDs; source order is ambiguous.")
+    limit = MAX_DIRECTOR_EXPANDED_TOTAL_SECONDS if allow_overrun else MAX_DIRECTOR_TOTAL_SECONDS
+    if not np.isfinite(total) or not 0 < total <= limit:
+        raise PromptRefinerError(f"Explicit-shot total must be positive and at most {limit:g}s.")
+    # Keep the existing soft-budget meaning, but never derive card count from est.
+    estimates = _parse_story_beats_block(brief)
+    if allow_overrun and estimates:
+        total = sum(item.estimated_seconds for item in estimates)
+        if total > limit:
+            raise PromptRefinerError(f"Story estimates exceed {limit:g}s.")
+    values = []
+    for block in blocks.values():
+        match = re.search(r"(?im)^[ \t]*(?:分镜\d+[ \t]*)?(?:时长|duration(?:_seconds)?)[ \t]*[:：=][ \t]*(\d+(?:\.\d+)?)[ \t]*(?:秒|s(?:econds?)?)?[ \t]*$", block)
+        values.append(float(match.group(1)) if match else None)
+    missing = [i for i, value in enumerate(values) if value is None]
+    fixed = sum(value for value in values if value is not None)
+    if missing:
+        remaining = round((total - fixed) * 1000)
+        if remaining < len(missing):
+            raise PromptRefinerError("Explicit shot durations leave no positive budget for remaining shots.")
+        share, residue = divmod(remaining, len(missing))
+        for position, index in enumerate(missing):
+            values[index] = (share + (position < residue)) / 1000
+    elif abs(fixed - total) > 0.002 and not (allow_overrun and total < fixed <= limit):
+        raise PromptRefinerError(f"Explicit shot durations sum to {fixed:g}s, conflicting with target {total:g}s.")
+    if any(value < 0.001 or not np.isfinite(value) for value in values):
+        raise PromptRefinerError("Explicit shot durations must be positive.")
+    for index, (shot_id, block) in enumerate(blocks.items()):
+        speech = _structure_card_speech_seconds("", block)
+        if speech > values[index] + 0.02:
+            if not allow_overrun:
+                raise PromptRefinerError(f"Source shot {shot_id}: dialogue needs {speech:.3f}s but has {values[index]:g}s. Enable duration overrun or increase this shot's budget.")
+            values[index] = round(speech, 3)
+    if sum(values) > limit + 0.002:
+        raise PromptRefinerError(f"Explicit shot plan exceeds {limit:g}s; no content was removed.")
+    return tuple(round(value, 3) for value in values)
+
+
+def _explicit_shot_segments(brief, schedule, mode, image_slots, video_slots,
+                            paired_slots, audio_slots, anchor_all_pictures=False):
+    """Host-owned cards; only a source shot exceeding 15s can have multiple parts."""
+    result = []
+    if len(schedule) != len(_brief_shot_blocks(brief)):
+        raise PromptRefinerError("Explicit shot schedule count differs from source shot count.")
+    for (shot_id, block), duration in zip(_brief_shot_blocks(brief).items(), schedule):
+        header, _, body = block.partition("\n")
+        # Never inherit another beat/pack's trailing metadata as this shot's story.
+        body = re.sub(rf"(?im)^[ \t]*分镜[ \t]*{shot_id}[ \t]*[:：=][ \t]*", "", body).strip()
+        body = re.sub(r"(?im)^[ \t]*(?:时长|duration(?:_seconds)?)[ \t]*[:：=][^\r\n]*$", "", body).strip()
+        if not body:
+            raise PromptRefinerError(f"Source shot {shot_id} has no story content.")
+        dialogue_units = _beat_quoted_speech_units(body)
+        dialogue = "\n".join(dialogue_units)
+        beat = _strip_beat_quote_spans(body, set(dialogue_units)) if dialogue_units else body
+        if not beat.strip():
+            beat = "Dialogue continues."
+        count = max(1, int(np.ceil(duration / MAX_DIRECTOR_SEGMENT_SECONDS)))
+        millis, residue = divmod(round(duration * 1000), count)
+        times = tuple((millis + (i < residue)) / 1000 for i in range(count))
+        parts = (_deterministic_repair_parts(beat, dialogue, "End this source shot.", times)
+                 if count > 1 else [{"beat": beat, "dialogue": dialogue, "handoff": "End this source shot."}])
+        _validate_verbatim_partition(beat, [p["beat"] for p in parts], "beat")
+        if dialogue:
+            _validate_verbatim_partition(dialogue, [p["dialogue"] for p in parts], "dialogue")
+        def named(label, available):
+            requested = tuple(dict.fromkeys(int(n) for n in re.findall(rf"<{label}\s+(\d+)>", header, re.I)))
+            return _plan_slot_list(list(requested), available, label, fallback_when_empty=False)
+        pictures = tuple(image_slots) if anchor_all_pictures else named("Picture", image_slots)
+        videos = named("Video", video_slots)
+        audios = named("Audio", audio_slots)
+        paired = tuple(slot for slot in paired_slots if re.search(rf"<Video\s+{slot}>\s*paired audio", header, re.I))
+        for part, seconds in zip(parts, times):
+            if _dialogue_speech_units(part["dialogue"]) / _DIALOGUE_WORDS_PER_SECOND > seconds + 0.02:
+                raise PromptRefinerError(f"Source shot {shot_id}: dialogue does not fit {seconds:g}s; increase its duration without deleting dialogue.")
+            result.append(_DirectorLongSegment(
+                index=len(result) + 1, duration_seconds=seconds, prompt="",
+                picture_slots=pictures, video_slots=videos, video_audio_slots=paired,
+                audio_slots=audios, continuity_from_prev=(part is not parts[0] or
+                    bool(result) and bool(re.search(r"延续上一镜|延续上个镜头|CONTINUITY_FROM_PREV\s*[:=]\s*true", body, re.I))),
+                beat=f"{header}\n分镜{shot_id}: {part['beat']}",
+                dialogue=part["dialogue"], handoff=part["handoff"],
+            ))
+    return result
 
 
 def _partition_ordered(items: list[int], count: int) -> list[list[int]]:
@@ -5005,6 +5095,7 @@ def _build_long_director_segment_request(
     prompt_example: _PromptExamplePreset | None,
     quality: _DirectorLongQualityProfile,
     output_language: str | None = None,
+    isolated_shot: bool = False,
 ) -> list[dict[str, Any]]:
     """One focused request.  Other groups appear only as handoff context, not as prompts."""
 
@@ -5020,8 +5111,8 @@ def _build_long_director_segment_request(
     )
     engine = _director_mode_engine(mode)
     assigned_shots = _assigned_brief_shot_ids(segment.beat)
-    previous = ordered[segment.index - 2] if segment.index > 1 else None
-    following = ordered[segment.index] if segment.index < len(ordered) else None
+    previous = ordered[segment.index - 2] if segment.index > 1 and not isolated_shot else None
+    following = ordered[segment.index] if segment.index < len(ordered) and not isolated_shot else None
     if segment.dialogue:
         dialogue_rule = (
             "Copy these lines verbatim inside <d>[Language] ...</d>. Do not invent, translate, or repeat a line "
@@ -5036,6 +5127,8 @@ def _build_long_director_segment_request(
         dialogue_body = "NONE"
     if previous is None:
         previous_block = "Previous group: none. This group opens the project."
+        if isolated_shot:
+            previous_block = "Do not invent previous or future shots. Follow only this assigned slice and its continuity flag."
     else:
         previous_block = (
             f"Previous group handoff: {previous.handoff}\n"
@@ -5047,6 +5140,8 @@ def _build_long_director_segment_request(
             previous_block += " This seam is a hard cut. Do not continue the previous action, camera, or audio."
     if following is None:
         following_block = "Next group: none. This is the final group. Resolve the action at this group's handoff."
+        if isolated_shot:
+            following_block = "No other shot content is supplied. Do not add an ending or action from another shot."
     else:
         following_block = (
             "Next group story slice (context only; do not write its action or dialogue):\n"
@@ -5205,7 +5300,8 @@ def _format_per_segment_refine_debug(record: dict[str, Any]) -> str:
     steps = list(record.get("passes") or [])
     total = len(steps)
     structure_attempts = record.get("structure_attempts")
-    structure_state = "skipped_single_group" if record.get("structure_skipped") else "ok"
+    structure_state = ("skipped_explicit_shots" if record.get("grouping_contract") == "explicit_shots_v1"
+                       else "skipped_single_group" if record.get("structure_skipped") else "ok")
     lines = [
         f"prompt_refinement={record.get('mode', DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT)}",
         f"structure_max_tokens={record.get('structure_max_tokens', 0)}",
@@ -6090,17 +6186,25 @@ def _plan_director_with_independent_segment_refine(
     completion_seed = int(seed)
     structure_attempts = 0
     structure_skipped = len(target_schedule) == 1
-    story_schedule, coverage_plan = _story_duration_schedule(
+    explicit_shots = bool(_brief_shot_blocks(brief))
+    story_schedule, coverage_plan = (target_schedule, None) if explicit_shots else _story_duration_schedule(
         brief, budget_seconds=sum(target_schedule), max_segment_seconds=max_segment_seconds,
         allow_duration_overrun=bool(allow_duration_overrun),
     )
     target_schedule = story_schedule if coverage_plan is not None else target_schedule
-    target_schedule = _locked_structure_schedule(target_schedule, coverage_plan)
+    target_schedule = target_schedule if explicit_shots else _locked_structure_schedule(target_schedule, coverage_plan)
     structure_max_tokens = _long_director_structure_max_tokens(len(target_schedule), requested_max_tokens)
     structure_audit: dict[str, Any] = {"schedule": target_schedule, "outputs": [], "repairs": []}
     diagnostic_path = ""
     coverage_landmark_misses: list[str] = []
-    if structure_skipped:
+    if explicit_shots:
+        target_schedule = _explicit_shot_schedule(brief, sum(target_schedule), allow_duration_overrun)
+        segments = _explicit_shot_segments(brief, target_schedule, mode, image_slots,
+            video_slots, video_audio_slots, audio_slots, anchor_all_pictures)
+        structure_skipped = True
+        title = "Explicit shot plan"
+        durations_rebalanced = False
+    elif structure_skipped:
         first_line = next((line.strip() for line in brief.splitlines() if line.strip()), "")
         title = _clip_text(first_line, 80) or "Untitled MiniMax H3 Director project"
         segments = [
@@ -6216,9 +6320,10 @@ def _plan_director_with_independent_segment_refine(
     refined: list[_DirectorLongSegment] = []
     passes: list[dict[str, Any]] = []
     for segment in segments:
+        segment_source = segment.beat + "\n" + segment.dialogue if explicit_shots else brief
         request = _build_long_director_segment_request(
             mode,
-            brief,
+            segment_source,
             reference_text,
             segments,
             segment,
@@ -6228,6 +6333,7 @@ def _plan_director_with_independent_segment_refine(
             prompt_example,
             quality,
             output_language,
+            isolated_shot=explicit_shots,
         )
         last_error = None
         prompt = ""
@@ -6237,12 +6343,16 @@ def _plan_director_with_independent_segment_refine(
             attempts = attempt
             text = complete(messages, refine_max_tokens, completion_seed)
             try:
-                audio_labels = _extract_audio_voice_labels(brief)
+                audio_labels = _extract_audio_voice_labels(segment_source)
                 authoritative_pictures = segment.picture_slots
-                if mode == DIRECTOR_LONG_R2V_MODE:
+                if mode == DIRECTOR_LONG_R2V_MODE and not explicit_shots:
                     authoritative_pictures = _picture_slots_for_materialize(
                         segment.picture_slots, segment.beat, image_slots
                     )
+                if explicit_shots:
+                    returned_ids = set(int(n) for n in re.findall(r"\[Brief Shot (\d+)\]", text or "", re.I))
+                    if returned_ids - set(_assigned_brief_shot_ids(segment.beat)):
+                        raise PromptRefinerError("Response includes another source shot; return only the assigned shot, not the raw brief.")
                 prompt = _finalize_director_segment_prompt(
                     text or "",
                     engine=engine,
@@ -6254,7 +6364,7 @@ def _plan_director_with_independent_segment_refine(
                     audio_slots=segment.audio_slots,
                     audio_labels=audio_labels,
                     output_language=output_language,
-                    context_text=brief,
+                    context_text=segment_source,
                 )
                 if _clean_structure_dialogue(segment.dialogue):
                     prompt = _force_assigned_dialogue_in_prompt(prompt, segment.dialogue)
@@ -6264,11 +6374,11 @@ def _plan_director_with_independent_segment_refine(
                     prompt,
                     segment.audio_slots,
                     audio_labels,
-                    context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
+                    context_text=segment_source,
                 )
                 _require_no_unbound_role_words(
                     prompt,
-                    context_text=f"{brief}\n{segment.beat}\n{segment.dialogue}",
+                    context_text=segment_source,
                     source="prompt",
                 )
                 last_error = None
@@ -6299,7 +6409,7 @@ def _plan_director_with_independent_segment_refine(
                 f"Director segment {segment.index} prompt refinement failed after 2 attempts. {last_error}"
             ) from last_error
         picture_slots = segment.picture_slots
-        if mode == DIRECTOR_LONG_R2V_MODE:
+        if mode == DIRECTOR_LONG_R2V_MODE and not explicit_shots:
             picture_slots = _picture_slots_for_materialize(
                 _picture_slots_for_materialize(picture_slots, segment.beat, image_slots),
                 prompt,
@@ -6332,6 +6442,7 @@ def _plan_director_with_independent_segment_refine(
     record = {
         "mode": DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT,
         "structure_skipped": structure_skipped,
+        "grouping_contract": "explicit_shots_v1" if explicit_shots else "legacy_duration",
         "structure_attempts": structure_attempts,
         "structure_diagnostic": diagnostic_path,
         "structure_duration_schedule": [s.duration_seconds for s in segments],
@@ -8469,7 +8580,9 @@ class Qwen38LongVideoDirectorPlanner:
         engine = _director_mode_engine(director_mode)
         quality_profile = _director_long_quality_profile(planning_quality)
         refinement = _director_prompt_refinement_mode(prompt_refinement)
-        schedule = _director_duration_schedule(effective_total_seconds, float(segment_duration_seconds))
+        schedule = (_explicit_shot_schedule(effective_brief, effective_total_seconds, allow_duration_overrun)
+                    if _brief_shot_blocks(effective_brief) else
+                    _director_duration_schedule(effective_total_seconds, float(segment_duration_seconds)))
         image_references = _get_image_inputs(assets)
         image_assets = {slot: assets[f"reference_image_{slot}"] for slot, _ in image_references}
         if director_mode == DIRECTOR_LONG_FL2V_MODE and not ({1, 2} & set(image_assets)):
@@ -8505,12 +8618,15 @@ class Qwen38LongVideoDirectorPlanner:
         # The widget is a per-group ceiling.  When the brief carries explicit
         # story beats, their pacing determines the group count for both the
         # single-shot and independent-refine paths.
-        schedule, _ = _story_duration_schedule(
+        schedule, _ = (schedule, None) if _brief_shot_blocks(normalized_brief) else _story_duration_schedule(
             normalized_brief,
             budget_seconds=effective_total_seconds,
             max_segment_seconds=float(segment_duration_seconds),
             allow_duration_overrun=bool(allow_duration_overrun),
         )
+        if _brief_shot_blocks(normalized_brief):
+            # Explicit shots always receive independent, isolated refinement.
+            refinement = DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT
         prompt_example = _selected_prompt_example(example_preset, engine)
         example_adapter_status = (
             _adapt_prompt_example_output(prompt_example)[1] if prompt_example else "none"
@@ -8604,7 +8720,7 @@ class Qwen38LongVideoDirectorPlanner:
 
         try:
             refine_record: dict[str, Any] | None = None
-            if refinement == DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT:
+            if refinement == DIRECTOR_PROMPT_REFINEMENT_PER_SEGMENT or _brief_shot_blocks(normalized_brief):
                 # Structure stays global.  Each group's H3 prompt is a separate
                 # completion whose token budget does not shrink as group count grows.
                 title, segments, durations_rebalanced, refine_trace, refine_record = (
@@ -8693,6 +8809,8 @@ class Qwen38LongVideoDirectorPlanner:
                     f"refine_passes={single_shot_passes}"
                 )
                 token_scope = "whole_plan"
+            if _brief_shot_blocks(normalized_brief):
+                effective_total_seconds = round(sum(item.duration_seconds for item in segments), 3)
             groups, director_group_packer = _pack_director_long_groups(
                 director_mode,
                 segments,

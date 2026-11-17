@@ -1,0 +1,11 @@
+{
+  "schedule": [
+    12.5,
+    12.5
+  ],
+  "outputs": [
+    "<think></think>\n\nTITLE: Village Street Inspection\n=== SEGMENT 1 ===\nDURATION_SECONDS: 13.000\nCONTINUITY_FROM_PREV: false\nPICTURES: <Picture 1>, <Picture 2>, <Picture 3>\nVIDEOS:\nVIDEO_AUDIOS:\nAUDIOS: <Audio 1>\nBEAT:\nWide-angle slow push reveals the village main street. Brick-tile houses and two-story buildings line the path. Zhao Fenghong in a floral skirt and Xiao Cheng walk away from the camera, gradually surrounded by architecture. The camera transitions to a medium tracking shot. Zhao Fenghong leads on the left, Xiao Cheng follows on the right. Xiao Cheng speaks his observation about the village's economic conditions.\nDIALOGUE:\n(S1) <d>[Chinese] 我来时真没想到咱们村条件这么好，按政府档案，咱们村经济其实并不太好呀。</d>\nHANDOFF:\nXiao Cheng stands mid-street, facing Zhao Fenghong's three-quarter profile, both characters in motion, ambient street noise present.\n=== END SEGMENT ===\n=== SEGMENT 2 ===\nDURATION_SECONDS: 12.000\nCONTINUITY_FROM_PREV: true\nPICTURES: <Picture 1>, <Picture 2>, <Picture 3>\nVIDEOS:\nVIDEO_AUDIOS:\nAUDIOS: <Audio 1>, <Audio 2>\nBEAT:\nMedium close-up fixed shot. Zhao Fenghong faces the camera, right hand pointing to a two-story building, then shifting to a brick house. She smiles coquettishly, eyes glancing at Xiao Cheng. She delivers her commentary on male earnings and Xiao Cheng's potential. Cut to close-up of Xiao Cheng's face. His smile stiffens, brows furrow slightly, revealing inner surprise as he processes her remark about local gossip.\nDIALOGUE:\n(S2) <d>[Chinese] 都是男人挣来的呗。不过小六你那么优秀肯定能让咱们村发展得更好。</d>\n(S1) <d>[Chinese] 这村情六处果然厉害，不到一天连我碰了几个女人都知道了。</d>\nHANDOFF:\nXiao Cheng's face frozen in close-up, expression shifting from forced smile to subtle alarm, camera static, dialogue complete.\n=== END SEGMENT ==="
+  ],
+  "repairs": [],
+  "error": "Cannot safely repair segment 2: 20.889s: segment 1 dialogue would not fit its redistributed 4.111s. Content was not truncated."
+}
